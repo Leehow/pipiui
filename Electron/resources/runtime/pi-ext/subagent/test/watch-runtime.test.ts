@@ -273,7 +273,7 @@ test("watchObservationFor reports unknown runs as gone without throwing", () => 
 	assert.equal(watchObservationFor("no-such-worker", "mtfa1b2-3c4d5e6f7a8b", Date.now()), undefined);
 });
 
-test("41 busy-session samples stay outside Pi and coalesce to the latest of four runs", async () => {
+test("41 busy-session samples are dropped without a Pi or extension backlog", async () => {
 	const runtime = __watchRuntimeForTests;
 	const now = Date.now();
 	const ids = ["watch-baseline", "watch-knowledge", "watch-pdf", "watch-viewer"];
@@ -305,19 +305,11 @@ test("41 busy-session samples stay outside Pi and coalesce to the latest of four
 			}
 		}
 		assert.equal(sent.length, 0, "no sample may enter Pi's follow-up queue while busy");
-		assert.equal(runtime.heldSignals.length, 4, "one replaceable slot per exact run");
-		for (const [index, seq] of [11, 11, 10, 9].entries()) {
-			assert.ok(runtime.heldSignals.some(entry => entry.text.startsWith(`[subagent-watch] ${ids[index]} `) && entry.text.includes(`seq=${seq}.`)));
-		}
+		assert.equal(runtime.heldSignals.length, 0, "busy samples do not retain notification text");
 		runtime.bossTurnBusy = false;
 		runtime.flushHeldSignals(pi);
 		await new Promise(resolve => setImmediate(resolve));
-		assert.equal(sent.length, 1, "all latest statuses share one message, not four Boss turns");
-		for (const [index, seq] of [11, 11, 10, 9].entries()) {
-			assert.ok(sent[0].includes(`[subagent-watch] ${ids[index]} `));
-			assert.ok(sent[0].includes(`seq=${seq}.`));
-		}
-		assert.equal(runtime.heldSignals.length, 0);
+		assert.equal(sent.length, 0, "settling does not replay old watch samples");
 	} finally {
 		runtime.bossTurnBusy = false;
 		runtime.heldSignals.length = 0;
@@ -326,7 +318,7 @@ test("41 busy-session samples stay outside Pi and coalesce to the latest of four
 	}
 });
 
-test("held watch forwards are dropped when their run or session expires", async () => {
+test("busy watch forwards cannot outlive their run or session", async () => {
 	const runtime = __watchRuntimeForTests;
 	const agentId = "watch-expired";
 	const runId = "run-expired";
@@ -341,7 +333,7 @@ test("held watch forwards are dropped when their run or session expires", async 
 			runtime.registry.start({ agentId, runId, now, fingerprint: "state=running" });
 			runtime.bossTurnBusy = true;
 			await runtime.sendUserMessage(pi, text);
-			assert.equal(runtime.heldSignals.length, 1);
+			assert.equal(runtime.heldSignals.length, 0);
 			expire();
 			runtime.bossTurnBusy = false;
 			runtime.flushHeldSignals(pi);
@@ -357,8 +349,9 @@ test("held watch forwards are dropped when their run or session expires", async 
 	}
 });
 
-test("the void extension sender reserves admission until Pi starts the turn", async () => {
+test("the void extension sender reserves admission and drops siblings instead of replaying", async () => {
 	const runtime = __watchRuntimeForTests;
+	runtime.notificationContext = { isIdle: () => true, hasPendingMessages: () => false };
 	const now = Date.now();
 	const sent: string[] = [];
 	const pi = {
@@ -377,17 +370,16 @@ test("the void extension sender reserves admission until Pi starts the turn", as
 		assert.equal(await runtime.sendUserMessage(pi, sample(ids[1], 1)), false);
 		assert.equal(await runtime.sendUserMessage(pi, sample(ids[1], 2)), false);
 		assert.equal(sent.length, 1, "void return is not a delivery acknowledgement");
-		assert.equal(runtime.heldSignals.length, 1);
-		assert.ok(runtime.heldSignals[0].text.includes("seq=2."));
+		assert.equal(runtime.heldSignals.length, 0);
 		runtime.bossTurnBusy = true; // before_agent_start takes over the reservation
 		runtime.flushHeldSignals(pi);
 		assert.equal(sent.length, 1);
-		runtime.bossTurnBusy = false; // agent_settled releases the next current snapshot
+		runtime.bossTurnBusy = false;
 		runtime.flushHeldSignals(pi);
 		await new Promise(resolve => setImmediate(resolve));
-		assert.equal(sent.length, 2);
-		assert.ok(sent[1].includes("seq=2."));
+		assert.equal(sent.length, 1, "no queued sibling to replay");
 	} finally {
+		runtime.notificationContext = undefined;
 		runtime.bossTurnBusy = false;
 		runtime.heldSignals.length = 0;
 		runtime.registry.clear();

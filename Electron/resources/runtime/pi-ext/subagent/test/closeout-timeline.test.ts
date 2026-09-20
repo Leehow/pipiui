@@ -49,11 +49,11 @@ scrubSubagentRuntimeTestHostEnvironment();
 process.env.PIPIUI_MAIN_CWD = HARNESS_MAIN_CWD;
 // index.ts also snapshots depth/supervisor/child-invocation vars AT IMPORT. A suite
 // running inside a dispatched-worker host inherits its ambient PIPIUI_* env, which
-// silently flips every gate this file exercises (depth!==0 disables the done-delivery
-// store binding; a SESSION_KEY binds the host supervisor; a foreign NODE_PATH points
-// worker children away from this file). Pin boss-mode values BEFORE importing —
-// same discipline as dispatch-seam.test.ts.
-process.env.PIPIUI_AGENT_DEPTH = "0"; // this suite IS the boss (depth 0)
+// silently flips every gate this file exercises. The durable done-delivery lifecycle
+// now belongs to nested parents only: Boss hints are covered by idle-notification-runtime.
+// Pin the resident-parent binding before importing; no shutdown token/process is needed.
+process.env.PIPIUI_AGENT_DEPTH = "1";
+process.env.PIPIUI_NESTED_RPC_PARENT = "1";
 delete process.env.PIPIUI_SESSION_KEY; // per the comment below: supervisor path stays off
 delete process.env.PIPIUI_AGENT_ID;
 delete process.env.PIPIUI_AGENT_RUN_ID;
@@ -75,7 +75,7 @@ after(async () => {
  *
  * PIPIUI_SESSION_KEY is deliberately left unset so bindHostSupervisor stays off
  * (the same default as every other index.ts suite) and delivery stays on the
- * boss path that emits the probes under test.
+ * nested-parent durable path that emits the probes under test.
  */
 type Handler = (event: unknown, ctx: unknown) => void | Promise<void>;
 type FakePi = {

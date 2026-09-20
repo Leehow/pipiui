@@ -407,6 +407,24 @@ describe("PiHostBackend message queue integration", () => {
     await backend.close();
   });
 
+  it.each(["__idle_subagent_status__", "__idle_subagent_notice__"])("projects direct subagent hints without a follow-up queue entry: %s", async prompt => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => { if (event.channel === "stream") events.push(event.event); });
+    try {
+      await backend.handle("sendPrompt", ["s1", prompt]);
+      await eventually(() => events.some(event => event.type === "user_message" && event.id === "idle-notice"));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "user_message", content: "[subagent-status-changed] 请调用 subagent_status() 查看最新状态。",
+      }));
+      // The host may project this test's initiating user prompt as pendingDrainPrompt;
+      // the internal notification itself must never acquire a queued follow-up slot.
+      expect(events.flatMap(event => event.pendingFollowUps ?? []).filter(text => text.startsWith("[subagent-"))).toEqual([]);
+      expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+    } finally { off(); await backend.close(); }
+  });
+
   it("emits settled when the Pi child exits mid-turn without agent_settled", async () => {
     const setup = await fixture();
     const children: ReturnType<typeof spawn>[] = [];

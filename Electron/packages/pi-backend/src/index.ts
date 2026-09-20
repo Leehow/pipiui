@@ -1013,11 +1013,16 @@ function migrateLegacySeamFixture(agent: AgentSummary): boolean {
   agent.testFixture = true;
   return true;
 }
-const SUBAGENT_COMPLETION_CUSTOM_TYPE = "pipiui-subagent-complete-v1";
+const SUBAGENT_NOTIFICATION_CUSTOM_TYPES = new Set([
+  "pipiui-subagent-complete-v1",
+  "pipiui-subagent-status-changed-v1",
+  "pipiui-subagent-notice-v1",
+]);
 function isSubagentCompletion(value: any): boolean {
   if (!value || typeof value !== "object") return false;
-  return value.customType === SUBAGENT_COMPLETION_CUSTOM_TYPE
-    || value.message?.customType === SUBAGENT_COMPLETION_CUSTOM_TYPE;
+  // Live-only hints must project like legacy completion receipts, without a queue row.
+  return SUBAGENT_NOTIFICATION_CUSTOM_TYPES.has(value.customType)
+    || SUBAGENT_NOTIFICATION_CUSTOM_TYPES.has(value.message?.customType);
 }
 function isVisibleCustomMessage(entry: any): boolean {
   return entry?.type === "custom_message" && (Boolean(entry.display) || isSubagentCompletion(entry));

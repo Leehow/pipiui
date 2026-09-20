@@ -175,6 +175,7 @@ import {
 	UNFILTERED_RESUMABLE_CAP,
 } from "./job-status-list.ts";
 import { isUnfilteredStatusQuery, StatusPollGuard } from "./status-poll-guard.ts";
+import { idleNotificationApi, IdleNotificationState, installIdleNotificationGuard } from "./idle-notification.ts";
 import {
 	formatOrphanRecoveryNotice,
 	selectOrphanedSlices,
@@ -2829,8 +2830,8 @@ function deliverPendingBossQuestions(agentId: string, runId: string, dir: string
 		if (!handle) continue;
 		deliveredBossQuestions.add(key);
 		const text = formatQuestionForBoss(question, { workerName: handle.name, timeoutMs: resolveAskBossTimeoutMs() });
-		void awaitCutInHoldRelease().then(() => {
-			// Keep questions separate, but never let them overtake queued user input.
+		void (PIPIUI_DEPTH === 0 ? Promise.resolve() : awaitCutInHoldRelease()).then(() => {
+			// Questions are queryable while busy; never park their text behind user input.
 			// The worker may have timed out or received a reply while the host queue drained.
 			if (!handleForRun(agentId, runId) || !pendingQuestions(dir).some(item => item.id === question.id)) return false;
 			return sendUserMessageAfterCutIn(pi, text);
@@ -3439,7 +3440,7 @@ export function runSubagentWatch(input: {
 		ok: true,
 		message: [
 			`Watch ${started.created ? "started" : "re-armed"}: agentId=${pair.agentId} runId=${pair.runId} samples every ${started.subscription.intervalSecs}s.`,
-			"Baseline recorded; you are told only on a state change (status/tool/finalization/verify), routed through Supervisor — ordinary output/activity counters stay silent, busy-session snapshots coalesce to the latest per run, and the normal completion receipt remains the only terminal notification.",
+			"Baseline recorded; state changes are routed through Supervisor and may notify an idle Boss. Busy-time samples are not queued or replayed; inspect subagent_status before ending a turn to wait.",
 			...(resolvedLog && "path" in resolvedLog ? [`Progress channel aimed at ${resolvedLog.path} (only appends from now are forwarded).`] : []),
 		].join("\n"),
 	};
@@ -5481,6 +5482,7 @@ async function sendUserMessageAfterCutIn(
 	// session. They are dropped for this cycle; the boss can still see every job
 	// state through subagent_status and the Subagents panel.
 	if (hostStopQuiet) return false;
+	if (PIPIUI_DEPTH === 0 && !bossCanReceiveNotification()) return false;
 	if (!admitOrHoldRuntimeSignal(text, shouldSend, pi)) return false;
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
@@ -5523,8 +5525,10 @@ async function trySendUserMessage(
 	text: string,
 	shouldSend?: () => boolean,
 ): Promise<boolean> {
-	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
-	await awaitCutInHoldRelease();
+	// Boss hints are live-only. Nested parents retain their completion/lease protocol.
+	if (PIPIUI_DEPTH === 0) {
+		if (!bossCanReceiveNotification()) return false;
+	} else await awaitCutInHoldRelease();
 	if (shouldSend && !shouldSend()) return false;
 	const routed = await routeRuntimeSignalThroughSupervisor(text);
 	// A heartbeat the Supervisor absorbed is a heartbeat handled: the Boss did not need it.
@@ -5843,6 +5847,10 @@ export const __doneLifecycleForTests = {
 	deliverToBoss: deliverConfirmedDoneToBossAsync,
 };
 export const __watchRuntimeForTests = {
+	set notificationContext(value: typeof bossNotificationContext) { bossNotificationContext = value; },
+	get idleNotificationState() { return idleNotificationState; },
+	remindIdleBoss,
+	deliverSupervisorNotice: deliverSupervisorNoticeToBoss,
 	get bossTurnBusy(): boolean { return bossTurnBusy; },
 	set bossTurnBusy(value: boolean) { bossTurnBusy = value; watchBossSendInFlight = false; runtimeSignalBatchInFlight = false; clearHeldRuntimeRetry(); },
 	get heldSignals() { return heldRuntimeSignals; },
@@ -5917,6 +5925,49 @@ let hostStopQuiet = false;
 let bossTurnBusy = false;
 let watchBossSendInFlight = false;
 let runtimeSignalBatchInFlight = false;
+let bossNotificationContext: { isIdle(): boolean; hasPendingMessages(): boolean } | undefined;
+const idleNotificationState = new IdleNotificationState();
+const terminalHintIdentities = new Set<string>();
+// Latest actionable decision per exact run, queryable state rather than queued messages.
+const supervisorNotices = new Map<string, { agentId: string; runId: string; text: string }>();
+let resetBossStatusPoll: (() => void) | undefined;
+
+function supervisorNoticeStatus(agentId?: string): string {
+	const notices = [...supervisorNotices.values()].filter(item => !agentId || item.agentId === agentId);
+	if (!notices.length) return "";
+	const listed = notices.slice(-8);
+	return ["Supervisor decisions (latest per run; queryable, not queued):",
+		...listed.map(item => `${item.agentId} runId=${item.runId}\n${item.text}`),
+		...(notices.length > listed.length ? [`${notices.length - listed.length} older decisions omitted; query subagent_status({agentId}) for that worker.`] : []),
+	].join("\n");
+}
+
+function deliverSupervisorNoticeToBoss(pi: ExtensionAPI, agentId: string, runId: string, text: string): boolean | "recorded" {
+	const key = `${agentId}\0${runId}`;
+	const bounded = truncateTextHead(text, 8192);
+	if (supervisorNotices.get(key)?.text === bounded) return "recorded";
+	supervisorNotices.delete(key);
+	supervisorNotices.set(key, { agentId, runId, text: bounded });
+	if (supervisorNotices.size > 64) supervisorNotices.delete(supervisorNotices.keys().next().value!);
+	resetBossStatusPoll?.(); // Same worker state, but a new decision is actionable.
+	idleNotificationState.changed();
+	return remindIdleBoss(pi) ? true : "recorded";
+}
+
+function bossCanReceiveNotification(): boolean {
+	return !hostStopQuiet && !bossTurnBusy && !cutInHoldActive()
+		&& bossNotificationContext?.isIdle() === true
+		&& !bossNotificationContext.hasPendingMessages();
+}
+
+function remindIdleBoss(pi: ExtensionAPI): boolean {
+	if (PIPIUI_DEPTH !== 0 || !bossCanReceiveNotification()) return false;
+	return idleNotificationState.remind(() => pi.sendMessage({
+		customType: "pipiui-subagent-status-changed-v1",
+		content: "[subagent-status-changed] 子任务状态已更新。请调用 subagent_status() 查看并处理；这是状态提醒，不是用户的新请求。",
+		display: true,
+	}, { triggerTurn: true }));
+}
 
 /**
  * True while a wake this extension queued still sits unconsumed in Pi's
@@ -5995,6 +6046,8 @@ function reminderOpenForSignal(text: string): boolean {
 
 function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean, pi?: ExtensionAPI): boolean {
 	if (shouldSend && !shouldSend()) return false;
+	// Includes unknown/future notices and ask_boss: no classification may bypass idle-only.
+	if (PIPIUI_DEPTH === 0 && !bossCanReceiveNotification()) return false;
 	const kind = classifyRuntimeSignal(text);
 	if (!kind) return true;
 	const activity = bossDeliveryActivity();
@@ -6006,6 +6059,7 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean, pi?:
 		alreadyDelivered: false,
 	});
 	if (decision === "send") return true;
+	if (PIPIUI_DEPTH === 0) return false; // No Boss-side backlog, including reservation races.
 	if (decision === "hold") {
 		// Completed/stopped runs must not occupy slots through a long Boss turn.
 		for (let index = heldRuntimeSignals.length - 1; index >= 0; index--) {
@@ -6022,6 +6076,11 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean, pi?:
 }
 
 function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
+	if (PIPIUI_DEPTH === 0) {
+		heldRuntimeSignals.length = 0;
+		clearHeldRuntimeRetry();
+		return;
+	}
 	if (bossDeliveryActivity() !== "idle") {
 		scheduleHeldRuntimeRetry(pi);
 		return;
@@ -6080,9 +6139,10 @@ async function deliverStallWake(pi: ExtensionAPI, text: string): Promise<boolean
 }
 
 async function deliverStallWakeToBoss(pi: ExtensionAPI, text: string): Promise<boolean> {
+	if (PIPIUI_DEPTH === 0 && !bossCanReceiveNotification()) return false;
 	return deliverStallWakeThrough(pi, text, {
 		quiet: () => hostStopQuiet,
-		waitForCutIn: awaitCutInHoldRelease,
+		waitForCutIn: PIPIUI_DEPTH === 0 ? async () => {} : awaitCutInHoldRelease,
 		admit: (signal) => admitOrHoldRuntimeSignal(signal, undefined, pi),
 	});
 }
@@ -6355,7 +6415,23 @@ async function deliverConfirmedDoneToBossAsync(
 	 * forever over a line that has no acknowledgement to give.
 	 */
 	armAlarm = true,
-): Promise<boolean> {
+): Promise<boolean | "recorded"> {
+	if (PIPIUI_DEPTH === 0) {
+		// Do not retain/replay completion payloads at the Boss. Results already live on
+		// the job and in findings. Keep just one unread-state revision across busy time.
+		const identity = `${identityNamespace ?? "completion"}\0${agentId}\0${runId}`;
+		if (terminalHintIdentities.has(identity)) return "recorded";
+		terminalHintIdentities.add(identity);
+		if (terminalHintIdentities.size > 2048) terminalHintIdentities.delete(terminalHintIdentities.values().next().value!);
+		const obligation = createDoneObligation(agentId, runId, text, identityNamespace, false);
+		if (doneDeliverySettled(obligation)) return "recorded";
+		try {
+			doneDeliveryStore?.markAcknowledged(obligation.id, "Live notification only; replay retired. Worker result and episode disposition are unchanged.");
+		} catch (error) { logDonePersistenceFailure("retire-notification", obligation.id, error); }
+		idleNotificationState.changed();
+		// Retire replay without claiming a wake when only queryable state changed.
+		return remindIdleBoss(pi) ? true : "recorded";
+	}
 	// The durable channel can only address a bound Pi session. A nested leader (depth > 0)
 	// and a terminal-only pi never bind one, and sendDoneWithConfirmation refuses an entry
 	// with an empty sessionId — silently swallowing the receipt. Degrade to the one-shot.
@@ -6402,6 +6478,7 @@ async function deliverConfirmedDoneToBossAsync(
 
 /** Reconcile only the active branch and inspect the first assistant after each exact wake. */
 function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[]): void {
+	if (PIPIUI_DEPTH === 0) return; // Boss notifications no longer have a replay lifecycle.
 	if (!doneDeliveryStore || doneDeliveryPiSessionId !== piSessionId) return;
 	for (const value of branch) {
 		for (const observed of completionObservations(value)) {
@@ -6479,6 +6556,12 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 		);
 		reconcilePersistedDone(piSessionId, activeBranch);
 		for (const recovered of doneDeliveryStore.recoverable()) {
+			if (PIPIUI_DEPTH === 0) {
+				// Retire old alarm/done copies without replaying them after upgrade/reload.
+				// This closes delivery only; failed jobs remain unresolved in status.
+				doneDeliveryStore.markAcknowledged(recovered.record.id, "Legacy notification replay retired; inspect worker state with subagent_status.");
+				continue;
+			}
 			clearDoneHoldOnForget(pendingDone.get(recovered.record.id));
 			const entry: PendingDoneEntry = {
 				obligation: recovered.record,
@@ -7089,6 +7172,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 				},
 			},
 			deliverCurrent: async ({ kind, publicText, agentId, runId, envelope, job }) => {
+				if (PIPIUI_DEPTH === 0 && envelope) return deliverSupervisorNoticeToBoss(pi, agentId, runId, publicText);
 				if (envelope || kind === "completion" || kind === "wave" || kind === "upgrade_failure") {
 					return deliverConfirmedDoneToBossAsync(
 						pi,
@@ -10305,10 +10389,15 @@ function registerContextManageTool(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	if (PIPIUI_DEPTH === 0) {
+		const guarded = installIdleNotificationGuard(AgentSession);
+		pi = idleNotificationApi(pi, () => guarded && bossCanReceiveNotification());
+	}
 	// Blocks a repeat whole-board subagent_status while nothing terminal has moved.
 	// See status-poll-guard.ts: the prose "do not busy-loop poll" rule never held,
 	// because a progressing worker changes turns/preview on every read.
 	const statusPollGuard = new StatusPollGuard();
+	resetBossStatusPoll = () => statusPollGuard.reset();
 	// This module is mounted inside the recursive worker itself. Its background
 	// descendants remain owned by that worker, so only this explicit RPC marker
 	// may create a lease that defers ctx.shutdown().
@@ -10367,6 +10456,10 @@ export default function (pi: ExtensionAPI) {
 	registerFatalHookPropagation(ExtensionRunner);
 	installExtensionToolOwnershipCapture(ExtensionRunner);
 	pi.on("session_start", (_event, ctx) => {
+		bossNotificationContext = ctx;
+		idleNotificationState.reset();
+		supervisorNotices.clear();
+		terminalHintIdentities.clear();
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
 		statusPollGuard.reset();
@@ -10396,6 +10489,8 @@ export default function (pi: ExtensionAPI) {
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
 	});
 	pi.on("session_shutdown", async () => {
+		bossNotificationContext = undefined;
+		idleNotificationState.reset();
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
 		// Drop every watch subscription before the delivery host goes: no sample may enter
@@ -10456,6 +10551,7 @@ export default function (pi: ExtensionAPI) {
 		retryPendingDoneAfterSessionSettled(pi);
 	});
 	pi.on("agent_settled", (_event, ctx) => {
+		bossNotificationContext = ctx;
 		bossTurnBusy = false;
 		watchBossSendInFlight = false;
 		runtimeSignalBatchInFlight = false;
@@ -10463,6 +10559,7 @@ export default function (pi: ExtensionAPI) {
 		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
 		flushHeldRuntimeSignals(pi);
+		remindIdleBoss(pi);
 		if (!nestedBackgroundLifecycle) return;
 		nestedBackgroundLifecycle.noteSettled();
 		// Queue cancellation can terminalize without a completion callback; it must
@@ -10684,7 +10781,7 @@ export default function (pi: ExtensionAPI) {
 		// `terminate` only ends the turn when every call in the batch asks for it, so a
 		// turn that also does real work is untouched; a turn whose only act was the
 		// redundant poll is the one that stops.
-		if (!decision.allow) return { block: true, reason: decision.reason, terminate: true };
+		if (!decision.allow) return { block: true, reason: [decision.reason, supervisorNoticeStatus()].filter(Boolean).join("\n"), terminate: true };
 	});
 
 	pi.registerTool({
@@ -10732,6 +10829,8 @@ export default function (pi: ExtensionAPI) {
 	if (prevWatchdog) clearInterval(prevWatchdog); // 防扩展 reload 后旧定时器泄漏
 	const stallWatchdog = setInterval(() => {
 		const now = Date.now();
+		// User input/cancellation may clear the idle gate without another turn settling.
+		remindIdleBoss(pi);
 		// Idle-fold TTL is an independent one-shot timer. Watchdog only sweeps orphans
 		// (vanished/aborted workers whose completion hook was missed) so handles cannot leak.
 		idleFoldRegistry?.sweepOrphans(new Set(runningAgents.keys()));
@@ -11227,13 +11326,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
-		promptSnippet: "See what workers are running, what finished, and what can be resumed — check before re-dispatching.",
+		promptSnippet: "See running and finished workers — check before re-dispatching or ending a turn to wait for subagents.",
 		description: [
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
 			"The unfiltered view lists every running job plus the most recent ended jobs (same cap as a Wave line), then the most recently touched resumable workers. Older ended, resumable, and historical workers are omitted with a count; inspect one with subagent_status({agentId, full:true}), or list the whole archive with subagent_status({full:true}).",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Before a user-facing conclusion, one unfiltered status call per turn is enough for the current wave. Do not call again for each [subagent-done]. While related work remains running or stalled, the gate is on the final closeout only: do not claim final completion or summarize the goal as finished until status confirms the whole related goal is terminal. This is not a silence rule — when the user directly asks about progress or what is going on, when an important diagnostic or route decision must be reported, or when you need to explain what you are waiting for, answer with a brief factual natural-language update grounded in this tool's output. Never fabricate results, never emit one update per done event, and never send an empty assistant message to comply with the waiting protocol.",
-			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
+			"Before ending a turn to wait for subagents, call subagent_status once (reuse a current snapshot). Handle completed workers first; wait only if relevant workers are still running. Busy-time notifications are not queued; results stay queryable here. Prefer reading finished results here over spawning a new agent for the same work.",
 			"Do not busy-loop poll; one unfiltered check per turn is enough. This is enforced, not advised: a repeat unfiltered call is blocked while no worker's identity or state has changed, and the block carries the current states so a closeout gate can still be satisfied from it. A per-worker subagent_status({agentId}) is never blocked.",
 		].join(" "),
 		parameters: Type.Object({
@@ -11253,7 +11352,8 @@ export default function (pi: ExtensionAPI) {
 				onlyRunning: params.onlyRunning === true,
 				full: params.full === true,
 			};
-			const formatted = formatJobsStatus(query);
+			const formatted = [formatJobsStatus(query), supervisorNoticeStatus(query.agentId)].filter(Boolean).join("\n\n");
+			if (!query.agentId && !query.onlyRunning) idleNotificationState.read();
 			const snapshot = decideAdjacentStatusSnapshot(
 				previousUnfilteredStatusSemanticKey,
 				formatted,
@@ -11521,8 +11621,8 @@ export default function (pi: ExtensionAPI) {
 				});
 				return (
 					`${bgIgnoredWarning}Started background agent(s) (${items.length}). Each line carries the exact runId for subagent_abort({agentId, runId}); queued jobs keep the runId from acceptance. ` +
-					"You will receive a completion signal per agent when each finishes. " +
-					"Do not busy-loop poll; use subagent_status before re-dispatch. " +
+					"Boss notifications are idle-only hints, never queued while busy; results remain available in subagent_status. " +
+					"Before ending a turn to wait, check subagent_status once and handle finished workers first. Do not busy-loop poll. " +
 					"Continue other work or dispatch more independent agents.\n\n" +
 					lines.join("\n")
 				);
@@ -13312,10 +13412,10 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_watch",
 		label: "Subagent Watch",
 		description: [
-			"Periodically observe one running worker without polling subagent_status. start arms a bounded sampling subscription on the exact run: the shared 30s watchdog samples status/tool/finalization/verify transitions. Ordinary output/activity counters emit nothing. Supervisor wait/status stay silent; forward/escalate wake you. While Boss is busy, normal watch forwards coalesce to the latest snapshot per exact run instead of entering its follow-up queue.",
+			"Periodically observe one running worker without polling subagent_status. start arms a bounded sampling subscription on the exact run: the shared 30s watchdog samples status/tool/finalization/verify transitions. Ordinary output/activity counters emit nothing. Supervisor wait/status stay silent; forward/escalate may wake an idle Boss. Busy-time notifications are dropped, never queued or replayed; use subagent_status before ending a turn to wait.",
 			"Required for start/update/stop: agentId and the exact runId (from the dispatch receipt or subagent_status); a stale runId is rejected, never re-targeted at a newer run. list shows every subscription, or one exact pair when both agentId and runId are given.",
 			"intervalSecs (30–3600, default 60) only sets the sampling cadence — it is not a new timer. Optional progressLog on start/update re-aims the run's progress channel first, under the same path containment, general-purpose eligibility, and single-flight delivery as subagent_progress.",
-			"The registry is process-local and cleared on session start/shutdown. A terminal run drops its subscription silently: the run's normal completion receipt stays the only terminal notification, and watch never re-runs verify.",
+			"The registry is process-local and cleared on session start/shutdown. A terminal run drops its subscription silently; its result remains in subagent_status. Watch never re-runs verify.",
 		].join(" "),
 		promptSnippet: "Periodically observe one exact run via the shared watchdog; only state changes surface, unchanged ticks stay silent.",
 		parameters: SubagentWatchParams,

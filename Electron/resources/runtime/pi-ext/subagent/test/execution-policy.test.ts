@@ -603,7 +603,7 @@ test("subagent_status description gates the final closeout, not all progress spe
 	// closeout only; factual interim answers stay allowed and required.
 	const runtimeIndex = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 	const descStart = runtimeIndex.indexOf('"Before a user-facing conclusion');
-	const descEnd = runtimeIndex.indexOf('"Prefer reading finished results', descStart);
+	const descEnd = runtimeIndex.indexOf('"Before ending a turn to wait for subagents', descStart);
 	assert.ok(descStart >= 0 && descEnd > descStart, "subagent_status description block not found");
 	const desc = runtimeIndex.slice(descStart, descEnd);
 	assert.doesNotMatch(desc, /progress[^"]*silent/i);

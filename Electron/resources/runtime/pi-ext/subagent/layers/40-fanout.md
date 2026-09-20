@@ -1,7 +1,7 @@
 ---
 id: fanout
 name: Fan-out
-summary: Every sidecar goes out in one wave, no thrift — as wide as the work genuinely decomposes; you stay on the mainline; genuinely coupled work is kept, not blindly split; signals arrive on their own, raw artifacts stay out.
+summary: Every sidecar goes out in one wave, no thrift — as wide as the work genuinely decomposes; you stay on the mainline; genuinely coupled work is kept, not blindly split; signals wake an idle Boss, results remain queryable, raw artifacts stay out.
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]
@@ -9,8 +9,8 @@ scope: [main]
 ---
 # Fan-out: many workers, running in the background
 
-Delegation here is intrinsically concurrent. Workers run in the background, they report
-through signals rather than through you watching them, and the wave — not the single task —
+Delegation here is intrinsically concurrent. Workers run in the background, their signals can
+wake an idle Boss and their results remain queryable, and the wave — not the single task —
 is the unit you plan.
 
 While this layer is active, that is an invariant rather than a preference: the dispatch
@@ -148,10 +148,14 @@ dependent is a serialization wearing a wave's costume.
 
 ## Worker state arrives as signals
 
-You cannot see any worker panel. Worker state reaches you only through completion signals and
-{{delegate_status}}. Check status before re-dispatching — never open a duplicate worker on a
-hunch. Aborting or interrupting your own turn does not kill background workers; they still
-report when they finish.
+You cannot see any worker panel. Worker state reaches you through signals and
+{{delegate_status}}. Notifications wake the Boss only when idle and able to receive them
+directly. While the Boss is busy, compacting, or has user input waiting, worker notifications
+do not enter its followUp or steering queue; there is no backlog of long messages to replay
+later. Results, status and findings remain available through {{delegate_status}} even when no
+notification was delivered. Check status before re-dispatching — never open a duplicate worker
+on a hunch. Aborting or interrupting your own turn does not kill background workers; their
+results remain available when they finish.
 
 A text-only "already completed" reply does not stop worker signals. When a worker's work is
 already complete, use this turn's {{delegate_status}} snapshot (call once without an agent id
@@ -164,8 +168,11 @@ A heartbeat check-in means the worker is still producing output after a long wal
 (10 minutes, then 30, then every 30). Judge drift from the activity snapshot in that message;
 do not treat silence-of-the-boss as approval to keep going unexamined.
 Follow the instructions in the message you actually received rather than a recipe remembered
-from here; they are written against what really happened. One {{delegate_status}} without an
-agent id lists every job; if this turn already has that snapshot, reuse it. The completion gate
+from here; they are written against what really happened. One unfiltered {{delegate_status}}
+checks the current wave; reuse this turn's latest snapshot if you have it. Before ending the
+turn to wait, follow orchestration's status check: handle terminal workers and advance first,
+rest only for workers confirmed running, and do not repeat polls while state is unchanged.
+The completion gate
 that snapshot feeds is orchestration's rule, and it is unchanged by which signal woke you. Two
 rules hold across all signals: never pull raw artifacts (conflict diffs, full reports) into
 your context merely to route a signal, and re-dispatching an agent id reuses its worktree,

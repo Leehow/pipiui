@@ -64,7 +64,8 @@ export type SupervisorDeliveryOutcome =
 	| "boss_direct"
 	| "ignored"
 	| "rejected"
-	| "pending";
+	| "pending"
+	| "recorded";
 
 export interface SupervisorDeliveryRequest {
 	kind: SupervisorEventKind;
@@ -118,7 +119,7 @@ export interface SupervisorCurrentDelivery {
 		/** Terminal status lets the host avoid arming ordinary successful completions. */
 		job?: SupervisorJobSnapshot;
 		envelope?: BossEscalationEnvelope;
-	}): Promise<boolean | void> | boolean | void;
+	}): Promise<boolean | void | "recorded"> | boolean | void | "recorded";
 }
 
 export interface SupervisorDeliveryDeps {
@@ -312,7 +313,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		receiptId: string,
 		publicText: string,
 		envelope?: BossEscalationEnvelope,
-	): Promise<boolean> {
+	): Promise<boolean | "recorded"> {
 		const accepted = await deps.deliverCurrent({
 			kind: request.kind,
 			publicText,
@@ -322,7 +323,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			job: request.job,
 			...(envelope ? { envelope } : {}),
 		});
-		return accepted !== false;
+		return accepted === "recorded" ? "recorded" : accepted !== false;
 	}
 
 	function pendingResult(
@@ -363,7 +364,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			outcome,
 			...(decisionAction ? { decisionAction } : {}),
 		});
-		let accepted: boolean;
+		let accepted: boolean | "recorded";
 		try {
 			accepted = await invokeCurrent(request, receiptId, publicText, envelope);
 		} catch (cause) {
@@ -377,11 +378,12 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			results.push(result);
 			return result;
 		}
-		if (envelope) {
+		const woke = accepted !== "recorded";
+		if (envelope && woke) {
 			await deps.boss.send(envelope);
 			bossRequestCount += 1;
 		}
-		bossWakeCount += 1;
+		if (woke) bossWakeCount += 1;
 		bossPending.delete(receiptId);
 		pendingBossPayloads.delete(receiptId);
 		remember(receiptId);
@@ -394,12 +396,12 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			});
 		}
 		const result: SupervisorDeliveryResult = {
-			outcome,
+			outcome: woke ? outcome : "recorded",
 			receiptId,
 			supervisorPrompts,
-			bossRequests: envelope ? 1 : 0,
-			bossWakes: 1,
-			createBossObligation: true,
+			bossRequests: envelope && woke ? 1 : 0,
+			bossWakes: woke ? 1 : 0,
+			createBossObligation: woke,
 			useCurrentPath: false,
 			...(decisionAction ? { decisionAction } : {}),
 			...(error ? { error } : {}),
@@ -659,7 +661,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		}
 		bossPending.add(receiptId);
 		if (!event) {
-			let accepted: boolean;
+			let accepted: boolean | "recorded";
 			try {
 				accepted = await invokeCurrent(request, receiptId, request.publicText);
 			} catch {
@@ -672,15 +674,17 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 				results.push(result);
 				return result;
 			}
-			bossWakeCount += 1;
+			const woke = accepted !== "recorded";
+			if (woke) bossWakeCount += 1;
+			bossPending.delete(receiptId);
 			remember(receiptId);
 			const result: SupervisorDeliveryResult = {
-				outcome: "fallback",
+				outcome: woke ? "fallback" : "recorded",
 				receiptId,
 				supervisorPrompts,
 				bossRequests: 0,
-				bossWakes: 1,
-				createBossObligation: true,
+				bossWakes: woke ? 1 : 0,
+				createBossObligation: woke,
 				useCurrentPath: false,
 				error,
 			};

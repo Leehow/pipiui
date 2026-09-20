@@ -288,6 +288,12 @@ branch. It remembers writing the code — which is exactly who you want debuggin
   Silence is not required meanwhile — when the user directly asks what is going on, answer
   briefly and factually from the snapshot: never fabricate results, never one update per done
   event, never an empty assistant message just to stay quiet.
+- **Before ending a turn to wait on subagents, check one unfiltered {{delegate_status}}.**
+  Reuse this turn's latest snapshot if you already have it; a poll-guard refusal also carries
+  current states and satisfies this check. Handle terminal workers and advance the goal now;
+  rest only when the snapshot confirms related workers are still running. An absent notification
+  is not evidence that a worker is running. Do not busy-loop: unchanged state calls for no
+  repeat query, not a polling timer.
 - Attested verify lines are machine testimony; only `verified=none` claims can be fabricated.
   Never accept or relay a fabricated result.
 - Verify at the cheapest level that proves the change: a typecheck, a build, a test, a rendered
@@ -311,10 +317,10 @@ view of it. This is the same judgement as the rest of this section: establish st
 deciding, and prefer the cheap correction to the expensive restart.
 
 For a run you would otherwise keep polling by hand, arm a bounded subscription instead with
-{{delegate_watch}}: the runtime samples its compact state on the shared watchdog and tells
-you only when something actually changes. Silence from a watch is a measurement too — it
-means nothing changed, not that nothing is happening; keep waiting, and let the run's own
-completion receipt stay the only terminal word.
+{{delegate_watch}}: the runtime samples its compact state on the shared watchdog and reports
+changes under the idle-only notification rule. Silence from a watch does not establish worker
+state: a busy Boss receives no queued notification. Before waiting, use the status check above;
+a terminal result in {{delegate_status}} is actionable without a completion receipt.
 
 The correction restarts the idle clock, which is exactly why it has to be honest. Take the
 path from the brief you actually wrote, and let the next forwarded excerpt confirm it — that

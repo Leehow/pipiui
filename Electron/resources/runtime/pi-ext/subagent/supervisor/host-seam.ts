@@ -78,7 +78,7 @@ export function classifySupervisorHostAdmission(
 ): SupervisorHostAdmission {
 	if (result.outcome === "pending") return "pending";
 	if (result.useCurrentPath) return "unhandled";
-	if ((result.outcome === "supervisor" || result.outcome === "duplicate") && (result.bossWakes ?? 0) === 0) return "absorbed";
+	if ((result.outcome === "supervisor" || result.outcome === "duplicate" || result.outcome === "recorded") && (result.bossWakes ?? 0) === 0) return "absorbed";
 	return "accepted";
 }
 

@@ -66,9 +66,10 @@ export function formatPollRefusal(jobs: readonly PollJob[], repeat: number): str
 	return [
 		`[status-poll-blocked] Nothing actionable has changed since your last unfiltered subagent_status: ${scope}. This is repeat ${repeat}.`,
 		`Current states (unchanged): ${stateSummary(jobs)}.`,
-		"Polling cannot surface a completion. A finished worker sends [subagent-done] and a wedged one sends [subagent-stalled]; both start a turn for you on their own, so waiting costs nothing and misses nothing.",
-		"Do not call subagent_status again until one of those signals arrives, a worker's state changes, or the user asks. To read one worker's diagnostics meanwhile, call subagent_status({agentId}) — per-worker queries are never blocked.",
-		"If you have nothing else to do this turn, end the turn without a tool call.",
+		"Worker notifications such as [subagent-done] and [subagent-stalled] wake the Boss only when idle and able to receive them directly. While busy, compacting, or user input is waiting, they do not enter the followUp or steering queue; results remain available through subagent_status, without a notification backlog to replay.",
+		"Before ending a turn to wait on subagents, check one unfiltered subagent_status or reuse this turn's latest snapshot. These current states satisfy that check: handle terminal workers and advance the goal; wait only for workers confirmed running, never for an absent notification.",
+		"Do not busy-loop or add a polling timer: while worker identity and state are unchanged, do not repeat this query. To read one worker's diagnostics meanwhile, call subagent_status({agentId}) — per-worker queries are never blocked.",
+		"If you have nothing else to do this turn and related workers are still running, end the turn without a tool call.",
 	].join("\n");
 }
 

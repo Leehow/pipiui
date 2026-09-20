@@ -211,6 +211,17 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_start" });
       return;
     }
+    if (command.message === "__idle_subagent_status__" || command.message === "__idle_subagent_notice__") {
+      send({ type: "agent_start" });
+      send({ type: "message_end", message: {
+        id: "idle-notice", role: "custom", display: true,
+        customType: command.message === "__idle_subagent_status__" ? "pipiui-subagent-status-changed-v1" : "pipiui-subagent-notice-v1",
+        content: "[subagent-status-changed] 请调用 subagent_status() 查看最新状态。",
+      } });
+      // Direct wake: no queue_update/followUp entry precedes it.
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__file_sources_end__") {
       send({ type: "agent_start" });
       send({
