@@ -3,6 +3,7 @@
   "bundledExtensions": [
     "grok-build-oauth",
     "code-retrieval",
+    "jev-optimizer",
     "git-capability",
     "deepseek",
     "flapcode",
