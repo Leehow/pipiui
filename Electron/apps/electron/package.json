@@ -110,6 +110,16 @@
         "to": "pipiui-runtime/extensions/code-retrieval/node_modules/detect-libc"
       },
       {
+        "from": "../../resources/runtime/extensions/jev-optimizer",
+        "to": "pipiui-runtime/extensions/jev-optimizer",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/extensions/git-capability",
         "to": "pipiui-runtime/extensions/git-capability",
         "filter": [

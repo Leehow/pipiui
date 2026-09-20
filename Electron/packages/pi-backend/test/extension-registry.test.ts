@@ -15,6 +15,8 @@ import {
   type ExtensionLifecycleState,
 } from "../src/extension-registry.js";
 import { projectPiAgentDir } from "../src/project-pi-home.js";
+import { createExtensionLoader } from "../src/extension-loader.js";
+import { parseExtensionManifestJson } from "../src/extension-manifest.js";
 
 let root = "";
 afterEach(async () => {
@@ -53,6 +55,37 @@ const ILLEGAL: Array<[ExtensionLifecycleState, ExtensionLifecycleState]> = [
 ];
 
 describe("extension lifecycle state machine", () => {
+  it("honors optional manifest defaultEnabled without changing legacy origin defaults", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-defaults-"));
+    const builtin = join(root, "builtin");
+    const app = join(root, "app");
+    const project = join(root, "project");
+    for (const [directory, id, extra] of [
+      [builtin, "jev-optimizer", { defaultEnabled: false }],
+      [builtin, "legacy-builtin", {}],
+      [app, "legacy-app", {}],
+      [join(projectPiAgentDir(project), "extensions"), "legacy-project", {}],
+    ] as const) {
+      await mkdir(join(directory, id), { recursive: true });
+      await writeFile(join(directory, id, "pipiui-extension.json"), JSON.stringify({
+        id, name: id, version: "1.0.0", capabilities: [], ...extra,
+      }));
+    }
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({ registry, builtinRoot: builtin, appRoot: app });
+    loader.scan(project);
+    expect(registry.get("jev-optimizer")?.defaultEnabled).toBe(false);
+    expect(loader.spawnPackages().find(pkg => pkg.id === "jev-optimizer")?.enabled).toBe(false);
+    expect(registry.get("legacy-builtin")?.state).toBe("enabled");
+    expect(registry.get("legacy-app")?.state).toBe("loaded");
+    expect(registry.get("legacy-project")?.state).toBe("enabled");
+    expect(loader.spawnPackages({ "jev-optimizer": true }).find(pkg => pkg.id === "jev-optimizer")?.enabled).toBe(true);
+    expect(parseExtensionManifestJson(JSON.stringify({
+      id: "bad-default", name: "Bad", version: "1.0.0", capabilities: [], defaultEnabled: "false",
+    }))).toMatchObject({ ok: false, errors: ["defaultEnabled must be a boolean"] });
+    await expect(readFile(join(projectPiAgentDir(project), "trust.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("allows the D9 edges and rejects the rest", () => {
     for (const [from, to] of LEGAL) {
       expect(canTransition(from, to), `${from} → ${to}`).toBe(true);

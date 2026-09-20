@@ -260,6 +260,8 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   id: string;
   name: string;
   version: string;
+  /** Optional initial enablement; absent retains the origin's legacy default. */
+  defaultEnabled?: boolean;
   /** One-line package summary shown in the extension list. */
   description?: string;
   /** Optional catalogue category; omitted legacy packages remain visible as Other. */
@@ -1246,6 +1248,9 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     else if (parsedComponents.components.length) updateComponents = parsedComponents.components;
   }
 
+  if (value.defaultEnabled !== undefined && typeof value.defaultEnabled !== "boolean") {
+    errors.push("defaultEnabled must be a boolean");
+  }
   if (errors.length) return { ok: false, errors, fallbackId };
 
   const manifest: ValidatedExtensionManifest = {
@@ -1254,6 +1259,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     version: version!,
     capabilities,
   };
+  if (typeof value.defaultEnabled === "boolean") manifest.defaultEnabled = value.defaultEnabled;
   if (description) manifest.description = description;
   if (category) manifest.category = category;
   if (settings) manifest.settings = settings;

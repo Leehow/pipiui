@@ -238,6 +238,7 @@ import {
 import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
+import { JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
 import {
   clearExtensionSecrets,
   extensionSecretEnvs,
@@ -2179,6 +2180,7 @@ export class PiHostBackend implements HostBackend {
   private readonly planStore = new PlanStore();
   private readonly extensions: ExtensionRegistry;
   private readonly extensionLoader: ExtensionLoader;
+  private readonly jevRuntimeState = new JevRuntimeStateStore();
   /** FIFO lane for project-bound scans whose result must survive awaited migrations. */
   private extensionScanLane: Promise<void> = Promise.resolve();
   /** Watches extension discovery roots; `changed(id)` drives graceful live-session respawns. */
@@ -8385,6 +8387,16 @@ export class PiHostBackend implements HostBackend {
     scopeValue: unknown,
     projectIdValue: unknown,
   ): Promise<ExtensionRecord> {
+    const update = () => this.setExtensionEnabledNow(idValue, enabledValue, scopeValue, projectIdValue);
+    return typeof idValue === "string" && idValue.trim() === JEV_EXTENSION_ID
+      ? this.jevRuntimeState.exclusive(update) : update();
+  }
+  private async setExtensionEnabledNow(
+    idValue: unknown,
+    enabledValue: unknown,
+    scopeValue: unknown,
+    projectIdValue: unknown,
+  ): Promise<ExtensionRecord> {
     if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
     if (typeof enabledValue !== "boolean") throw new Error("enabled 必须是 boolean");
     const scope = scopeValue as ExtensionEnableScope;
@@ -8395,12 +8407,15 @@ export class PiHostBackend implements HostBackend {
     if (current.state === "error") throw new Error(`extension ${id} is in error; not retrying`);
     if (enabledValue) await this.assertContributionCanEnable(id, projectIdValue);
     if (scope === "app") {
+      const jevRoots = id === JEV_EXTENSION_ID ? await this.openJevProjectRoots() : [];
+      for (const root of jevRoots) this.jevRuntimeState.revoke(root);
       const overlay = await this.updateSettings((settings) => {
         writeAppExtensionEnabled(settings, id, enabledValue);
         return readAppExtensionEnabled(settings);
       });
       if (enabledValue) this.extensions.enable(id);
       else this.extensions.disable(id);
+      for (const root of jevRoots) await this.projectJevRuntimeState(root);
       // Contribution enablement changes model availability: flip the authority shut in THIS
       // synchronous continuation, before any further await. A provider-less extension leaves
       // it untouched (nothing pinnable can change); the refresh below reopens it for real.
@@ -8424,7 +8439,9 @@ export class PiHostBackend implements HostBackend {
       throw new Error("projectId 必须是 string");
     }
     const root = await this.projectPath(projectIdValue);
+    if (id === JEV_EXTENSION_ID) this.jevRuntimeState.revoke(root);
     const overlay = await writeProjectExtensionEnabled(projectPiAgentDir(root), id, enabledValue);
+    if (id === JEV_EXTENSION_ID) await this.projectJevRuntimeState(root);
     const record = this.extensions.list(overlay).find((item) => item.id === id);
     if (!record) throw new Error(`unknown extension ${id}`);
     await this.refreshCatalogAfterExtensionChange(id);
@@ -8538,6 +8555,15 @@ export class PiHostBackend implements HostBackend {
     patchValue: unknown,
     projectId?: unknown,
   ): Promise<ExtInvokeResult<Record<string, unknown>>> {
+    const update = () => this.updateExtensionSettingsNow(idValue, patchValue, projectId);
+    return typeof idValue === "string" && idValue.trim() === JEV_EXTENSION_ID
+      ? this.jevRuntimeState.exclusive(update) : update();
+  }
+  private async updateExtensionSettingsNow(
+    idValue: unknown,
+    patchValue: unknown,
+    projectId?: unknown,
+  ): Promise<ExtInvokeResult<Record<string, unknown>>> {
     if (typeof idValue !== "string" || !idValue.trim()) {
       return settingsDenied("not_found", "extension id 必须是 string");
     }
@@ -8557,9 +8583,14 @@ export class PiHostBackend implements HostBackend {
       return settingsDenied("capability_denied", `secret values must be at least ${MIN_SECRET_LEN} characters`);
     }
     const scope = manifest?.scope ?? "app";
+    const jevKeyChanged = id === JEV_EXTENSION_ID && (
+      Object.prototype.hasOwnProperty.call(validated.secrets, JEV_SECRET_KEY) || validated.cleared.includes(JEV_SECRET_KEY)
+    );
     if (scope === "project") {
       const root = await this.resolveExtensionSettingsProject(projectId);
       if (!root) return settingsDenied("no_session", "project-scoped settings require a project");
+      // This project's namespace is isolated; revoke all its live consumers via one file.
+      if (jevKeyChanged) this.jevRuntimeState.revoke(root);
       const namespace = this.extensionVaultNamespace(scope, root);
       // Durable projection first: paddleocr.json is authoritative across restarts.
       await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
@@ -8581,8 +8612,14 @@ export class PiHostBackend implements HostBackend {
       const existing = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
       const next = { ...existing, ...validated.values };
       await writeProjectExtensionSettingsValues(projectPiAgentDir(root), id, next, manifest?.settingsVersion);
-      this.notifyExtensionSettingsChanged(id, next);      return { ok: true, data: next };
+      if (id === JEV_EXTENSION_ID) await this.projectJevRuntimeState(root);
+      this.notifyExtensionSettingsChanged(id, next);
+      return { ok: true, data: next };
     }
+    // An app-scoped credential really is shared: never reuse one project's enablement
+    // for its peers, and never write a project that is not open or consuming it live.
+    const jevRoots = jevKeyChanged ? await this.openJevProjectRoots() : [];
+    for (const root of jevRoots) this.jevRuntimeState.revoke(root);
     if (Object.keys(validated.secrets).length > 0) {
       try {
         await putExtensionSecrets(this.vaultDir, validated.secrets);
@@ -8604,6 +8641,7 @@ export class PiHostBackend implements HostBackend {
       writeAppExtensionSettingsValues(settings, id, merged, manifest?.settingsVersion);
       return merged;
     });
+    for (const root of jevRoots) await this.projectJevRuntimeState(root);
     this.notifyExtensionSettingsChanged(id, next);
     return { ok: true, data: next };
   }
@@ -8830,13 +8868,36 @@ export class PiHostBackend implements HostBackend {
     }
     return env;
   }
+  private async openJevProjectRoots(): Promise<string[]> {
+    return [...new Set([
+      ...(await this.loadProjectPaths()),
+      ...[...this.live.values()].map((live) => live.projectRoot ?? live.cwd),
+    ])];
+  }
+  private async projectJevRuntimeState(projectRoot: string): Promise<void> {
+    this.extensionLoader.scan(projectRoot);
+    const overlay = await this.mergedExtensionOverlay(projectRoot);
+    const pkg = this.extensionLoader.spawnPackages(overlay).find((item) => item.id === JEV_EXTENSION_ID);
+    const secretEnv = await this.spawnSecretEnvFor(JEV_EXTENSION_ID, projectRoot);
+    this.jevRuntimeState.ensure(projectRoot, {
+      enabled: Boolean(pkg?.enabled && pkg.extensionPath),
+      hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()),
+    });
+  }
   private async registeredExtensionsForSpawn(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
+    return this.jevRuntimeState.exclusive(() => this.registeredExtensionsForSpawnNow(projectRoot));
+  }
+  private async registeredExtensionsForSpawnNow(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
     this.extensionLoader.scan(projectRoot);
     const overlay = await this.mergedExtensionOverlay(projectRoot);
     const packages = this.extensionLoader.spawnPackages(overlay);
     const out: SpawnRegisteredExtension[] = [];
+    if (!packages.some((pkg) => pkg.id === JEV_EXTENSION_ID) && this.jevRuntimeState.has(projectRoot)) {
+      this.jevRuntimeState.ensure(projectRoot, { enabled: false, hasKey: false });
+    }
     for (const pkg of packages) {
       if (!pkg.enabled || !pkg.extensionPath) {
+        if (pkg.id === JEV_EXTENSION_ID) await this.projectJevRuntimeState(projectRoot);
         out.push(pkg);
         continue;
       }
@@ -8864,7 +8925,10 @@ export class PiHostBackend implements HostBackend {
       } catch (error) {
         console.warn(`[${pkg.id}] spawn secret resolution failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-      out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}) });
+      const jevRuntimeState = pkg.id === JEV_EXTENSION_ID
+        ? this.jevRuntimeState.ensure(projectRoot, { enabled: true, hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()) })
+        : undefined;
+      out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}), ...(jevRuntimeState ? { jevRuntimeState } : {}) });
     }
     // Recovery-seed mount overrides: shared-store installs (active/previous slot)
     // supersede the bundled seed copies of the six core-capability extensions.
@@ -8901,7 +8965,7 @@ export class PiHostBackend implements HostBackend {
       if (!live.mountedExtensionIds || this.sidebarArchivedCache.has(sessionId)) continue;
       let nextMountedIds: ReadonlySet<string>;
       try {
-        const registered = await this.registeredExtensionsForSpawn(live.cwd);
+        const registered = await this.registeredExtensionsForSpawn(live.projectRoot ?? live.cwd);
         nextMountedIds = new Set(registered.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id));
       } catch {
         continue;

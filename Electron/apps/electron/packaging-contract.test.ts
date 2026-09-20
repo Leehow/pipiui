@@ -57,6 +57,12 @@ describe('macOS packaging contract', () => {
     expect(runtimeSource?.filter).toContain('!**/target/**')
     expect(runtimeSource?.filter).toContain('!extensions/office-extension/bin/**/officecli')
     expect(runtimeSource?.filter).toContain('!extensions/office-extension/bin/**/officecli.exe')
+    const jev = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/jev-optimizer')
+    expect(jev).toEqual({
+      from: '../../resources/runtime/extensions/jev-optimizer',
+      to: 'pipiui-runtime/extensions/jev-optimizer',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo'],
+    })
     const codeRetrieval = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/code-retrieval')
     expect(codeRetrieval?.filter).toContain('!**/target/**')
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
