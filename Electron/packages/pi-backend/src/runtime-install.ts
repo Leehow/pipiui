@@ -16,14 +16,14 @@ const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist"
  * re-synced with `keepDist` after the generic `extensions` pass so their build
  * artifacts survive both the signature and the copy.
  *
- * `pdf-extension` additionally keeps its owned vendored dependency tree
- * (`vendor/pdf-inspector/node_modules`, see BUNDLED_KEEP_NODE_MODULES) so its
- * compiled agent resolves the pdf-inspector native/WASM engine relative to
- * itself instead of through a host path contract.
+ * `pdf-extension` and `code-retrieval` additionally keep their owned production
+ * dependency trees (see BUNDLED_KEEP_NODE_MODULES). Their compiled agents must
+ * resolve the PDF engine and zvec/native bindings from the installed mirror,
+ * not accidentally from the source checkout or the App bundle.
  */
 export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "jev-optimizer", "git-capability", "deepseek", "flapcode", "qoder", "pipiui-headroom", "office-extension", "pdf-extension", "vision-routing", "web-search-keys", "external-session-scan", "pipiui-theme-pack"];
 /** Bundled manifest extensions that ship an owned `node_modules` inside their mirrored tree. */
-const BUNDLED_KEEP_NODE_MODULES: ReadonlySet<string> = new Set(["pdf-extension"]);
+const BUNDLED_KEEP_NODE_MODULES: ReadonlySet<string> = new Set(["pdf-extension", "code-retrieval"]);
 /** Optional packaging-time selection of dist/node_modules-heavy runtime assets. */
 export const RUNTIME_BUNDLE_MANIFEST_FILENAME = "pipiui-runtime-manifest.json";
 export const RUNTIME_BUNDLE_MANIFEST_SCHEMA_VERSION = 1 as const;

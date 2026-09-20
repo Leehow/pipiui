@@ -107,6 +107,47 @@ describe("installRuntimeTree", () => {
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
+  it("restores code-retrieval dependencies from an old stripped mirror and tracks dependency-only changes", async () => {
+    const root = await temp();
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      for (const name of ["pi-core-prompt", "pi-ext", "pi-philosophy", "built-in-skills", "pi-goal", "profiles", "extensions"]) {
+        await mkdir(join(source, name), { recursive: true });
+      }
+      const ext = join(source, "extensions", "code-retrieval");
+      const dep = "node_modules/@zvec/zvec/src/index.mjs";
+      await mkdir(join(ext, "agent/dist"), { recursive: true });
+      await mkdir(join(ext, "node_modules/@zvec/zvec/src"), { recursive: true });
+      await writeFile(join(ext, "agent/dist/index.js"), "export default () => {};\n");
+      await writeFile(join(ext, dep), "export const version = 1;\n");
+      await mkdir(join(source, "extensions/jev-optimizer/agent/dist"), { recursive: true });
+      await mkdir(join(source, "extensions/jev-optimizer/node_modules/dev-only"), { recursive: true });
+      await writeFile(join(source, "extensions/jev-optimizer/agent/dist/index.js"), "export default () => {};\n");
+      await writeFile(join(source, "extensions/jev-optimizer/node_modules/dev-only/index.js"), "dev-only\n");
+      await writeFile(join(source, "pipiui-runtime-manifest.json"), JSON.stringify({
+        schemaVersion: 1, bundledExtensions: ["code-retrieval", "jev-optimizer"], includeAnydoc: false,
+      }));
+      const installed = join(destination, "extensions", "code-retrieval");
+      // Reproduce the previous policy and its stored signature, not just a clean install.
+      syncTree(join(source, "extensions"), join(destination, "extensions"));
+      syncTree(ext, installed, undefined, { keepDist: true });
+      expect(existsSync(join(installed, dep))).toBe(false);
+
+      expect(installRuntimeTree({ sourceRoot: source }, destination).failures).toEqual([]);
+      expect(await readFile(join(installed, dep), "utf8")).toContain("version = 1");
+      expect(existsSync(join(destination, "extensions/jev-optimizer/node_modules"))).toBe(false);
+      expect(installRuntimeTree({ sourceRoot: source }, destination).unchanged).toContain(installed);
+
+      await writeFile(join(ext, dep), "export const version = 2;\n");
+      await utimes(join(ext, dep), new Date(), new Date(Date.now() + 5000));
+      const refreshed = installRuntimeTree({ sourceRoot: source }, destination);
+      expect(refreshed.failures).toEqual([]);
+      expect(refreshed.installed).toContain(installed);
+      expect(await readFile(join(installed, dep), "utf8")).toContain("version = 2");
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
   it("honors an empty runtime bundle manifest without demanding omitted optional packages", async () => {
     const root = await temp();
     try {

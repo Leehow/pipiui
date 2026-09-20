@@ -164,20 +164,55 @@ function metaPath(projectRoot: string): string {
 type ZvecModule = typeof import("@zvec/zvec");
 type ZvecCollection = import("@zvec/zvec").ZVecCollection;
 
+export type ZvecLoadFailureKind = "disabled" | "missing_module" | "native_load" | "unknown";
+
+const ZVEC_LOAD_REASONS: Record<ZvecLoadFailureKind, string> = {
+  disabled: "zvec disabled (PIPIUI_CODE_RETRIEVAL_ZVEC=0)",
+  missing_module: "zvec dependency missing",
+  native_load: "zvec native binding or platform package failed to load",
+  unknown: "zvec failed to load",
+};
+
+export function classifyZvecLoadError(error: unknown): Exclude<ZvecLoadFailureKind, "disabled"> {
+  const code =
+    error && typeof error === "object" && "code" in error && error.code != null
+      ? String(error.code)
+      : "";
+  if (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND") return "missing_module";
+  if (code === "ERR_DLOPEN_FAILED") return "native_load";
+  const msg = error instanceof Error ? error.message : "";
+  if (msg.includes("Failed to load prebuilt binary") || msg.includes("ERR_DLOPEN_FAILED")) {
+    return "native_load";
+  }
+  return "unknown";
+}
+
+export function zvecLoadFailureReason(kind: ZvecLoadFailureKind): string {
+  return ZVEC_LOAD_REASONS[kind];
+}
+
 let zvecMod: ZvecModule | null | undefined;
 let zvecInit = false;
+let zvecLoadReason: string | undefined;
+
+function unavailableReason(): string {
+  return zvecLoadReason ?? zvecLoadFailureReason("unknown");
+}
 
 async function loadZvec(): Promise<ZvecModule | null> {
   if (zvecMod !== undefined) return zvecMod;
   if (process.env.PIPIUI_CODE_RETRIEVAL_ZVEC === "0") {
     zvecMod = null;
+    zvecLoadReason = zvecLoadFailureReason("disabled");
     return null;
   }
   try {
     zvecMod = await import("@zvec/zvec");
+    zvecLoadReason = undefined;
     return zvecMod;
-  } catch {
+  } catch (error) {
     zvecMod = null;
+    zvecLoadReason = zvecLoadFailureReason(classifyZvecLoadError(error));
     return null;
   }
 }
@@ -452,6 +487,7 @@ export async function rebuildZvecIndex(
   options: { excludeGlobs?: string[]; signal?: AbortSignal } = {},
 ): Promise<{ ok: boolean; reason?: string }> {
   try {
+    if (!(await loadZvec())) return { ok: false, reason: unavailableReason() };
     const ok = await buildIndex(projectRoot, options.excludeGlobs ?? [], options.signal);
     return ok ? { ok: true } : { ok: false, reason: "@zvec/zvec is not available" };
   } catch (error) {
@@ -525,7 +561,7 @@ async function searchZvec(args: SemanticSearchArgs): Promise<SemanticOutcome> {
   args.signal?.throwIfAborted();
   const mod = await loadZvec();
   args.signal?.throwIfAborted();
-  if (!mod) return { available: false, hits: [], reason: "@zvec/zvec native bindings are not loaded" };
+  if (!mod) return { available: false, hits: [], reason: unavailableReason() };
   const ready = await ensureIndex(args.projectRoot, args.excludeGlobs ?? [], args.signal);
   args.signal?.throwIfAborted();
   if (!ready) return { available: false, hits: [], reason: "zvec index failed to build" };
