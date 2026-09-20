@@ -85,3 +85,25 @@ cannot shadow bundled workflows), then `PIPIUI_SKILL_ROOTS`, the opened project'
 **Worktree ownership**:
 `.pi/worktrees/*` on `pipiui/*` branches belong to the in-app `SubagentStore`; external
 Codex worktrees go through `codex-worktree-lifecycle`. Linked worktrees are build/test-only.
+
+## 实验
+
+**实验台（Experiment Lab）**：
+PipiUI 中按需制作候选方案、隔离运行、展示证据并交由用户决定是否采用的能力；不指所有开发任务必经的原型流程。
+_避免混称_：原型生成器、自动优化器、沙盒本身。
+
+**实验（Experiment）**：
+围绕一个明确问题组织的、带固定基线、方案、测例、指标和预算的比较单元；可包含多次运行，不等于一次测试命令。
+
+**方案（Variant）**：
+实验中解释一个候选假设的代码或配置版本，现状也可作为基线方案；冻结后改变内容应进入新的实验修订。
+_避免混称_：Worker、分支（它们只是承载方式）。
+
+**单次运行（Trial）**：
+某一实验修订中，一个方案对一个测例的一次实际执行；重复运行仍是同一测例的重复，不是新增独立样本。
+
+**采纳（Adoption）**：
+用户选择以某个冻结方案和证据作为正式实现依据；不等于测试通过，也不等于原型自动合并或已经上线。
+
+**试验隔离／执行安全沙盒**：
+试验隔离分开代码、数据和运行状态；执行安全沙盒用技术边界限制进程文件与网络权限。Git worktree 本身仅提供前者，不证明后者。
