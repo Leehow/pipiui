@@ -289,6 +289,17 @@ describe("pipiui-coding-tools extension", () => {
       expect(grep.promptGuidelines?.join("\n")).toMatch(/mode=count or mode=files/i);
     });
 
+    it("advertises pre-grep routing guidance while preserving exact matching and known-file reads", async () => {
+      const { grep } = await grepFixture();
+      expect(grep.description).toMatch(/code_search.*available/i);
+      const guidelines = grep.promptGuidelines?.join("\n") ?? "";
+      expect(guidelines).toMatch(/code_search.*available/i);
+      expect(guidelines).toMatch(/known.*(?:identifiers|strings)/i);
+      expect(guidelines).toMatch(/guessed.*patterns/i);
+      expect(guidelines).toMatch(/code_nav.*available/i);
+      expect(guidelines).toMatch(/known file.*read/i);
+    });
+
     it("delegates a simple search unchanged to the base tool", async () => {
       const { cwd, grep } = await grepFixture();
       const result = await grep.execute("c1", { pattern: "cadence" }, undefined, undefined, { cwd });

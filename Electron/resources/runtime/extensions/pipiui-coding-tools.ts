@@ -87,12 +87,16 @@ function registerCompositeGrep(pi: ExtensionAPI) {
 		...prototype,
 		description:
 			`${prototype.description} ` +
+			"Use code_search when available for locating code by description; grep is for known text or regex patterns. " +
 			"Also supports composite search in one call: `patterns` (several patterns at once, one section each), " +
 			"`paths` (several directories/files; absolute paths work, so never cd in bash first), " +
 			"`mode`=\"count\" (per-file match counts, like grep -c) or \"files\" (matching file paths, like grep -l), " +
 			"and `exclude` (glob patterns to skip, like 'node_modules' or '*.jsonl').",
 		promptGuidelines: [
 			...(prototype.promptGuidelines ?? []),
+			"Use grep for known exact identifiers, strings, error messages, or deliberate regex patterns; an unknown location is not an exact-match task.",
+			"For locating code from a description, use code_search when available rather than trying a sequence of guessed grep patterns. If retrieval tools are unavailable, retain the grep/read fallback.",
+			"For symbol relationships, prefer code_nav when available. For returned refs, use read_spans when available; for a known file, use read rather than searching again.",
 			"Search any directory with grep's path/paths parameter (absolute paths allowed) — never run `cd` + grep in bash.",
 			"Batch related searches into one grep call with patterns[] or paths[] instead of chaining greps in bash.",
 			"Use grep with mode=count or mode=files instead of `grep -c` / `grep -rl` in bash.",
