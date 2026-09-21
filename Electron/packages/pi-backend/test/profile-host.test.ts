@@ -199,6 +199,7 @@ describe("Product Profile host interface", () => {
       "document-workbench",
       "webview-browser-extension",
       "agent-orchestration",
+      "autoresearch",
       "git-capability",
       // Bundled platform layers and provider/utility extensions the Coding
       // product ships with: a coding project must not lose grok/deepseek

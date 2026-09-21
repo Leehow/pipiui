@@ -1,0 +1,15 @@
+{
+  "name": "@pipiui/autoresearch-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "自动研究：内置上游 pi-autoresearch 的自主实验循环（指标、保留改进、丢弃退步）",
+  "scripts": {
+    "build": "node ../../scripts/sync-bundled-extension.mjs autoresearch-extension",
+    "test": "vitest run",
+    "pretest": "npm run build"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}

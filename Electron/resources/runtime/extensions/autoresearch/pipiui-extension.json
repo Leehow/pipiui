@@ -1,0 +1,25 @@
+{
+  "id": "autoresearch",
+  "name": "自动研究",
+  "version": "0.1.0",
+  "description": "自主实验循环：设定指标，反复尝试、保留改进、丢弃退步。直接说：帮我循环优化 X / 跑 autoresearch。",
+  "category": "coding",
+  "capabilities": [],
+  "agent": {
+    "extension": "vendor/pi-autoresearch/extensions/pi-autoresearch/index.ts",
+    "skills": ["skills", "vendor/pi-autoresearch/skills"]
+  },
+  "runtimeAssets": ["vendor/pi-autoresearch", "skills"],
+  "updateComponents": [
+    {
+      "id": "pi-autoresearch",
+      "name": "pi-autoresearch",
+      "version": "1.8.1",
+      "source": { "type": "npm", "packageName": "pi-autoresearch" },
+      "upstream": "https://github.com/davebcn87/pi-autoresearch",
+      "license": "MIT"
+    }
+  ],
+  "settingsVersion": 1,
+  "migrations": []
+}

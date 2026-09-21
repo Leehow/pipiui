@@ -12,6 +12,7 @@
     ],
     "recommended": [
       { "id": "agent-orchestration", "version": "^1.0.0" },
+      { "id": "autoresearch", "version": "^0.1.0" },
       { "id": "built-in-skills", "version": "^1.0.0" },
       { "id": "code-retrieval", "version": "^1.0.0" },
       { "id": "cua-extension", "version": "^0.1.0" },
