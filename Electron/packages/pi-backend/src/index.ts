@@ -239,6 +239,7 @@ import { handleExtEmit, handleExtState, toolResultDetailsField } from "./extensi
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import { JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
+import { JevCredentialStore, type ExtensionSecretCipher } from "./jev-credential-store.js";
 import {
   clearExtensionSecrets,
   extensionSecretEnvs,
@@ -726,6 +727,12 @@ export type PiBackendOptions = {
   /** Test-injected Structured Outputs validator. Production loads the grok host entry. */ structuredOutputNormalize?: StructuredOutputNormalize;
   structuredOutputsEnabled?: StructuredOutputsEnabled;
   /** In-memory vault namespace key. Never used as a disk path. */ vaultDir?: string;
+  /**
+   * Host-injected OS encryption for the Jev extension API key. The global tool vault
+   * stays RAM-only. Absent: reads without stored credentials work, but saving a key
+   * fails explicitly. Electron injects OS encryption; tests inject a fake cipher.
+   */
+  extensionSecretCipher?: ExtensionSecretCipher;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /**
@@ -2186,6 +2193,7 @@ export class PiHostBackend implements HostBackend {
   private readonly extensions: ExtensionRegistry;
   private readonly extensionLoader: ExtensionLoader;
   private readonly jevRuntimeState = new JevRuntimeStateStore();
+  private readonly jevCredentials: JevCredentialStore;
   /** FIFO lane for project-bound scans whose result must survive awaited migrations. */
   private extensionScanLane: Promise<void> = Promise.resolve();
   /** Watches extension discovery roots; `changed(id)` drives graceful live-session respawns. */
@@ -2388,6 +2396,7 @@ export class PiHostBackend implements HostBackend {
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.vaultDir = options.vaultDir ?? this.agentDir;
+    this.jevCredentials = new JevCredentialStore(options.extensionSecretCipher);
     this.agentPersistMinIntervalMs = options.agentPersistMinIntervalMs ?? AGENT_PERSIST_MIN_INTERVAL_MS;
     this.agentLogPersistDebounceMs = options.agentLogPersistDebounceMs ?? AGENT_LOG_PERSIST_DEBOUNCE_MS;
     this.agentRetentionMaxTerminal = options.agentRetentionMaxTerminal ?? AGENT_RETENTION_MAX_TERMINAL;
@@ -8528,6 +8537,13 @@ export class PiHostBackend implements HostBackend {
     return secretEnvName(PDF_EXTENSION_SECRET_KEY);
   }
   private async getExtensionSettings(idValue: unknown, projectId?: unknown): Promise<Record<string, unknown>> {
+    const read = () => this.getExtensionSettingsNow(idValue, projectId);
+    // Hydration writes the per-run cache. Serialize it with key clear/replace so a
+    // delayed read of the old ciphertext cannot resurrect a revoked credential.
+    return typeof idValue === "string" && idValue.trim() === JEV_EXTENSION_ID
+      ? this.jevRuntimeState.exclusive(read) : read();
+  }
+  private async getExtensionSettingsNow(idValue: unknown, projectId?: unknown): Promise<Record<string, unknown>> {
     if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
     const id = idValue.trim();
     if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
@@ -8542,6 +8558,7 @@ export class PiHostBackend implements HostBackend {
       const legacyConfigured = id === PDF_EXTENSION_ID && secretKeys.has(PDF_EXTENSION_SECRET_KEY)
         ? Boolean(await this.legacyPaddleOcrToken(root))
         : false;
+      if (id === JEV_EXTENSION_ID) await this.hydrateJevCredential(root);
       const presence = {
         ...(legacyConfigured ? { [PDF_EXTENSION_SECRET_KEY]: true as const } : {}),
         ...secretPresence(this.extensionVaultNamespace(scope, root), secretKeys),
@@ -8551,6 +8568,36 @@ export class PiHostBackend implements HostBackend {
     }
     const values = readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
     return { ...values, ...secretPresence(this.vaultDir, secretKeys) };
+  }
+  /**
+   * Durable OS-encrypted projection for the Jev API key ({projectAgentHome}/jev-optimizer/credential.enc).
+   * Written atomically BEFORE the per-run vault cache, matching the PDF durable-then-cache order
+   * without copying its plaintext file. Missing encryption must never pretend a key was saved.
+   * Clear deletes the blob even without a cipher so it cannot resurrect.
+   */
+  private async persistJevCredential(
+    extensionId: string,
+    projectRoot: string,
+    mutation: { saved?: Record<string, string>; cleared?: readonly string[] },
+  ): Promise<void> {
+    if (extensionId !== JEV_EXTENSION_ID || !projectRoot) return;
+    const saved = mutation.saved?.[JEV_SECRET_KEY];
+    if (typeof saved === "string") {
+      await this.jevCredentials.write(projectRoot, saved);
+      return;
+    }
+    if (mutation.cleared?.includes(JEV_SECRET_KEY)) {
+      await this.jevCredentials.clear(projectRoot);
+    }
+  }
+  /** Restore the durable Jev key into the same project vault namespace used by presence and spawn. */
+  private async hydrateJevCredential(projectRoot: string): Promise<void> {
+    const namespace = this.extensionVaultNamespace("project", projectRoot);
+    const existing = extensionSecretEnvs(namespace, new Set([JEV_SECRET_KEY]));
+    if (existing[JEV_SECRET_ENV]?.trim()) return;
+    const value = await this.jevCredentials.read(projectRoot);
+    if (!value) return;
+    await putExtensionSecrets(namespace, { [JEV_SECRET_KEY]: value });
   }
   /**
    * TEMPORARY pdf-extension adapter: project the generic-settings value into its one
@@ -8618,8 +8665,13 @@ export class PiHostBackend implements HostBackend {
         this.jevRuntimeState.revokeBrowser(root);
       }
       const namespace = this.extensionVaultNamespace(scope, root);
-      // Durable projection first: paddleocr.json is authoritative across restarts.
+      // Durable projection first: paddleocr.json / Jev ciphertext are authoritative across restarts.
       await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
+      try {
+        await this.persistJevCredential(id, root, { saved: validated.secrets, cleared: validated.cleared });
+      } catch (error) {
+        return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+      }
       if (Object.keys(validated.secrets).length > 0) {
         try {
           await putExtensionSecrets(namespace, validated.secrets);
@@ -8883,13 +8935,16 @@ export class PiHostBackend implements HostBackend {
    * from the extension vault namespace (a per-run cache mirroring each key's durable
    * store) and returned keyed by env var name. Values never enter settings snapshots,
    * IPC payloads, or redaction/transcript surfaces. For pdf-extension the durable
-   * store is `{projectAgentHome}/paddleocr.json`, kept in lockstep by the generic
-   * channel, so post-restart spawns resolve the identical value here.
+   * store is `{projectAgentHome}/paddleocr.json`; for jev-optimizer it is the
+   * OS-encrypted `{projectAgentHome}/jev-optimizer/credential.enc`. Both hydrate into
+   * the same project vault namespace used by settings presence, so code and browser
+   * spawns share one credential after restart.
    */
   private async spawnSecretEnvFor(extensionId: string, projectRoot: string): Promise<Record<string, string>> {
     const manifest = this.extensions.settingsManifest(extensionId);
     const keys = secretPropertyKeys(manifest?.schema);
     if (!keys.size) return {};
+    if (extensionId === JEV_EXTENSION_ID) await this.hydrateJevCredential(projectRoot);
     const namespace = this.extensionVaultNamespace(manifest?.scope, projectRoot);
     const env = extensionSecretEnvs(namespace, keys);
     const missing = [...keys].filter((key) => !(secretEnvName(key) in env));
@@ -8909,7 +8964,12 @@ export class PiHostBackend implements HostBackend {
     this.extensionLoader.scan(projectRoot);
     const overlay = await this.mergedExtensionOverlay(projectRoot);
     const pkg = this.extensionLoader.spawnPackages(overlay).find((item) => item.id === JEV_EXTENSION_ID);
-    const secretEnv = await this.spawnSecretEnvFor(JEV_EXTENSION_ID, projectRoot);
+    let secretEnv: Record<string, string> = {};
+    try {
+      secretEnv = await this.spawnSecretEnvFor(JEV_EXTENSION_ID, projectRoot);
+    } catch (error) {
+      console.warn(`[jev-optimizer] credential restore failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const enabled = Boolean(pkg?.enabled && pkg.extensionPath);
     let browserEnabled = false;
     if (enabled) {
@@ -12523,3 +12583,10 @@ export {
 } from "./secret-vault.js";
 export { FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from "./freeze-probe.js";
 export { HEADROOM_ENGINE_VERSION } from "./headroom-managed-runtime.js";
+export {
+  JevCredentialStore,
+  jevCredentialCipherPath,
+  EXTENSION_SECRET_ENCRYPTION_UNAVAILABLE,
+  JEV_CREDENTIAL_DECRYPT_FAILED,
+  type ExtensionSecretCipher,
+} from "./jev-credential-store.js";

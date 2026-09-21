@@ -2,6 +2,7 @@ import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, powerMo
 import { basename, join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
+import { createElectronExtensionSecretCipher } from './extension-secret-cipher.js'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -313,6 +314,7 @@ if (app) {
       runtimeRoot,
       agentDir: piProfile.agentDir,
       vaultDir: piProfile.agentDir,
+      extensionSecretCipher: createElectronExtensionSecretCipher(),
       sessionsRoot: piProfile.sessionsRoot,
       canonicalModelsWrite: modelsWriteQueue,
       profileInitialization: profileInstall,

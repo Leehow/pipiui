@@ -3,7 +3,7 @@
   "name": "Jev 优化",
   "version": "1.0.0",
   "category": "knowledge",
-  "description": "可选 TypeSafe Jev 检索重排及独立授权的浏览器候选评分。默认关闭；无 key 时基础检索与浏览器观察不受影响。",
+  "description": "TypeSafe Jev 决策扩展：共用一份凭据提供检索评分与浏览器 Choice 动作控制。默认关闭；无 key 时基础检索与普通浏览器工具不受影响。",
   "defaultEnabled": false,
   "capabilities": [],
   "agent": {
@@ -18,14 +18,14 @@
           "ext.jev-optimizer.browserEnabled": {
             "type": "boolean",
             "default": false,
-            "title": "允许浏览器候选云端评分",
-            "description": "另行允许将当前目标和脱敏控件/区域描述发送给 TypeSafe，可能收费；不会发送截图或整个页面。控件描述仍可能含业务数据。关闭后立即撤销浏览器评分，不影响代码检索；未挂载扩展或更换 key 需开启新会话。"
+            "title": "允许 Jev 浏览器云端决策（Choice / Score）",
+            "description": "允许将任务目标和脱敏控件/选项描述发送给 TypeSafe，用于选择浏览器动作或候选评分，可能收费；不发送截图或整个页面。描述仍可能含业务数据。Choice 仅在显式调用 browser goal 时执行，不改变普通 observe。关闭后撤销浏览器决策，不影响代码检索；未挂载扩展或更换 key 需开启新会话。"
           },
           "ext.jev-optimizer.apiKey": {
             "type": "string",
             "format": "secret",
             "title": "TypeSafe API Key",
-            "description": "启用后会将查询、相对路径/符号和受限源码片段发送给 TypeSafe 云端评价。未配置 key 时基础检索仍可使用。更换或刷新 key 后需开启新会话才会生效。"
+            "description": "本项目所有 Jev 功能共用此 key，包括代码检索评分与浏览器 Choice / Score。凭据加密持久保存，重启后恢复；不需要在通用密钥库另填一份。检索启用后会发送查询及受限源码片段，浏览器外发由上方开关控制。更换 key 后需开启新会话。"
           }
         }
       }

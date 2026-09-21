@@ -1,6 +1,8 @@
 import { CHANNEL_DISCOVER, CHANNEL_PROVIDE, CHANNEL_WITHDRAW, JEV_PROVIDER } from "./protocol.js";
 import { BROWSER_DISCOVER, BROWSER_PROVIDE, BROWSER_WITHDRAW, executeBrowserAvailability, executeBrowserRerank, type BrowserRerankOffer } from "./browser-rerank.js";
 export { executeBrowserRerank } from "./browser-rerank.js";
+import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, executeBrowserChoiceAvailability, executeBrowserChoice, type BrowserChoiceOffer } from "./browser-choice.js";
+export * from "./browser-choice.js";
 import { executeAvailability, executeRerank } from "./rerank.js";
 import type { JevDeps, JevExtensionAPI, RerankOffer, RerankWithdraw } from "./types.js";
 
@@ -64,6 +66,16 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     pi.events?.emit(BROWSER_PROVIDE, browser);
   };
 
+  const emitChoiceOffer = () => {
+    if (withdrawn) return;
+    const choice: BrowserChoiceOffer = {
+      version: 1, provider: JEV_PROVIDER, instanceId,
+      availability: (root, signal) => executeBrowserChoiceAvailability(root, deps, gate, signal),
+      choose: (input) => executeBrowserChoice(input, deps, gate),
+    };
+    pi.events?.emit(BROWSER_CHOICE_PROVIDE, choice);
+  };
+
   const dispose = () => {
     if (withdrawn) return;
     withdrawn = true;
@@ -76,11 +88,8 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
       }
     }
     const payload: RerankWithdraw = { version: 1, provider: JEV_PROVIDER, instanceId };
-    try {
-      pi.events?.emit(CHANNEL_WITHDRAW, payload);
-      pi.events?.emit(BROWSER_WITHDRAW, payload);
-    } catch {
-      /* ignore */
+    for (const channel of [CHANNEL_WITHDRAW, BROWSER_WITHDRAW, BROWSER_CHOICE_WITHDRAW]) {
+      try { pi.events?.emit(channel, payload); } catch { /* One consumer cannot prevent another withdrawal. */ }
     }
   };
 
@@ -92,8 +101,11 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     if (typeof unsub === "function") unsubscribers.push(unsub);
     const browserUnsub = bus.on(BROWSER_DISCOVER, emitBrowserOffer);
     if (typeof browserUnsub === "function") unsubscribers.push(browserUnsub);
+    const choiceUnsub = bus.on(BROWSER_CHOICE_DISCOVER, emitChoiceOffer);
+    if (typeof choiceUnsub === "function") unsubscribers.push(choiceUnsub);
     emitOffer();
     emitBrowserOffer();
+    emitChoiceOffer();
   }
 
   if (typeof pi.on === "function") {

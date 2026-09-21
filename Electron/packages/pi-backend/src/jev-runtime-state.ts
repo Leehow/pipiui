@@ -24,7 +24,9 @@ export function jevRuntimeStateFile(projectRoot: string): string {
   return join(projectPiAgentDir(projectRoot), JEV_EXTENSION_ID, "runtime-state.json");
 }
 
-/** Host authority only: the file contains neither a credential nor its fingerprint. */
+/** Host authority only: the file contains neither a credential nor its fingerprint.
+ *  `hasKey` is restored from the OS-encrypted `{projectAgentHome}/jev-optimizer/credential.enc`
+ *  via the in-memory extension vault cache — never from this JSON. */
 export class JevRuntimeStateStore {
   private readonly states = new Map<string, JevRuntimeState>();
   private lane: Promise<unknown> = Promise.resolve();

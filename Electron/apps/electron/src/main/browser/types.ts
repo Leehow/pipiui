@@ -103,7 +103,7 @@ export const BROWSER_DESKTOP_VIEWPORT = { width: 1280, height: 800 } as const
 export const BROWSER_MOBILE_VIEWPORT = { width: 390, height: 844 } as const
 export const DEFAULT_MOBILE_DEVICE: BrowserMobileDevice = { width: 390, height: 844, deviceScaleFactor: 2 }
 export const defaultPartition = 'persist:pipiui-browser'
-export const unsafeBothActions = new Set(['click', 'input', 'type', 'select', 'fill_form', 'scroll', 'eval', 'content', 'console', 'wait'])
+export const unsafeBothActions = new Set(['click', 'input', 'type', 'select', 'fill_form', 'scroll', 'eval', 'content', 'console', 'wait', 'prepare_choice_observation', 'execute_choice'])
 /** Actions whose page dispatch is deferred to the caller; navigation itself may run mid-navigation. */
 export const navigationExemptActions = new Set(['navigate', 'back', 'forward', 'reload', 'console'])
 

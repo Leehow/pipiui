@@ -1,5 +1,7 @@
 # Jev 浏览器目标相关观察优化规格 v1
 
+> 本文件保留 2026-09-20 观察层首版范围；后续用户明确要求的动作控制另见 [Jev Choice 浏览器控制](jev-browser-choice-v1.md)。这里的“非目标”不限制 Jev 扩展后续提供 Choice。
+
 - 状态：已按批准计划实现源码，并通过目标范围及隔离提交态验证。实际验证、全仓测试限制与未执行项见[实现与评测报告](research/jev-browser-observation-evaluation-2026-09-20.md)；真实 Jev 净提速尚未证明。
 - 日期：2026-09-20。
 - 实施计划：`jev-browser-observation-v1`。

@@ -383,9 +383,21 @@ const INTENT_HELP = [
   '                        intent for ordinary paging. target=both stays local. Known locators',
   '                        and saved flows need no extra observation or scoring step.',
 ].join('\n');
+const GOAL_DESCRIPTION = "goal runs a bounded Jev Choice action loop using the extension's saved key; standalone only, single viewport. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. ";
+const GOAL_HELP = [
+  'goal {goal, max_steps?, timeoutSecs?, target?}',
+  '                        Standalone bounded Jev Choice control loop (not actions[]). Requires the',
+  '                        enabled Jev extension, its saved key and browser-cloud permission.',
+  '                        Jev chooses operation + observed target in one request; TYPE_TEXT uses',
+  '                        the current session model/auth. Default 12 decisions/30s; caps 30/60s.',
+  '                        Single viewport only. Stale targets are reobserved, never relocated.',
+  '                        DONE returns needs_verification, NOT verified task success. Check the',
+  '                        actual outcome independently. Consequential submissions hand back control.',
+  '',
+].join('\n');
 function legacyDocumentation(result: ToolResult): ToolResult {
   return { ...result, content: result.content.map(part => part.type === 'text' && part.text
-    ? { ...part, text: part.text.replace(INTENT_HELP, 'observe {scope?,target?,region?,role?,name?,cursor?}') }
+    ? { ...part, text: part.text.replace(INTENT_HELP, 'observe {scope?,target?,region?,role?,name?,cursor?}').replace(GOAL_HELP, '') }
     : part) };
 }
 
@@ -465,7 +477,7 @@ describe("webview-browser-extension manifest", () => {
 });
 
 describe("schema: names, labels, descriptions, parameters", () => {
-  it("retains all legacy schema fields and adds only the optional browser intent surface", () => {
+  it("retains legacy schema fields and adds only explicit intent/goal surfaces", () => {
     expect(extensionWebviewTools.tools.map((tool) => tool.name)).toEqual(["browser"]);
     expect(extensionSearchTools.tools.map((tool) => tool.name).sort()).toEqual(["browser_fetch", "browser_search"]);
     for (const name of FROZEN_TOOLS) {
@@ -473,12 +485,19 @@ describe("schema: names, labels, descriptions, parameters", () => {
       const extensionTool = name === "browser" ? extensionWebviewTools.byName.get(name) : extensionSearchTools.byName.get(name);
       expect(extensionTool, `tool ${name} mounted`).toBeDefined();
       expect(extensionTool!.label).toBe(legacyTool!.label);
-      expect(extensionTool!.description?.replace(INTENT_DESCRIPTION, '')).toBe(legacyTool!.description);
+      expect(extensionTool!.description?.replace(INTENT_DESCRIPTION, '').replace(GOAL_DESCRIPTION, '').replace('observe, goal, wait', 'observe, wait')).toBe(legacyTool!.description);
       const parameters = JSON.parse(JSON.stringify(extensionTool!.parameters));
       if (name === 'browser') {
         expect(extensionTool!.description).toContain(INTENT_DESCRIPTION);
         expect(parameters.properties.intent).toMatchObject({ type: 'string', minLength: 1, maxLength: 512 });
         expect(parameters.properties.actions.items.properties.intent).toEqual(parameters.properties.intent);
+        expect(extensionTool!.description).toContain(GOAL_DESCRIPTION);
+        expect(parameters.properties.goal).toMatchObject({ type: 'string', minLength: 1, maxLength: 512 });
+        expect(parameters.properties.max_steps).toMatchObject({ type: 'integer', minimum: 1, maximum: 30 });
+        expect(parameters.properties.action.description).toContain('observe | goal | wait');
+        parameters.properties.action.description = parameters.properties.action.description.replace('observe | goal | wait', 'observe | wait');
+        delete parameters.properties.goal;
+        delete parameters.properties.max_steps;
         delete parameters.properties.intent;
         delete parameters.properties.actions.items.properties.intent;
       }

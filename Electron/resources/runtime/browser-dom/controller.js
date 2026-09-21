@@ -12,6 +12,8 @@
   const REGION_PAGE_SIZE = 8;
   const ELEMENT_PAGE_SIZE = 32;
   const MAX_MUTATION_SAMPLES = 8;
+  const CHOICE_TTL_MS = 30000;
+  const CHOICE_MAX_CANDIDATES = 64;
   const LANDMARK_ROLES = new Set([
     "banner", "navigation", "main", "complementary", "contentinfo",
     "form", "search", "dialog", "alertdialog", "region",
@@ -35,6 +37,7 @@
     code: 128,
     token: 128,
     snapshotID: 128,
+    choiceGuard: 128,
     description: 256,
     region: 160,
     content: 100000,
@@ -45,6 +48,8 @@
   const state = {
     activeSnapshot: null,
     pendingIntent: null,
+    activeChoice: null,
+    disallowRelocate: false,
     pendingFrameClick: null,
     redactionValues: [],
     redactionTotalUnits: 0,
@@ -153,7 +158,7 @@
 
   function sanitizePublic(value, variants, key = "") {
     if (typeof value === "string") {
-      if (key === "token" || key === "snapshotID") return truncateUTF16(value, stringLimitForKey(key));
+      if (key === "token" || key === "snapshotID" || key === "choiceGuard") return truncateUTF16(value, stringLimitForKey(key));
       return truncateUTF16(redactString(value, variants), stringLimitForKey(key));
     }
     if (Array.isArray(value)) return value.map((item) => sanitizePublic(item, variants, key));
@@ -227,8 +232,14 @@
     state.pendingIntent = null;
   }
 
+  function clearPendingChoice() {
+    state.activeChoice?.observer?.disconnect();
+    state.activeChoice = null;
+  }
+
   function invalidateSnapshot() {
     clearPendingIntent();
+    clearPendingChoice();
     state.activeSnapshot = null;
   }
 
@@ -1071,6 +1082,7 @@
 
   function prepareIntentObservation(params) {
     clearPendingIntent();
+    clearPendingChoice();
     const invalid = validateIntent(params);
     if (invalid) return invalid;
     if (!retainCurrentSensitiveValues()) return redactionCapacityFailure();
@@ -1217,6 +1229,270 @@
       clearPendingFrameClick();
     }
     return observation;
+  }
+
+  function choiceOperations(element) {
+    if (element.localName === "select") return ["SELECT"];
+    if (element.localName === "textarea") return ["TYPE_TEXT"];
+    if (element.isContentEditable) return ["TYPE_TEXT"];
+    if (element.localName === "input") {
+      const type = (element.getAttribute("type") || "text").toLowerCase();
+      if (["hidden", "file"].includes(type)) return [];
+      if (["button", "submit", "reset", "image", "checkbox", "radio"].includes(type)) return ["CLICK"];
+      return ["TYPE_TEXT"];
+    }
+    return isInteractive(element, role(element)) ? ["CLICK"] : [];
+  }
+
+  function formFreshnessSignature() {
+    const parts = [];
+    forEachElement(element => {
+      if (!element.matches?.("input,textarea,select,[contenteditable]")) return;
+      if (element.hasAttribute("contenteditable") && String(element.getAttribute("contenteditable")).toLowerCase() === "false") return;
+      const isEditable = element.hasAttribute("contenteditable") && !['input', 'textarea', 'select'].includes(element.localName);
+      const value = isEditable ? String(element.textContent || "") : String(element.value || "");
+      const checked = element.checked ? "1" : "0";
+      const options = element.localName === "select"
+        ? Array.from(element.options || []).map(option => `${option.value}\u001f${option.textContent}`).join("\u001e")
+        : "";
+      parts.push(`${value}\u001f${checked}\u001f${options}`);
+    });
+    return parts.join("\n");
+  }
+
+  function choiceScroll() {
+    const info = scrollInfo();
+    return { canUp: info.pixelsAbove > 0, canDown: info.pixelsBelow > 0 };
+  }
+
+  function collectChoiceOptions(element, cloudText, terms) {
+    if (element.localName !== "select") return { publicOptions: undefined, optionMap: [], truncated: false };
+    const options = [];
+    Array.from(element.options || []).forEach((option, index) => {
+      if (option.disabled || (option.parentElement?.localName === "optgroup" && option.parentElement.disabled) || isSelfHidden(option)) return;
+      const label = cloudText(String(option.label || option.textContent || ""));
+      const words = intentTerms(normalizedText(label).toLowerCase());
+      options.push({ id: `option-${index + 1}`, value: String(option.value ?? ""), label, index,
+        score: terms.filter(term => words.includes(term)).length });
+    });
+    // A Choice head accepts at most 255 options. Keep goal-relevant options first,
+    // not just the first countries/timezones in DOM order; expose truncation.
+    const window = options.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 255);
+    return {
+      publicOptions: window.map(({ id, label }) => ({ id, label })),
+      optionMap: window.map(({ id, value }) => ({ id, value })),
+      truncated: options.length > window.length,
+    };
+  }
+
+  function prepareChoiceObservation(params) {
+    clearPendingChoice();
+    clearPendingIntent();
+    const invalid = validateIntent(params);
+    if (invalid) return invalid;
+    if (!retainCurrentSensitiveValues()) return redactionCapacityFailure();
+    const started = Date.now();
+    const variants = activeRedactionVariants();
+    const intent = redactString(params.intent.trim(), variants);
+    const needle = normalizedText(intent).toLowerCase();
+    const terms = intentTerms(needle);
+    const scope = params.scope === "page" ? "page" : "viewport";
+    const collected = collect(scope, {
+      maxCandidates: 256, maxBytes: 64 * 1024,
+      // Native options execute through the owning SELECT, never as independent clicks.
+      accept: candidate => !["option", "optgroup"].includes(candidate.element.localName)
+        && isInteractive(candidate.element, candidate.public.role),
+    });
+    const scored = collected.candidates.map((candidate, ordinal) => {
+      const name = normalizedText(redactString(candidate.public.name, variants)).toLowerCase();
+      const covers = (text) => terms.filter(term => /\p{Script=Han}/u.test(term)
+        ? text.includes(term) : intentTerms(text).includes(term)).length;
+      return { candidate, ordinal, score: [name === needle ? 2 : name.includes(needle) ? 1 : 0, covers(name)] };
+    });
+    scored.sort((a, b) => b.score[0] - a.score[0] || b.score[1] - a.score[1] || a.ordinal - b.ordinal);
+    const formValues = new Set();
+    let formUnits = 0;
+    let cloudOverflow = false;
+    forEachElement(element => {
+      if (cloudOverflow || !element.matches?.('input,textarea,select,[contenteditable]')) return;
+      const value = String(element.hasAttribute('contenteditable') ? element.textContent || '' : element.value || '');
+      if (!value || formValues.has(value)) return;
+      formUnits += value.length;
+      if (value.length > MAX_REDACTION_VALUE_UNITS || formValues.size >= MAX_REDACTION_ENTRIES || formUnits > MAX_REDACTION_TOTAL_UNITS) cloudOverflow = true;
+      else formValues.add(value);
+    });
+    if (cloudOverflow) {
+      clearPendingChoice();
+      return failure(
+        "browser redaction capacity exceeded; reload the document before continuing",
+        "browser_redaction_capacity_exceeded",
+        true,
+      );
+    }
+    const cloudVariants = activeRedactionVariants([...formValues]);
+    const cloudText = value => redactString(value, cloudVariants).replace(/https?:\/\/[^\s<>"']+/gi, "[url]");
+    const records = [];
+    const candidates = [];
+    let optionsTruncated = false;
+    for (const item of scored) {
+      if (candidates.length >= CHOICE_MAX_CANDIDATES) break;
+      const element = item.candidate.element;
+      if (isSensitive(element)) continue;
+      const operations = choiceOperations(element);
+      if (!operations.length) continue;
+      const token = opaqueID("element");
+      const { publicOptions, optionMap, truncated } = collectChoiceOptions(element, cloudText, terms);
+      optionsTruncated ||= truncated;
+      const record = {
+        ...item.candidate,
+        id: `candidate-${candidates.length + 1}`,
+        token,
+        operations,
+        optionMap,
+      };
+      records.push(record);
+      const published = {
+        id: record.id,
+        token,
+        operations,
+        role: item.candidate.public.role,
+        name: cloudText(accessibleName(element, Infinity)),
+      };
+      if (publicOptions) {
+        published.options = publicOptions.map(option => ({
+          id: option.id,
+          label: truncateUTF16(option.label, STRING_LIMITS.name),
+        }));
+      }
+      candidates.push(published);
+    }
+    const snapshotID = opaqueID("snapshot");
+    const choiceGuard = opaqueID("choice");
+    const pending = {
+      snapshotID,
+      choiceGuard,
+      url: String(location.href),
+      records,
+      formSignature: formFreshnessSignature(),
+      expires: Date.now() + CHOICE_TTL_MS,
+      changed: false,
+      observer: null,
+    };
+    if (typeof MutationObserver === "function") {
+      pending.observer = new MutationObserver(() => { pending.changed = true; });
+      const roots = new Set([document, ...records.map(record => record.rootNode)]);
+      for (const root of roots) pending.observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+    }
+    state.activeChoice = pending;
+    const response = {
+      ok: true,
+      snapshotID,
+      choiceGuard,
+      // The caller's goal was already sensitive-value redacted above. Ordinary
+      // form values must not erase it after TYPE_TEXT (e.g. Paris -> [redacted]).
+      goal: intent.replace(/https?:\/\/[^\s<>"']+/gi, "[url]"),
+      candidates,
+      scroll: choiceScroll(),
+      collectedCount: collected.candidates.length,
+      collectionMs: Date.now() - started,
+      truncated: Boolean(collected.incompleteReason) || scored.length > candidates.length || optionsTruncated,
+    };
+    // Bound the local bridge too. Do not clip raw names before the Jev provider
+    // can remove its own key: rejecting the envelope avoids leaking key prefixes.
+    if (utf8Length(JSON.stringify(response)) > 64 * 1024) {
+      clearPendingChoice();
+      return failure("Choice observation exceeds the local payload budget; use ordinary browser controls.", "choice_observation_budget", true);
+    }
+    return response;
+  }
+
+  function choiceExecuteFailure(error, code, consumed, extra = {}) {
+    return failure(error, code, extra.requiresObservation !== false, { consumed, ...extra });
+  }
+
+  function executeChoice(params) {
+    const operation = String(params.operation || "");
+    if (["WAIT", "DONE", "BLOCKED"].includes(operation) || !operation) {
+      return choiceExecuteFailure("Choice operation is handled by the agent and does not execute in the page.", "invalid_choice_operation", false, { requiresObservation: false });
+    }
+    if (!["CLICK", "TYPE_TEXT", "SELECT", "SCROLL_UP", "SCROLL_DOWN"].includes(operation)) {
+      return choiceExecuteFailure("Unsupported choice operation.", "invalid_choice_operation", false, { requiresObservation: false });
+    }
+    const choice = state.activeChoice;
+    if (!choice || typeof params.snapshot_id !== "string" || params.snapshot_id !== choice.snapshotID) {
+      return choiceExecuteFailure("The choice snapshot is stale; observe again.", "stale_browser_snapshot", false);
+    }
+    if (typeof params.choice_guard !== "string" || params.choice_guard !== choice.choiceGuard) {
+      return choiceExecuteFailure("The choice snapshot guard is invalid.", "invalid_choice_snapshot", false);
+    }
+    const consume = () => { clearPendingChoice(); };
+    const stale = (message) => {
+      consume();
+      return choiceExecuteFailure(message, "stale_browser_snapshot", true);
+    };
+    if (choice.expires <= Date.now() || choice.url !== String(location.href)
+      || choice.changed || choice.observer?.takeRecords().length
+      || choice.formSignature !== formFreshnessSignature()) {
+      return stale("The choice snapshot is no longer valid; observe again.");
+    }
+    let mappedParams = {};
+    let entry = null;
+    if (operation === "SCROLL_UP" || operation === "SCROLL_DOWN") {
+      consume();
+      mappedParams = { action: "scroll", direction: operation === "SCROLL_UP" ? "up" : "down", amount: 0.8, scope: params.scope };
+    } else {
+      const record = choice.records.find(candidate => candidate.id === params.candidate_id);
+      if (!record || !record.operations.includes(operation)) {
+        consume();
+        return choiceExecuteFailure("The choice target is not valid for this snapshot.", "invalid_choice_target", true);
+      }
+      if (operation === "TYPE_TEXT" && typeof params.text !== "string") {
+        consume();
+        return choiceExecuteFailure("TYPE_TEXT requires text.", "invalid_browser_input", true, { requiresObservation: false });
+      }
+      let option = null;
+      if (operation === "SELECT") {
+        option = record.optionMap.find(item => item.id === params.option_id);
+        if (!option) {
+          consume();
+          return choiceExecuteFailure("The requested option is not in the choice snapshot.", "invalid_choice_target", true);
+        }
+      }
+      const element = record.element;
+      if (!element?.isConnected
+        || element.ownerDocument !== record.ownerDocument
+        || element.getRootNode() !== record.rootNode
+        || owningFrameElement(element.ownerDocument) !== record.owningFrameElement
+        || isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)
+        || fingerprint(element, record.frame, role(element), accessibleName(element)) !== record.fingerprint) {
+        return stale("The requested element changed; observe again.");
+      }
+      const offset = owningFrameElement(element.ownerDocument)?.getBoundingClientRect();
+      const currentRect = frameRect(element, offset?.left || 0, offset?.top || 0);
+      if (JSON.stringify(currentRect) !== JSON.stringify(record.public.rect)) {
+        return stale("The requested element moved; observe again.");
+      }
+      consume();
+      entry = record;
+      if (operation === "CLICK") {
+        mappedParams = { action: "click", snapshot_id: choice.snapshotID, element_token: record.token, scope: params.scope };
+      } else if (operation === "TYPE_TEXT") {
+        mappedParams = { action: "input", snapshot_id: choice.snapshotID, element_token: record.token, text: params.text, scope: params.scope };
+      } else {
+        mappedParams = { action: "select", snapshot_id: choice.snapshotID, element_token: record.token, option: option.value, scope: params.scope };
+      }
+    }
+    if (entry) {
+      state.activeSnapshot = { id: choice.snapshotID, url: String(location.href), map: new Map([[entry.token, entry]]) };
+    }
+    state.disallowRelocate = true;
+    try {
+      const result = dispatch(mappedParams);
+      if (result && typeof result === "object" && result.consumed === undefined) return { ...result, consumed: true };
+      return result;
+    } finally {
+      state.disallowRelocate = false;
+    }
   }
 
   function observe(scope, action, secretValues, query = {}) {
@@ -1702,6 +1978,9 @@
     if (!entry) return miss("The requested element is no longer in the active snapshot.");
     const validationError = validateEntry(entry, false);
     if (!validationError) return { entry };
+    if (options?.allowRelocate === false || state.disallowRelocate) {
+      return preserveSnapshot ? { error: validationError } : miss("The requested element could not be relocated; observe again.");
+    }
     const relocated = tryRelocate(entry);
     if (relocated?.ambiguous) {
       return miss("The requested element matched multiple candidates; observe again.");
@@ -2400,6 +2679,8 @@
     if (action === "sanitize") return sanitizeBypassOutput(params.value);
     if (action === "prepare_intent_observation") return prepareIntentObservation(params);
     if (action === "finalize_intent_observation") return finalizeIntentObservation(params);
+    if (action === "prepare_choice_observation") return prepareChoiceObservation(params);
+    if (action === "execute_choice") return executeChoice(params);
     if (action === "observe") return observe(scope, params.action_metadata || null, [], params);
     if (action === "fill_form") return fillForm(params);
     if (action === "wait_check") return waitCheck(params, scope);

@@ -232,7 +232,7 @@ export async function executeRerank(
     (signal) => checkAvailability(deps, signal), gate);
 }
 
-/** Shared Score transport, not a candidate schema. Browser data never becomes a code span. */
+/** Compatibility wrapper: Score keeps its existing API and parser. */
 export async function executeScore(
   input: { signal?: AbortSignal },
   deps: JevDeps,
@@ -241,6 +241,22 @@ export async function executeScore(
   gate?: RerankGate,
   onSubmitted?: (count: number) => void,
 ): Promise<RerankOutcome> {
+  return executeDecision(input, deps, build, availability, (parsed, built) => parseApplied(parsed, built.ids), gate, onSubmitted);
+}
+
+type DecisionFailure = { status: "skipped" | "fallback"; reason: string };
+type DecisionPayload = { status: "ok"; json: string; ids: string[] };
+
+/** One transport for Score and Choice: shared revocation, deadline and strict JSON handling. */
+export async function executeDecision<B extends DecisionPayload, O>(
+  input: { signal?: AbortSignal },
+  deps: JevDeps,
+  build: (key: string) => B | { status: "skipped"; reason: string },
+  availability: (signal?: AbortSignal) => Promise<{ ready: boolean; reason?: string; apiKey?: string }>,
+  parse: (payload: unknown, built: B, key: string) => O,
+  gate?: RerankGate,
+  onSubmitted?: (count: number) => void,
+): Promise<O | DecisionFailure> {
   if (gate?.withdrawn()) return { status: "skipped", reason: "withdrawn" };
   if (input.signal?.aborted || gate?.signal.aborted) return { status: "skipped", reason: "aborted" };
 
@@ -249,6 +265,7 @@ export async function executeScore(
   const pollMs = deps.pollMs ?? JEV_POLL_MS;
   const ac = new AbortController();
   let stop: StopReason | undefined;
+  let requestKey: string | undefined;
   const stopWith = (reason: StopReason) => {
     if (stop) return;
     stop = reason;
@@ -264,7 +281,7 @@ export async function executeScore(
   timeout.unref?.();
   const poll = setInterval(() => {
     void availability(ac.signal).then((result) => {
-      if (!result.ready) stopWith("generation-mismatch");
+      if (!result.ready || (requestKey !== undefined && result.apiKey !== requestKey)) stopWith("generation-mismatch");
     });
   }, pollMs);
   poll.unref?.();
@@ -290,6 +307,7 @@ export async function executeScore(
       return { status: "skipped", reason: ready.reason ?? "no-key" };
     }
 
+    requestKey = ready.apiKey;
     const built = build(ready.apiKey);
     if (built.status === "skipped") return { status: "skipped", reason: built.reason };
 
@@ -300,6 +318,7 @@ export async function executeScore(
     const beforeSend = await race(availability(ac.signal));
     if (stop) return { status: "fallback", reason: stop };
     if (!beforeSend.ready) return { status: "skipped", reason: beforeSend.reason ?? "generation-mismatch" };
+    if (beforeSend.apiKey !== requestKey) return { status: "skipped", reason: "credential-mismatch" };
     if (Date.now() >= deadline) return { status: "fallback", reason: "timeout" };
     onSubmitted?.(built.ids.length);
     const response = await race(
@@ -335,8 +354,9 @@ export async function executeScore(
     if (gate?.withdrawn()) return { status: "fallback", reason: "withdrawn" };
     if (input.signal?.aborted) return { status: "fallback", reason: "aborted" };
     if (!still.ready) return { status: "fallback", reason: still.reason ?? "generation-mismatch" };
+    if (still.apiKey !== requestKey) return { status: "fallback", reason: "credential-mismatch" };
     if (Date.now() >= deadline) return { status: "fallback", reason: "timeout" };
-    return parseApplied(parsed, built.ids);
+    return parse(parsed, built, ready.apiKey);
   } catch (error) {
     if (stop) return { status: "fallback", reason: stop };
     if (isAbortError(error)) return { status: "fallback", reason: "aborted" };

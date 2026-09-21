@@ -164,6 +164,49 @@ describe('intent observation host routing', () => {
   })
 })
 
+describe('choice snapshot host routing', () => {
+  it('namespaces choice handles and rejects viewport crossings', async () => {
+    const { host, contents } = browserHarness()
+    await host.toolAction({ action: 'navigate', url: 'https://fixture.invalid' })
+    contents.executeJavaScript.mockResolvedValueOnce({
+      ok: true,
+      snapshotID: 'snap-one',
+      choiceGuard: 'guard-one',
+      goal: 'Go',
+      candidates: [{ id: 'candidate-1', token: 'tok-one', role: 'button', name: 'Go', operations: ['CLICK'] }],
+      scroll: { canUp: false, canDown: true },
+    })
+    const prepared = await host.toolAction({ action: 'prepare_choice_observation', intent: 'Go', target: 'desktop' })
+    expect(prepared.snapshotID).toBe('desktop:snap-one')
+    expect(prepared.choiceGuard).toBe('desktop:guard-one')
+    expect((prepared.candidates as Array<{ token: string }>)[0]?.token).toBe('desktop:tok-one')
+    await expect(host.toolAction({
+      action: 'execute_choice',
+      snapshot_id: String(prepared.snapshotID),
+      choice_guard: String(prepared.choiceGuard),
+      operation: 'CLICK',
+      candidate_id: 'candidate-1',
+      target: 'mobile',
+    })).resolves.toMatchObject({ ok: false, error: expect.stringContaining('belongs to desktop') })
+    contents.executeJavaScript.mockResolvedValueOnce({ ok: true, consumed: true })
+    await host.toolAction({
+      action: 'execute_choice',
+      snapshot_id: String(prepared.snapshotID),
+      choice_guard: String(prepared.choiceGuard),
+      operation: 'CLICK',
+      candidate_id: 'candidate-1',
+    })
+    const injected = String(contents.executeJavaScript.mock.calls.at(-1)?.[0] || '')
+    expect(injected).toContain('"snapshot_id":"snap-one"')
+    expect(injected).toContain('"choice_guard":"guard-one"')
+    expect(injected).not.toContain('desktop:snap-one')
+    await expect(host.toolAction({ action: 'prepare_choice_observation', intent: 'Go', target: 'both' }))
+      .resolves.toMatchObject({ ok: false })
+    await expect(host.toolAction({ action: 'execute_choice', operation: 'CLICK', target: 'both' }))
+      .resolves.toMatchObject({ ok: false })
+  })
+})
+
 describe('awaitLoadURL', () => {
   it('resolves loaded when the promise settles before the bound', async () => {
     await expect(awaitLoadURL(Promise.resolve('ok'), 50)).resolves.toBe('loaded')

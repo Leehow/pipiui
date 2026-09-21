@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createJevOptimizer } from "./index.js";
+import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, type BrowserChoiceOffer } from "./browser-choice.js";
+import { BROWSER_PROVIDE, BROWSER_WITHDRAW } from "./browser-rerank.js";
 import {
   CHANNEL_DISCOVER,
   CHANNEL_PROVIDE,
@@ -200,6 +202,53 @@ test("session shutdown withdraws the instance and late rerank cannot apply", asy
     ),
   );
   assert.equal((await offer!.availability("/abs/project")).ready, false);
+});
+
+test("Choice shares instance, key, consent and synchronous withdrawal with both Score offers", async () => {
+  const bus = createBus(), pi = fakePi(bus);
+  let choice: BrowserChoiceOffer | undefined;
+  let offers = 0;
+  const instances: string[] = [];
+  const withdrawn: string[] = [];
+  bus.on(BROWSER_CHOICE_PROVIDE, value => { choice = value as BrowserChoiceOffer; offers++; instances.push(choice.instanceId); });
+  bus.on(BROWSER_PROVIDE, value => { instances.push((value as { instanceId: string }).instanceId); });
+  for (const channel of [CHANNEL_WITHDRAW, BROWSER_WITHDRAW, BROWSER_CHOICE_WITHDRAW]) bus.on(channel, () => { withdrawn.push(channel); });
+  const root = "/synthetic/project";
+  let markStarted!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  let requestSignal: AbortSignal | null | undefined;
+  const handle = createJevOptimizer(pi, deps(async (_url, init) => {
+    assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${KEY}`);
+    requestSignal = init?.signal; markStarted(); return new Promise(() => {});
+  }, { env: { PIPIUI_JEV_STATE_FILE: `${root}/.pi/agent/jev-optimizer/runtime-state.json`, PIPIUI_JEV_GENERATION: GEN, EXT_JEV_OPTIMIZER_APIKEY: KEY },
+    readState: async () => JSON.stringify({ schemaVersion: 1, enabled: true, hasKey: true, generation: GEN, browserEnabled: true, browserGeneration: "browser" }) }));
+  assert.ok(choice);
+  assert.deepEqual(await choice.availability(root), { ready: true });
+  assert.ok(instances.every(id => id === handle.instanceId));
+  bus.emit(BROWSER_CHOICE_DISCOVER);
+  assert.equal(offers, 2);
+  const pending = choice.choose({ projectRoot: root, goal: "wait", candidates: [], scroll: { canUp: false, canDown: false } });
+  await started;
+  // A throwing Score subscriber must not suppress the Choice withdrawal event.
+  bus.on(CHANNEL_WITHDRAW, () => { throw Error("consumer failure"); });
+  pi.shutdown();
+  assert.deepEqual(withdrawn, [CHANNEL_WITHDRAW, BROWSER_WITHDRAW, BROWSER_CHOICE_WITHDRAW]);
+  assert.equal(requestSignal?.aborted, true);
+  const result = await pending;
+  assert.equal(result.decision, undefined); assert.equal(result.reason, "withdrawn");
+  assert.deepEqual(await choice.availability(root), { ready: false, reason: "withdrawn" });
+  bus.emit(BROWSER_CHOICE_DISCOVER); handle.dispose();
+  assert.equal(offers, 2); assert.equal(withdrawn.length, 3);
+});
+
+test("Choice provider-first discovery honors browser-only consent", async () => {
+  const bus = createBus();
+  const handle = createJevOptimizer(fakePi(bus), deps(async () => new Response()));
+  let offer: BrowserChoiceOffer | undefined;
+  bus.on(BROWSER_CHOICE_PROVIDE, value => { offer = value as BrowserChoiceOffer; });
+  bus.emit(BROWSER_CHOICE_DISCOVER);
+  assert.ok(offer); assert.equal(offer.instanceId, handle.instanceId);
+  handle.dispose();
 });
 
 test("discover after withdraw does not resurrect a disposed instance", () => {

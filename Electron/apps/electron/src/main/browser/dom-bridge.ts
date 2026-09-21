@@ -28,7 +28,9 @@ export function untaggedRequest(request: Record<string, unknown>, kind: BrowserV
   const token = parseBrowserSnapshotTarget(typeof request.element_token === 'string' ? request.element_token : undefined)
   const next = { ...request }
   const preparation = parseBrowserSnapshotTarget(typeof request.preparation_id === 'string' ? request.preparation_id : undefined)
+  const guard = parseBrowserSnapshotTarget(typeof request.choice_guard === 'string' ? request.choice_guard : undefined)
   if (preparation.kind === kind) next.preparation_id = preparation.id
+  if (guard.kind === kind) next.choice_guard = guard.id
   if (snapshot.kind === kind) next.snapshot_id = snapshot.id
   if (token.kind === kind) next.element_token = token.id
   if (Array.isArray(request.fields)) {
@@ -51,6 +53,7 @@ export function tagObservationTokens(value: unknown, kind: BrowserViewportKind):
   if (Array.isArray(next.elements)) next.elements = tagObservationTokens(next.elements, kind) as unknown[]
   if (Array.isArray(next.preview)) next.preview = tagObservationTokens(next.preview, kind) as unknown[]
   if (Array.isArray(next.regions)) next.regions = tagObservationTokens(next.regions, kind) as unknown[]
+  if (Array.isArray(next.candidates)) next.candidates = tagObservationTokens(next.candidates, kind) as unknown[]
   return next
 }
 
@@ -73,6 +76,7 @@ export function tagObservation(result: BrowserToolResult, kind: BrowserViewportK
   return {
     ...tagged, snapshotID, viewportTarget: kind,
     ...(typeof tagged.preparationID === 'string' ? { preparationID: tagBrowserSnapshotId(tagged.preparationID, kind) } : {}),
+    ...(typeof tagged.choiceGuard === 'string' ? { choiceGuard: tagBrowserSnapshotId(tagged.choiceGuard, kind) } : {}),
   }
 }
 

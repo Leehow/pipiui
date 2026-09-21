@@ -1,5 +1,7 @@
 # 浏览器观察评测
 
+> 这是 **observe / Score 观察级** 评测，不是 Choice 动作控制评测。新的 [`browser action=goal`](../../../../../../docs/jev-browser-choice-v1.md) 通过已启用的 Jev 扩展使用其保存的同一份 key，不需要再配置 `TYPESAFE_API_KEY`。下文 CLI 的独立环境变量仅供隔离合成实验，不能据其缺失判断扩展未配置凭据。
+
 用于 `jev-browser-observation-v1`：固定 12 个合成金标、4 个完整任务定义、A 组基线，以及同生产接缝的 A/B(/C) 观察级对照。金标不是模型/Jev 输出；不复制排序算法，不使用真实网站或用户表单。
 
 ## 环境与离线运行

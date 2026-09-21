@@ -8,7 +8,10 @@ import { Type } from "typebox";
 import { capabilityCall } from "./capability-bridge.ts";
 import { isTrivialBrowserEval } from "./browser-eval-guard.ts";
 import { connectBrowserReranker, observeWithOptionalRerank, type BrowserRerankerConnection } from "./browser-reranker.ts";
-type BrowserOptimization = { connection: BrowserRerankerConnection; projectRoot: string };
+import { connectBrowserChoice, runBrowserGoal, type BrowserChoiceConnection, type GoalDependencies } from "./browser-choice-loop.ts";
+import { createGoalTextGenerator } from "./browser-choice-text.ts";
+type BrowserOptimization = { connection: BrowserRerankerConnection; projectRoot: string; choice?: BrowserChoiceConnection; generateText?: GoalDependencies['generateText'] };
+export const BROWSER_AGENT_TOOL_ACTIONS = ["goal"] as const;
 
 const REQUEST_TIMEOUT_MS = 35_000;
 // Whole-batch ceiling: per-item timeouts alone would allow 8 × 35s ≈ 280s, which
@@ -140,6 +143,14 @@ const HELP = [
   "starts, so later items cannot consume an earlier item's fresh observation. watch inside a",
   "batch only registers its non-blocking listener; the batch never waits for the condition.",
   "",
+  "goal {goal, max_steps?, timeoutSecs?, target?}",
+  "                        Standalone bounded Jev Choice control loop (not actions[]). Requires the",
+  "                        enabled Jev extension, its saved key and browser-cloud permission.",
+  "                        Jev chooses operation + observed target in one request; TYPE_TEXT uses",
+  "                        the current session model/auth. Default 12 decisions/30s; caps 30/60s.",
+  "                        Single viewport only. Stale targets are reobserved, never relocated.",
+  "                        DONE returns needs_verification, NOT verified task success. Check the",
+  "                        actual outcome independently. Consequential submissions hand back control.",
   "actions[]               Ordered batch (1..8). Each item is {action, ...same params as a single call}.",
   "                        Mutually exclusive with top-level action.",
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
@@ -620,7 +631,8 @@ async function executeBrowserActionBatch(items: any[], signal?: AbortSignal, opt
  */
 export default function (pi: ExtensionAPI) {
   const connection = connectBrowserReranker(pi.events);
-  if (typeof pi.on === "function") pi.on("session_shutdown", () => connection.dispose());
+  const choice = connectBrowserChoice(pi.events);
+  if (typeof pi.on === "function") pi.on("session_shutdown", () => { connection.dispose(); choice.dispose(); });
   // One stable tool instead of five browser_* tools. The tool set never changes, so the
   // prompt prefix stays cached, and the per-request schema cost drops ~400 tokens.
   pi.registerTool({
@@ -628,7 +640,8 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
-      "actions: navigate, observe, wait, watch, unwatch, watches, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "actions: navigate, observe, goal, wait, watch, unwatch, watches, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "goal runs a bounded Jev Choice action loop using the extension's saved key; standalone only, single viewport. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. " +
       "Prefer packing consecutive actions that do not need an intermediate observation into one actions[] call (1..8 items), e.g. fill_form then submit click, click then wait, type then Enter. Pass exactly one of action or actions. Stop and observe after navigate, after submitting a form, and when a dialog, captcha, or login wall may appear. " +
       "observe/screenshot are best as the final step of a batch (later items cannot consume an earlier item's observation), and watch in a batch only registers its non-blocking listener without waiting. " +
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
@@ -643,8 +656,10 @@ export default function (pi: ExtensionAPI) {
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.Optional(Type.String({
-        description: "navigate | observe | wait | watch | unwatch | watches | click | input | type | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+        description: "navigate | observe | goal | wait | watch | unwatch | watches | click | input | type | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
       })),
+      goal: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "action=goal only: bounded browser task for Jev Choice; not observation scoring." })),
+      max_steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "goal decision limit, default 12; timeoutSecs limits the whole goal to 1–60 seconds (default 30)." })),
       actions: Type.Optional(Type.Array(Type.Object({
         action: Type.String({
           description: "navigate | observe | wait | watch | unwatch | watches | click | input | type | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
@@ -790,7 +805,7 @@ export default function (pi: ExtensionAPI) {
       }))),
     }),
     async execute(_id, params, signal, _update, ctx) {
-      return executeBrowserTool(params, signal, { connection, projectRoot: ctx?.cwd ?? process.cwd() });
+      return executeBrowserTool(params, signal, { connection, choice, projectRoot: ctx?.cwd ?? process.cwd(), generateText: createGoalTextGenerator(ctx as any) });
     },
   });
 }
@@ -805,6 +820,7 @@ export async function executeBrowserTool(params: any, signal?: AbortSignal, opti
     return usage('browser requires exactly one of "action" or "actions".\n\n' + HELP);
   }
   if (hasActions) {
+    if (params.actions.some((item: any) => item?.action === "goal")) return usage('goal is a standalone action and cannot appear inside actions[].');
     return executeBrowserActionBatch((params as { actions: unknown[] }).actions, signal, optimization);
   }
   return executeBrowserAction(params, signal, optimization);
@@ -824,6 +840,13 @@ async function executeBrowserAction(params: any, signal?: AbortSignal, optimizat
         return usage(`browser ${params.action} cannot target both viewports; specify target=desktop or target=mobile.\n\n${HELP}`);
       }
       switch (params.action) {
+        case "goal": {
+          const r = await runBrowserGoal(params, {
+            projectRoot: optimization?.projectRoot ?? process.cwd(), connection: optimization?.choice,
+            generateText: optimization?.generateText, bridge, signal,
+          });
+          return { ...text(JSON.stringify(r), r), ...(r.ok ? {} : { isError: true }) };
+        }
         case "navigate": {
           if (!params.url) return usage('browser navigate requires "url".\n\n' + HELP);
           const r = await bridge("navigate", { url: params.url, scope: params.scope ?? "viewport", ...targetParams }, signal);
