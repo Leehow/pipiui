@@ -10,7 +10,7 @@ import {
 
 /**
  * User-mandated policy: a non-urgent proactive compaction needs context
- * usage >= 45%, tokens >= 200_000, AND >= 4 minutes of continuous quiet.
+ * usage >= 65%, tokens >= 200_000, AND >= 4 minutes of continuous quiet.
  * Near-overflow / overflow protection is NOT tested here — it lives at the
  * pi session layer (see pi-ext follow-up/mid-turn guards) and stays live
  * while busy.
@@ -37,9 +37,9 @@ describe("ProactiveCompactionPolicy", () => {
   const high = { tokens: 450_000, contextWindow: 500_000 };
   const low = { tokens: 50_000, contextWindow: 500_000 };
 
-  it("standard configuration enforces 45% + 200k tokens + 4-minute quiet (AND, not OR)", () => {
-    expect(STANDARD_PROACTIVE_COMPACTION.highWatermark).toBe(0.45);
-    expect(STANDARD_PROACTIVE_COMPACTION.waitWatermark).toBe(0.45);
+  it("standard configuration enforces 65% + 200k tokens + 4-minute quiet (AND, not OR)", () => {
+    expect(STANDARD_PROACTIVE_COMPACTION.highWatermark).toBe(0.65);
+    expect(STANDARD_PROACTIVE_COMPACTION.waitWatermark).toBe(0.65);
     expect(STANDARD_PROACTIVE_COMPACTION.quietDelayMs).toBe(240_000);
     expect(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs).toBe(240_000);
     expect(PROACTIVE_COMPACTION_MIN_TOKENS).toBe(200_000);
@@ -48,26 +48,26 @@ describe("ProactiveCompactionPolicy", () => {
     );
   });
 
-  it("schedules only at or above the 45% watermark when tokens are already >= 200k", () => {
+  it("schedules only at or above the 65% watermark when tokens are already >= 200k", () => {
     const policy = new ProactiveCompactionPolicy();
-    policy.observeFreshUsage({ tokens: 224_999, contextWindow: 500_000 }, 1);
+    policy.observeFreshUsage({ tokens: 324_999, contextWindow: 500_000 }, 1);
     expect(policy.nextSchedulingDelay(0)).toBeUndefined();
-    policy.observeFreshUsage({ tokens: 225_000, contextWindow: 500_000 }, 2);
+    policy.observeFreshUsage({ tokens: 325_000, contextWindow: 500_000 }, 2);
     expect(policy.nextSchedulingDelay(0)).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
   });
 
-  it("does not schedule at >=45% when tokens are below 200k", () => {
+  it("does not schedule at >=65% when tokens are below 200k", () => {
     const policy = new ProactiveCompactionPolicy();
-    // 45% of a 200k window is 90k — the floor is the whole point of the rule.
-    policy.observeFreshUsage({ tokens: 90_000, contextWindow: 200_000 }, 1);
+    // 199_999 tokens on a 200k window is past the 65% line but under the 200k floor.
+    policy.observeFreshUsage({ tokens: 199_999, contextWindow: 200_000 }, 1);
     expect(policy.nextSchedulingDelay(0)).toBeUndefined();
     policy.observeFreshUsage({ tokens: 199_999, contextWindow: 400_000 }, 2);
     expect(policy.nextSchedulingDelay(0)).toBeUndefined();
   });
 
-  it("schedules at >=45% once tokens reach 200k", () => {
+  it("schedules at >=65% once tokens reach 200k", () => {
     const policy = new ProactiveCompactionPolicy();
-    policy.observeFreshUsage({ tokens: 200_000, contextWindow: 400_000 }, 1);
+    policy.observeFreshUsage({ tokens: 260_000, contextWindow: 400_000 }, 1);
     expect(policy.nextSchedulingDelay(0)).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
   });
 
@@ -179,13 +179,13 @@ function harness(options: {
 }
 
 const HIGH = { tokens: 450_000, contextWindow: 500_000 };
-const POLICY_LINE = { tokens: 225_000, contextWindow: 500_000 };
-const BELOW_LINE = { tokens: 224_999, contextWindow: 500_000 };
+const POLICY_LINE = { tokens: 325_000, contextWindow: 500_000 };
+const BELOW_LINE = { tokens: 324_999, contextWindow: 500_000 };
 const LOW = { tokens: 50_000, contextWindow: 500_000 };
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("ProactiveCompactionScheduler", () => {
-  it("never schedules below 45%, however idle the session is", async () => {
+  it("never schedules below 65%, however idle the session is", async () => {
     const h = harness();
     h.scheduler.observeUsage(BELOW_LINE, h.scheduler.beginUsageRequest());
     expect(h.pending).toBe(0);
@@ -194,9 +194,9 @@ describe("ProactiveCompactionScheduler", () => {
     expect(h.state.compactCalls).toBe(0);
   });
 
-  it("never schedules at >=45% when tokens are below 200k", async () => {
+  it("never schedules at >=65% when tokens are below 200k", async () => {
     const h = harness();
-    h.scheduler.observeUsage({ tokens: 90_000, contextWindow: 200_000 }, h.scheduler.beginUsageRequest());
+    h.scheduler.observeUsage({ tokens: 199_999, contextWindow: 200_000 }, h.scheduler.beginUsageRequest());
     expect(h.pending).toBe(0);
     h.advance(10 * 60_000);
     await flush();
@@ -209,16 +209,16 @@ describe("ProactiveCompactionScheduler", () => {
     expect(h.state.compactCalls).toBe(0);
   });
 
-  it("compacts at >=45% once tokens reach 200k", async () => {
+  it("compacts at >=65% once tokens reach 200k", async () => {
     const h = harness();
-    h.scheduler.observeUsage({ tokens: 200_000, contextWindow: 400_000 }, h.scheduler.beginUsageRequest());
+    h.scheduler.observeUsage({ tokens: 260_000, contextWindow: 400_000 }, h.scheduler.beginUsageRequest());
     expect(h.pending).toBe(1);
     h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
     await flush();
     expect(h.state.compactCalls).toBe(1);
   });
 
-  it("at 45% it arms, but fires only after 4 continuous quiet minutes", async () => {
+  it("at 65% it arms, but fires only after 4 continuous quiet minutes", async () => {
     const h = harness();
     h.scheduler.observeUsage(POLICY_LINE, h.scheduler.beginUsageRequest());
     expect(h.pending).toBe(1);
@@ -239,16 +239,16 @@ describe("ProactiveCompactionScheduler", () => {
     expect(h.state.compactCalls).toBe(1);
   });
 
-  it("falls back to host summary compaction when lossless rewrite leaves usage at or above 45%", async () => {
+  it("falls back to host summary compaction when lossless rewrite leaves usage at or above 65%", async () => {
     // Production closes the legacy summary gate so Headroom/context-fold can
     // own the epoch. If their rewrite never drops the sample, the quiet timer
-    // must still issue the compact RPC — otherwise 585k/1m sits forever.
+    // must still issue the compact RPC — otherwise 700k/1m sits forever.
     const events: ProactiveCompactionObserverEvent[] = [];
     const h = harness({
       shouldCompact: () => false,
       observer: (event) => events.push(event),
     });
-    h.scheduler.observeUsage({ tokens: 584_556, contextWindow: 1_000_000 }, h.scheduler.beginUsageRequest());
+    h.scheduler.observeUsage({ tokens: 700_000, contextWindow: 1_000_000 }, h.scheduler.beginUsageRequest());
     h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
     await flush();
     expect(h.state.compactCalls).toBe(1);
@@ -357,18 +357,18 @@ describe("ProactiveCompactionScheduler", () => {
   });
 
   describe("quiet Boss wait with live subagents", () => {
-    // Under the unified policy (45% + 4 minutes, AND) the former
+    // Under the unified policy (65% + 4 minutes, AND) the former
     // wait-for-subagents fast path (50% + 30s) collapsed into the ordinary
     // path: waitWatermark == highWatermark, so a quiet Boss with live agents
     // compacts on exactly the same terms as one without. These tests pin
     // that no live-agent configuration can bypass the AND policy.
-    it("does not schedule below 45% even with live agents", () => {
+    it("does not schedule below 65% even with live agents", () => {
       const h = harness({ liveAgents: true });
       h.scheduler.observeUsage(BELOW_LINE, h.scheduler.beginUsageRequest());
       expect(h.pending).toBe(0);
     });
 
-    it("requires the same full 4-minute quiet window with live agents at 45%+", async () => {
+    it("requires the same full 4-minute quiet window with live agents at 65%+", async () => {
       const h = harness({ liveAgents: true });
       h.scheduler.observeUsage(POLICY_LINE, h.scheduler.beginUsageRequest());
       expect(h.pending).toBe(1);

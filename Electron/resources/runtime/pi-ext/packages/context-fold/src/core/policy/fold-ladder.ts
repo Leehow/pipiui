@@ -10,7 +10,7 @@
  * prefix-stable frozen layer whose bytes never change again.
  *
  * A fold event fires when BOTH hold:
- *   • usage ≥ the first-fold threshold (~45 % of the window; the cold branch lowers it — with no
+ *   • usage ≥ the first-fold threshold (~65 % of the window; the cold branch lowers it — with no
  *     live cache read there is no prefix to protect, so fold earlier and more freely), and
  *   • the maskable mass is worth a fold (≥ step × window) — this is what spaces events: each
  *     fold must buy at least one ladder step, so a fresh fold can't re-fire on the next turn.
@@ -62,7 +62,7 @@ export interface LadderConfig {
 }
 
 export const LADDER_DEFAULTS: LadderConfig = {
-	foldAt: 0.45,
+	foldAt: 0.65,
 	foldStep: 0.12,
 	coldFoldAt: 0.25,
 	toolUseTrigger: 40,
@@ -82,7 +82,7 @@ export class FoldLadderPolicy implements FoldPolicy {
 	private host: PolicyHost | null = null;
 	/** No live cache read observed yet (adapter feeds this from measured telemetry each turn). */
 	private cold = false;
-	/** Shared 45% + quiet gate controls new fold events; frozen layers still render while closed. */
+	/** Shared 65% + quiet gate controls new fold events; frozen layers still render while closed. */
 	private enabled = true;
 
 	constructor(private readonly cfg: LadderConfig = LADDER_DEFAULTS) {}

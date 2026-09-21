@@ -13,15 +13,15 @@
  * the timer. Session shutdown / extension reload dispose every pending handle.
  */
 export const IDLE_FOLD_TTL_MS_DEFAULT = 4 * 60 * 1000;
-export const IDLE_FOLD_LOW_WATERMARK_DEFAULT = 0.45;
+export const IDLE_FOLD_LOW_WATERMARK_DEFAULT = 0.65;
 export const IDLE_FOLD_FALLBACK_MS_DEFAULT = 60_000;
 /**
- * Mandatory floors for the 45% + 4-minute-idle AND policy: PIPIUI_IDLE_FOLD_*
+ * Mandatory floors for the 65% + 4-minute-idle AND policy: PIPIUI_IDLE_FOLD_*
  * knobs may only configure more conservative (longer / higher) values, never
  * below these floors.
  */
 export const IDLE_FOLD_TTL_FLOOR_MS = 240_000;
-export const IDLE_FOLD_LOW_WATERMARK_FLOOR = 0.45;
+export const IDLE_FOLD_LOW_WATERMARK_FLOOR = 0.65;
 
 export interface IdleFoldConfig {
 	enabled: boolean;
@@ -100,7 +100,7 @@ function envFraction(env: NodeJS.ProcessEnv, name: string, fallback: number): nu
 	return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback;
 }
 
-/** Parse PIPIUI_IDLE_FOLD_* knobs. Defaults: enabled, 4 min idle TTL, 45% watermark, nudge+fallback. TTL and low watermark are clamped to the mandatory floors (>= 240_000 ms / >= 0.45): env may only be more conservative. */
+/** Parse PIPIUI_IDLE_FOLD_* knobs. Defaults: enabled, 4 min idle TTL, 65% watermark, nudge+fallback. TTL and low watermark are clamped to the mandatory floors (>= 240_000 ms / >= 0.65): env may only be more conservative. */
 export function idleFoldConfigFromEnv(env: NodeJS.ProcessEnv = process.env): IdleFoldConfig {
 	return {
 		enabled: envFlag(env, "PIPIUI_IDLE_FOLD_ENABLED", true),

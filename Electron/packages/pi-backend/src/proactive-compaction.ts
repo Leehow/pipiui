@@ -31,7 +31,7 @@ export interface ProactiveCompactionConfiguration {
 
 /**
  * PipiUI auto-compaction policy (user-mandated AND semantics): a non-urgent
- * proactive compaction requires context usage >= 45%, an absolute floor of
+ * proactive compaction requires context usage >= 65%, an absolute floor of
  * >= 200_000 tokens, AND >= 4 minutes of continuous quiet. The quiet timer
  * measures continuous idleness because
  * the host cancels it on `agent_start` and every queue/follow-up transition,
@@ -42,7 +42,7 @@ export interface ProactiveCompactionConfiguration {
  */
 export const STANDARD_PROACTIVE_COMPACTION = Object.freeze({
   /** Policy A: usage fraction at or above this enables proactive compaction. */
-  highWatermark: 0.45,
+  highWatermark: 0.65,
   /** A successful compaction stays disarmed until a newer usage report is below this. */
   lowWatermark: 0.35,
   /** Policy B: continuous quiet required before the compact RPC. */
@@ -50,13 +50,13 @@ export const STANDARD_PROACTIVE_COMPACTION = Object.freeze({
   /** Avoid repeatedly retrying an unsuccessful compaction while context stays high. */
   failureBackoffMs: 60_000,
   /** Live-subagent waiting path uses the same policy numbers. */
-  waitWatermark: 0.45,
+  waitWatermark: 0.65,
   waitQuietDelayMs: 240_000,
 });
 
 /**
  * Absolute token floor for non-urgent proactive compaction. Combined with
- * `highWatermark` (45%), a 200k-window model almost never trips this path —
+ * `highWatermark` (65%), a 200k-window model almost never trips this path —
  * overflow / near-overflow recovery stays at the session layer.
  */
 export const PROACTIVE_COMPACTION_MIN_TOKENS = 200_000;
@@ -517,7 +517,7 @@ export class ProactiveCompactionScheduler {
         return;
       }
       // Fallback: Headroom/context-fold own the epoch, but the quiet sample is
-      // still at/above 45%. Issue the host summary compact so the session does
+      // still at/above 65%. Issue the host summary compact so the session does
       // not sit at 585k/1m with no visible compression.
     }
     this.notify({

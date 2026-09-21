@@ -67,7 +67,7 @@ function foldedSession(): { tools: Map<string, StubTool>; engine: ContextFoldEng
 		messages.push(i === 0 ? toolResult(`c${i}`, needleBody()) : bigResult(`c${i}`, 400));
 	}
 	messages.push(user("now the newest question"));
-	engine.process(messages, { contextWindow: 80_000, tokens: null });
+	engine.process(messages, { contextWindow: 58_000, tokens: null });
 
 	const tools = new Map<string, StubTool>();
 	const unfoldedIds: string[] = [];
@@ -105,7 +105,7 @@ describe("recall tool", () => {
 		expect(text(sliced)).toContain("SPECIFIC_NEEDLE_XYZ");
 
 		// Read-only: the block is still folded in the next outgoing view.
-		const after = engine.process(messages, { contextWindow: 80_000, tokens: null });
+		const after = engine.process(messages, { contextWindow: 58_000, tokens: null });
 		const block = after.find((m) => (m as { toolCallId?: string }).toolCallId === "c0") as { content: { text: string }[] };
 		expect(block.content[0].text).toContain("FOLDED");
 	});
@@ -182,7 +182,7 @@ describe("unfold tool", () => {
 		// The block ids are handed to the caller so the unfold survives resume.
 		expect(unfoldedIds).toEqual(["r:c0"]);
 
-		const after = engine.process(messages, { contextWindow: 80_000, tokens: null });
+		const after = engine.process(messages, { contextWindow: 58_000, tokens: null });
 		const block = after.find((m) => (m as { toolCallId?: string }).toolCallId === "c0") as { content: { text: string }[] };
 		expect(block.content[0].text).toContain("SPECIFIC_NEEDLE_XYZ");
 	});

@@ -96,7 +96,7 @@ describe("spool collision guard", () => {
 			assistantText("done A"),
 			user("next"),
 		];
-		expect(JSON.stringify(engine.process(turn1, 20_000))).toContain("FOLDED");
+		expect(JSON.stringify(engine.process(turn1, 14_000))).toContain("FOLDED");
 
 		// Turn 2: colliding block B arrives alongside an innocent block C. B is dropped (raw),
 		// C folds — the event survives.
@@ -108,7 +108,7 @@ describe("spool collision guard", () => {
 			assistantText("done B C"),
 			user("go on"),
 		];
-		const out2 = JSON.stringify(engine.process(turn2, 20_000));
+		const out2 = JSON.stringify(engine.process(turn2, 14_000));
 		expect(out2).toContain("B-marker"); // collider stays raw
 		expect(out2).not.toContain("C-marker"); // innocent block folded
 
@@ -120,7 +120,7 @@ describe("spool collision guard", () => {
 			assistantText("done D"),
 			user("more"),
 		];
-		const out3 = JSON.stringify(engine.process(turn3, 20_000));
+		const out3 = JSON.stringify(engine.process(turn3, 14_000));
 		expect(out3).not.toContain("D-marker"); // later folds proceed
 		expect(out3).toContain("B-marker"); // collider still raw, still delivered
 	});

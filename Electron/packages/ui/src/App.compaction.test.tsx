@@ -76,7 +76,7 @@ describe('context compaction', () => {
     emit({ type: 'compaction', sessionId: 'welcome', phase: 'start', reason: 'manual', operation: 'context_compaction', trigger: 'proactive_idle', executed: true })
     await waitFor(() => expect((screen.getByTestId('stats-compacting') as HTMLElement).textContent).toContain('空闲自动'))
     emit({ type: 'compaction', sessionId: 'welcome', phase: 'end', reason: 'manual', operation: 'context_compaction', trigger: 'proactive_idle', executed: true })
-    expect(await screen.findByText('上下文压缩完成（空闲自动压缩：上下文≥45%且连续空闲4分钟）')).toBeTruthy()
+    expect(await screen.findByText('上下文压缩完成（空闲自动压缩：上下文≥65%且连续空闲4分钟）')).toBeTruthy()
   })
 
   it('falls back to 自动压缩 for legacy events without trigger fields', async () => {
@@ -96,7 +96,7 @@ describe('context compaction', () => {
 
   it('never writes a transcript line for notice-only (check/nudge/skip) events', async () => {
     const { emit } = await mount()
-    emit({ type: 'compaction', sessionId: 'welcome', phase: 'end', executed: false, skipReason: '上下文低于45%' })
+    emit({ type: 'compaction', sessionId: 'welcome', phase: 'end', executed: false, skipReason: '上下文低于65%' })
     emit({ type: 'compaction', sessionId: 'welcome', phase: 'start', executed: false })
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)) })
     expect(transcriptNotices().some(text => text.includes('压缩') || text.includes('已检查'))).toBe(false)

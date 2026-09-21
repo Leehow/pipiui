@@ -50,7 +50,7 @@ import {
 export { adapterConfigFromEnv, configFromEnv };
 
 /** One product-wide gate for every non-urgent model-visible context rewrite. */
-export const CONTEXT_REWRITE_USAGE_FRACTION = 0.45;
+export const CONTEXT_REWRITE_USAGE_FRACTION = 0.65;
 export const CONTEXT_REWRITE_QUIET_MS = 4 * 60 * 1000;
 
 export default function contextFold(pi: ExtensionAPI): void {
@@ -140,7 +140,7 @@ export default function contextFold(pi: ExtensionAPI): void {
 
 	// The trigger gauge: render whichever ladder condition is actually binding, so the line stays
 	// meaningful in every state. Below the entry threshold that IS the threshold ("next fold at
-	// 45% ctx"); at or past it the usage threshold is permanently satisfied and the real trigger is
+	// 65% ctx"); at or past it the usage threshold is permanently satisfied and the real trigger is
 	// maskable mass reaching one ladder step, so the gauge tracks that instead — counting up from
 	// 0 right after a fold, since interim emptiness refills as new observations land. "No more
 	// folds possible" is reserved for the terminal state where the irreducible floor is over
@@ -179,7 +179,7 @@ export default function contextFold(pi: ExtensionAPI): void {
 					? "rewrite gate active"
 					: optimizer.rewriteGate.armed
 						? "rewrite gate armed"
-						: "rewrite gate waiting (45% + 4m quiet)",
+						: "rewrite gate waiting (65% + 4m quiet)",
 			);
 		}
 		const gauge = foldGauge(engine.status?.metrics ?? {});

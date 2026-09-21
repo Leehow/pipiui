@@ -38,7 +38,7 @@ describe("span recall (churn guard)", () => {
 		dir = mkdtempSync(join(tmpdir(), "contextfold-span-"));
 		const e = new ContextFoldEngine(new FoldLadderPolicy(), { tailTarget: 100 }, new MapSpoolRegistry());
 		const { messages, needles } = needledSession(5);
-		e.process(messages, { contextWindow: 40_000, tokens: null }); // ~25k live → ~0.63 ≥ 0.45 → fold event
+		e.process(messages, { contextWindow: 36_000, tokens: null }); // ~25k live → ~0.69 ≥ 0.65 → fold event
 
 		const sweep = e.searchFolded("SHARD_CAP_");
 		expect(sweep.hits.length).toBe(5); // every pointer answered in ONE call
@@ -50,7 +50,7 @@ describe("span recall (churn guard)", () => {
 		dir = mkdtempSync(join(tmpdir(), "contextfold-span-"));
 		const e = new ContextFoldEngine(new FoldLadderPolicy(), { tailTarget: 100 }, new MapSpoolRegistry());
 		const { messages } = needledSession(5);
-		e.process(messages, { contextWindow: 40_000, tokens: null });
+		e.process(messages, { contextWindow: 36_000, tokens: null });
 		const sweep = e.searchFolded("SHARD_CAP_0");
 		expect(sweep.hits.length).toBe(1);
 		const [lineNo] = sweep.hits[0].lines[0].split(":");
@@ -68,7 +68,7 @@ describe("span recall (churn guard)", () => {
 		messages.push(toolResult(`f${i}`, Array.from({ length: 500 }, (_, j) => `match line ${j}`).join("\n"), "read"));
 		}
 		messages.push(user("tail"));
-		e.process(messages, { contextWindow: 18_000, tokens: null });
+		e.process(messages, { contextWindow: 16_000, tokens: null });
 		const sweep = e.searchFolded("match line");
 		const totalLines = sweep.hits.reduce((n, h) => n + h.lines.length, 0);
 		expect(totalLines).toBeLessThan(500 * 6);
@@ -79,7 +79,7 @@ describe("span recall (churn guard)", () => {
 		dir = mkdtempSync(join(tmpdir(), "contextfold-span-"));
 		const e = new ContextFoldEngine(new FoldLadderPolicy(), { tailTarget: 100 }, new MapSpoolRegistry());
 		const { messages } = needledSession(5);
-		e.process(messages, { contextWindow: 40_000, tokens: null });
+		e.process(messages, { contextWindow: 36_000, tokens: null });
 		const sweep = e.searchFolded("SHARD_CAP_0");
 		e.resolveRecall([sweep.hits[0].code]);
 		e.resolveRecall([sweep.hits[0].code]);

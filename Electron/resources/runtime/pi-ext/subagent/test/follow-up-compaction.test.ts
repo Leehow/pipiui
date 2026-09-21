@@ -26,12 +26,12 @@ const WINDOW = 500_000;
 const RESERVE = 16_384;
 const SOFT = WINDOW - RESERVE + 1; // trips native shouldCompact, still < window
 const HARD = WINDOW;
-/** Exactly at the 45% policy line. */
-const POLICY_LINE = 225_000;
-/** Just below the 45% policy line (44.999…%). */
-const BELOW_POLICY_LINE = 224_998;
-/** Above 45% but far below the near-overflow line. */
-const MID_USAGE = 250_000;
+/** Exactly at the 65% policy line. */
+const POLICY_LINE = 325_000;
+/** Just below the 65% policy line (64.999…%). */
+const BELOW_POLICY_LINE = 324_998;
+/** Above 65% but far below the near-overflow line. */
+const MID_USAGE = 350_000;
 
 type CompactCall = [string, boolean];
 
@@ -116,7 +116,7 @@ const WrappedSession = makeSessionClass();
 assert.equal(installFollowUpCompactionGuard(WrappedSession), true);
 
 test("policy constants match the mandated AND semantics", () => {
-	assert.equal(AUTO_COMPACTION_USAGE_FRACTION_DEFAULT, 0.45);
+	assert.equal(AUTO_COMPACTION_USAGE_FRACTION_DEFAULT, 0.65);
 	assert.equal(AUTO_COMPACTION_IDLE_MS_DEFAULT, 4 * 60 * 1000);
 	assert.equal(AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT, 16_384);
 	assert.equal(PROACTIVE_COMPACTION_MIN_TOKENS, 200_000);
@@ -156,7 +156,7 @@ test("idle clock: prompt/provider activity restarts the idle window", () => {
 	assert.equal(autoCompactionIdleMs(session, now), 1_000);
 });
 
-test("unified gate: 44.999% + idle satisfied still never compactes", () => {
+test("unified gate: 64.999% + idle satisfied still never compactes", () => {
 	assert.equal(
 		shouldAllowAutoCompaction({
 			reason: "threshold",
@@ -168,7 +168,7 @@ test("unified gate: 44.999% + idle satisfied still never compactes", () => {
 	);
 });
 
-test("unified gate: 45% + idle below 4 minutes does not compact", () => {
+test("unified gate: 65% + idle below 4 minutes does not compact", () => {
 	assert.equal(
 		shouldAllowAutoCompaction({
 			reason: "threshold",
@@ -199,7 +199,7 @@ test("unified gate: 45% + idle below 4 minutes does not compact", () => {
 	);
 });
 
-test("unified gate: 45% + 4 minutes idle compactes (exact boundary)", () => {
+test("unified gate: 65% + 4 minutes idle compactes (exact boundary)", () => {
 	assert.equal(
 		shouldAllowAutoCompaction({
 			reason: "threshold",
@@ -220,8 +220,8 @@ test("unified gate: 45% + 4 minutes idle compactes (exact boundary)", () => {
 	);
 });
 
-test("unified gate: >=45% but under 200k tokens does not compact", () => {
-	// 45% of a 200k window is 90k — the floor is the whole point of the rule.
+test("unified gate: >=65% but under 200k tokens does not compact", () => {
+	// 65% of a 200k window is 130k — the 200k floor is the whole point of the rule.
 	assert.equal(
 		shouldAllowAutoCompaction({
 			reason: "threshold",
@@ -242,11 +242,11 @@ test("unified gate: >=45% but under 200k tokens does not compact", () => {
 	);
 });
 
-test("unified gate: >=45% and >=200k tokens compactes", () => {
+test("unified gate: >=65% and >=200k tokens compactes", () => {
 	assert.equal(
 		shouldAllowAutoCompaction({
 			reason: "threshold",
-			tokens: 200_000,
+			tokens: 260_000,
 			contextWindow: 400_000,
 			idleMs: AUTO_COMPACTION_IDLE_MS_DEFAULT,
 		}),
@@ -320,7 +320,7 @@ test("BEFORE: extension follow-up at soft threshold triggers native threshold co
 test("AFTER: soft line is near-overflow — wrapped extension follow-up still compactes", async () => {
 	// The soft line (window - 16k + 1) is pi's own model-safety reserve line,
 	// shared with the mid-turn guard. The unified policy keeps it live even
-	// during busy extension turns; only BELOW that line does 45%+idle apply.
+	// during busy extension turns; only BELOW that line does 65%+idle apply.
 	const session = new WrappedSession();
 	await session.prompt("heartbeat", { source: "extension" });
 	assert.deepEqual(session.compactCalls, [["threshold", false]]);
@@ -383,7 +383,7 @@ test("AFTER: foreign threshold below the urgent line is vetoed during busy exten
 	assert.deepEqual(session.compactCalls, []);
 });
 
-test("AFTER: foreign threshold below the urgent line passes when 45% + 4min idle both hold", async () => {
+test("AFTER: foreign threshold below the urgent line passes when 65% + 4min idle both hold", async () => {
 	const session = new WrappedSession();
 	session.setLast(assistant(MID_USAGE));
 	session.forceThreshold = true;
@@ -488,9 +488,9 @@ test("production entry: index.ts installs both compaction guards on the live Age
 	assert.match(source, /from "\.\/mid-turn-compaction\.ts"/);
 });
 
-test("production entry: idle-fold policy keeps 45% + 4 minutes with no absolute token floor", () => {
+test("production entry: idle-fold policy keeps 65% + 4 minutes with no absolute token floor", () => {
 	const timer = readFileSync(new URL("../idle-fold-timer.ts", import.meta.url), "utf8");
-	assert.match(timer, /IDLE_FOLD_LOW_WATERMARK_DEFAULT = 0\.45/);
+	assert.match(timer, /IDLE_FOLD_LOW_WATERMARK_DEFAULT = 0\.65/);
 	assert.match(timer, /IDLE_FOLD_TTL_MS_DEFAULT = 4 \* 60 \* 1000/);
 	assert.doesNotMatch(timer, /200_000|MIN_TOKENS/);
 });

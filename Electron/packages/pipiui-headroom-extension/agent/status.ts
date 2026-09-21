@@ -23,7 +23,7 @@ export function formatStatus(snapshot: RuntimeSnapshot, detailed = false): strin
     `worker ${snapshot.worker.state} · queue ${snapshot.worker.queued} · active ${snapshot.worker.active}`,
     `prepared ${snapshot.worker.accepted} accepted · ${snapshot.worker.rejected} rejected · ${snapshot.worker.skipped} noop`,
     `unique applied ${snapshot.uniqueSubstitutions} · context applications ${snapshot.substitutions} · unique tokens saved ${number.format(snapshot.tokensSaved)} · bytes saved ${number.format(snapshot.bytesSaved)}`,
-    `rewrite gate ${snapshot.rewriteGate?.activeTurn ? "active" : snapshot.rewriteGate?.armed ? "armed" : "waiting"} · threshold ${number.format((snapshot.rewriteGate?.usageFraction ?? 0.45) * 100)}% + ${number.format((snapshot.rewriteGate?.quietDelayMs ?? 240_000) / 60_000)}m quiet`,
+    `rewrite gate ${snapshot.rewriteGate?.activeTurn ? "active" : snapshot.rewriteGate?.armed ? "armed" : "waiting"} · threshold ${number.format((snapshot.rewriteGate?.usageFraction ?? 0.65) * 100)}% + ${number.format((snapshot.rewriteGate?.quietDelayMs ?? 240_000) / 60_000)}m quiet`,
     `cache ${number.format(snapshot.cache.bytes)}/${number.format(snapshot.cache.maxBytes)} bytes`,
     `retrievals ${snapshot.retrievals}`,
     `fallback ${snapshot.fallbackReason ?? "none"}`,

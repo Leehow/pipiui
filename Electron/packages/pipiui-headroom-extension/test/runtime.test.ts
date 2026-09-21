@@ -225,7 +225,7 @@ describe("Headroom primary lease and sticky fallback", () => {
     runtime.observeToolResult(toolResult as any, h.value);
     await vi.waitFor(() => expect(runtime.snapshot().worker.accepted).toBe(1));
 
-    // Preparation is deliberately eager, but nothing model-visible changes before 45% + 4m arms.
+    // Preparation is deliberately eager, but nothing model-visible changes before 65% + 4m arms.
     expect(runtime.transform([toolResult] as any, h.value)).toBeUndefined();
     expect(runtime.snapshot()).toMatchObject({ substitutions: 0, uniqueSubstitutions: 0, tokensSaved: 0 });
 

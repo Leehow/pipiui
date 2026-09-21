@@ -55,7 +55,7 @@ function setup() {
 		user("now the newest question"),
 	];
 	const e = new ContextFoldEngine(new FoldLadderPolicy(), { tailTarget: 100 }, registry);
-	e.process(messages, { contextWindow: 20_000, tokens: null });
+	e.process(messages, { contextWindow: 16_000, tokens: null });
 	return { e, code };
 }
 

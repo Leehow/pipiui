@@ -49,9 +49,9 @@ describe('compaction event protocol', () => {
   })
 
   it('distinguishes notice-only events from executed lifecycles', () => {
-    const check = compaction({ type: 'compaction', sessionId: 's1', phase: 'end', executed: false, skipReason: '上下文低于45%' })
+    const check = compaction({ type: 'compaction', sessionId: 's1', phase: 'end', executed: false, skipReason: '上下文低于65%' })
     expect(check.executed).toBe(false)
-    expect(check.skipReason).toBe('上下文低于45%')
+    expect(check.skipReason).toBe('上下文低于65%')
     // A real lifecycle event stays executed: true even when aborted or failed.
     const aborted = compaction({ type: 'compaction', sessionId: 's1', phase: 'end', reason: 'manual', aborted: true, operation: 'context_compaction', trigger: 'manual', executed: true })
     expect(aborted.executed).toBe(true)

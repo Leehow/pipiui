@@ -316,7 +316,7 @@ describe("context compaction", () => {
     // `__agent_running__` parks at 200000/262144 ≈ 76%: above the 200k floor
     // and the injected wait watermark, but below this suite's 80% ordinary
     // high watermark. Lower only the wait watermark so the test exercises
-    // host live-agent wiring; unit tests own the real 45%/4-minute values.
+    // host live-agent wiring; unit tests own the real 65%/4-minute values.
     const backend = await fixture({ waitWatermark: 0.05, waitQuietDelayMs: 20 });
     const events: any[] = [];
     const off = backend.subscribe((e) => events.push(e));

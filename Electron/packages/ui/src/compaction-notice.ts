@@ -45,7 +45,7 @@ export function resolveCompactionTrigger(event: CompactionEvent): CompactionTrig
 export function compactionTriggerLabel(trigger: CompactionTriggerKind): string {
   switch (trigger) {
     case 'manual': return '手动压缩'
-    case 'proactive_idle': return '空闲自动压缩：上下文≥45%且连续空闲4分钟'
+    case 'proactive_idle': return '空闲自动压缩：上下文≥65%且连续空闲4分钟'
     case 'near_overflow': return '临近上下文上限保护'
     case 'overflow': return '上下文溢出恢复'
     case 'mid_turn': return '回合中工具循环保护'

@@ -117,7 +117,7 @@ function ctxFor(opts: {
 
 function openRewriteGate(sessionId = "s1") {
 	beginContextOptimizerSession(sessionId);
-	configureContextRewriteGate(sessionId, 0.45, 240_000);
+	configureContextRewriteGate(sessionId, 0.65, 240_000);
 	armContextRewrite(sessionId);
 	beginContextRewriteTurn(sessionId);
 }
@@ -135,18 +135,18 @@ function heavySession(): AgentMessage[] {
 	const messages: AgentMessage[] = [user("build the thing")];
 	for (let i = 0; i < 8; i++) {
 		messages.push(assistantWithCalls([{ id: `c${i}`, name: "read" }]));
-		messages.push(bigResult(`c${i}`, 400));
+		messages.push(bigResult(`c${i}`, 550));
 	}
 	messages.push(user("now the newest question"));
 	return messages;
 }
 
 describe.skipIf(!PI_PRESENT)("context hook", () => {
-	it("requires 45% and a fresh four-minute quiet window before a new fold event", async () => {
+	it("requires 65% and a fresh four-minute quiet window before a new fold event", async () => {
 		vi.useFakeTimers();
 		try {
 			const s = await load({ rewriteAllowed: false });
-			const { ctx } = ctxFor({ usage: { contextWindow: 80_000, tokens: 36_000, percent: 45 } });
+			const { ctx } = ctxFor({ usage: { contextWindow: 80_000, tokens: 56_000, percent: 70 } });
 			const messages = heavySession();
 			await s.hooks.get("session_start")!({}, ctx);
 
@@ -596,7 +596,7 @@ describe.skipIf(!PI_PRESENT)("footer status line", () => {
 	it("tracks maskable mass toward the next step once usage is past the threshold", async () => {
 		process.env.CONTEXTFOLD_TAIL = "1000"; // shrink the protected tail so one older result is maskable
 		const s = await load();
-		const { ctx, statuses } = ctxFor({ usage: { contextWindow: 80_000, tokens: 40_000 } });
+		const { ctx, statuses } = ctxFor({ usage: { contextWindow: 80_000, tokens: 56_000 } });
 		const messages: AgentMessage[] = [
 			user("build the thing"),
 			assistantWithCalls([{ id: "c0", name: "read" }]),
@@ -606,7 +606,7 @@ describe.skipIf(!PI_PRESENT)("footer status line", () => {
 			user("now the newest question"),
 		];
 
-		// 40k/80k = 50% ≥ the 45% threshold, but only ~2.5k of maskable mass (< the 9.6k step):
+		// 56k/80k = 70% ≥ the 65% threshold, but only ~2.5k of maskable mass (< the 9.6k step):
 		// no fold fires, and the gauge shows progress toward the step instead of the usage threshold.
 		await s.hooks.get("context")!({ messages }, ctx);
 		expect(statuses["context-fold"]).toMatch(/next fold: \S+\/\S+ maskable/);
@@ -615,10 +615,10 @@ describe.skipIf(!PI_PRESENT)("footer status line", () => {
 
 	it("shows an empty step gauge past the threshold with nothing maskable yet", async () => {
 		const s = await load();
-		const { ctx, statuses } = ctxFor({ usage: { contextWindow: 80_000, tokens: 40_000 } });
+		const { ctx, statuses } = ctxFor({ usage: { contextWindow: 80_000, tokens: 56_000 } });
 
 		// Pure conversation: no tool results or thinking anywhere, so the ladder has nothing to work
-		// with even though usage (50%) is past the 45% threshold. Still interim — a big tool result
+		// with even though usage (70%) is past the 65% threshold. Still interim — a big tool result
 		// next turn would start filling the gauge — so it counts from zero rather than declaring
 		// folding impossible.
 		await s.hooks.get("context")!({ messages: [user("hi"), assistantText("a long answer"), user("more")] }, ctx);

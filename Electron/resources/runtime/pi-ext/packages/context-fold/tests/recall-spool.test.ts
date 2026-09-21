@@ -164,7 +164,7 @@ describe("spool recall — failure and compaction surfaces", () => {
 			assistantText("finished reading", "after-c1"),
 			user("tail"),
 		];
-		engine.process(messages, 20_000); // block is in the snapshot
+		engine.process(messages, 16_000); // block is in the snapshot
 		removeFile(registry.get("r:c1")!.spoolPath, { force: true });
 
 		const whole = engine.resolveRecall([code]);
@@ -225,7 +225,7 @@ describe("spool recall — failure and compaction surfaces", () => {
 			assistantText("finished reading", "after-c1"),
 			user("tail"),
 		];
-		engine.process(messages, 20_000);
+		engine.process(messages, 16_000);
 		const result = engine.searchFolded("live needle");
 		expect(result.scanned).toBe(1);
 		expect(result.hits).toHaveLength(1);

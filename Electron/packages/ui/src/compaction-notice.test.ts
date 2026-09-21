@@ -15,7 +15,7 @@ const event = (partial: Partial<CompactionEvent>): CompactionEvent =>
 describe('compactionTriggerLabel', () => {
   it('gives every trigger kind its own user-visible sentence', () => {
     expect(compactionTriggerLabel('manual')).toBe('手动压缩')
-    expect(compactionTriggerLabel('proactive_idle')).toBe('空闲自动压缩：上下文≥45%且连续空闲4分钟')
+    expect(compactionTriggerLabel('proactive_idle')).toBe('空闲自动压缩：上下文≥65%且连续空闲4分钟')
     expect(compactionTriggerLabel('near_overflow')).toBe('临近上下文上限保护')
     expect(compactionTriggerLabel('overflow')).toBe('上下文溢出恢复')
     expect(compactionTriggerLabel('mid_turn')).toBe('回合中工具循环保护')
@@ -58,7 +58,7 @@ describe('compactionNotice', () => {
 
   it('names the concrete trigger on completion', () => {
     expect(compactionNotice(event({ phase: 'end', trigger: 'manual' }))).toBe('上下文压缩完成（手动压缩）')
-    expect(compactionNotice(event({ phase: 'end', reason: 'manual', trigger: 'proactive_idle' }))).toBe('上下文压缩完成（空闲自动压缩：上下文≥45%且连续空闲4分钟）')
+    expect(compactionNotice(event({ phase: 'end', reason: 'manual', trigger: 'proactive_idle' }))).toBe('上下文压缩完成（空闲自动压缩：上下文≥65%且连续空闲4分钟）')
     expect(compactionNotice(event({ phase: 'end', trigger: 'mid_turn' }))).toBe('上下文压缩完成（回合中工具循环保护）')
     expect(compactionNotice(event({ phase: 'end', trigger: 'overflow' }))).toBe('上下文压缩完成（上下文溢出恢复）')
     expect(compactionNotice(event({ phase: 'end', reason: 'threshold' }))).toBe('上下文压缩完成（自动压缩）')
@@ -75,10 +75,10 @@ describe('compactionNotice', () => {
   })
 
   it('never says 已压缩 for notice-only (check/nudge/skip) events', () => {
-    const notice = compactionNotice(event({ phase: 'end', executed: false, skipReason: '上下文低于45%' }))
+    const notice = compactionNotice(event({ phase: 'end', executed: false, skipReason: '上下文低于65%' }))
     expect(notice).toContain('未执行压缩')
     expect(notice).not.toContain('已压缩')
-    expect(notice).toContain('上下文低于45%')
+    expect(notice).toContain('上下文低于65%')
     expect(compactionNotice(event({ phase: 'end', executed: false }))).toBe('已检查压缩条件，未执行压缩（条件不满足）')
   })
 

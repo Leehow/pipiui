@@ -50,7 +50,7 @@ describe("recall survives hard compaction", () => {
 	it("a ladder-masked block resolves from the spool once its raw message left history", () => {
 		const { e, index } = setup();
 		const { messages, needle } = needled();
-		e.process(messages, { contextWindow: 80_000, tokens: null }); // fold event → spool + registry
+		e.process(messages, { contextWindow: 56_000, tokens: null }); // fold event → spool + registry
 
 		const rec = index.readAll()[0];
 		const span = rec.spans.find((s) => s.blockId === "r:cx");
@@ -103,7 +103,7 @@ describe("compact index record + deterministic summary", () => {
 	it("emitCompactIndex indexes the whole leaving span and the renderer carries it verbatim", () => {
 		const { e, registry, index } = setup();
 		const { messages, needle } = needled();
-		e.process(messages, { contextWindow: 80_000, tokens: null });
+		e.process(messages, { contextWindow: 56_000, tokens: null });
 
 		// Hard compaction fires: everything except the newest exchange is summarized away.
 		const leaving = messages.slice(0, -1);

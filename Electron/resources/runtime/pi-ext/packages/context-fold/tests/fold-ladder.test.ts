@@ -73,7 +73,7 @@ describe("discrete fold events", () => {
 	it("crossing the threshold fires ONE fold event: observations mask, intent and actions stay", () => {
 		const { e, committed, events } = ladderEngine();
 		const { messages, callIds } = session(8); // ~39k live
-		const out = e.process(messages, { contextWindow: 80_000, tokens: null }); // ~0.49 ≥ 0.45
+		const out = e.process(messages, { contextWindow: 55_000, tokens: null }); // ~0.71 ≥ 0.65
 
 		expect(committed.length).toBe(1);
 		expect(events.length).toBe(1);
@@ -107,7 +107,7 @@ describe("discrete fold events", () => {
 		}
 		messages.push(user("now the newest question"));
 
-		const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+		const out = e.process(messages, { contextWindow: 55_000, tokens: null });
 		expect(committed.length).toBe(1);
 
 		const parts = assistantParts(out, "rA");
@@ -125,23 +125,23 @@ describe("discrete fold events", () => {
 	it("a fresh fold cannot re-fire next turn: frozen bytes hold and no second layer commits", () => {
 		const { e, committed } = ladderEngine();
 		const { messages, callIds } = session(8);
-		const first = e.process(messages, { contextWindow: 80_000, tokens: null });
+		const first = e.process(messages, { contextWindow: 55_000, tokens: null });
 		const firstText = resultText(first, callIds[0]);
-		const second = e.process(messages, { contextWindow: 80_000, tokens: null });
+		const second = e.process(messages, { contextWindow: 55_000, tokens: null });
 		expect(committed.length).toBe(1);
 		expect(resultText(second, callIds[0])).toBe(firstText);
 	});
 
 	it("step spacing: over the threshold but with too little maskable mass, no event fires", () => {
 		const { e, committed } = ladderEngine();
-		// A huge (unmaskable) user brief + one small observation: fraction ≥ 0.45, savings ≪ step.
+		// A huge (unmaskable) user brief + one small observation: fraction ≥ 0.65, savings ≪ step.
 		const messages: AgentMessage[] = [
 			user("brief: " + "requirements ".repeat(12_000)), // ~39k tokens of user intent
 			assistantWithCalls([{ id: "c0", name: "read" }]),
 			bigResult("c0", 150), // ~2k — under the 0.12 × 80k step
 			user("go"),
 		];
-		const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+		const out = e.process(messages, { contextWindow: 55_000, tokens: null });
 		expect(out).toBe(messages);
 		expect(committed.length).toBe(0);
 	});
@@ -153,7 +153,7 @@ describe("discrete fold events", () => {
 		e.process(messages, { contextWindow: 100_000, tokens: null });
 		expect(committed.length).toBe(1);
 
-		// Same session, warm: 0.29 < 0.45 → no event.
+		// Same session, warm: 0.29 < 0.65 → no event.
 		const warm = ladderEngine();
 		warm.policy.setCold(false);
 		warm.e.process(session(6).messages, { contextWindow: 100_000, tokens: null });
@@ -233,7 +233,7 @@ describe("discrete fold events", () => {
 	it("provider-reported usage drives the fraction when present", () => {
 		const { e, committed } = ladderEngine();
 		const { messages } = session(8); // estimator says ~0.49 of 80k
-		// Provider says the context is actually tiny — trust it, no fold.
+		// Estimator says ~0.49 of 80k (below the 0.65 line), but the provider reports 8k: trust it, no fold.
 		const out = e.process(messages, { contextWindow: 80_000, tokens: 8_000 });
 		expect(out).toBe(messages);
 		expect(committed.length).toBe(0);
@@ -245,7 +245,7 @@ describe("reversibility", () => {
 	it("recall and unfold still resolve a ladder-masked block", () => {
 		const { e, committed } = ladderEngine();
 		const { messages } = session(8);
-		e.process(messages, { contextWindow: 80_000, tokens: null });
+		e.process(messages, { contextWindow: 55_000, tokens: null });
 		const frozenId = committed[0].entries[0].id;
 		const code = frozenId.replace(/^r:/, "");
 
@@ -383,7 +383,7 @@ describe("externalized fold priority", () => {
 				vb({ id: "r:norm", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "norm", order: 3 }),
 			],
 			budget: 80_000,
-			contextWindow: 80_000,
+			contextWindow: 60_000,
 			liveTokens: 40_050,
 			protectedFromIndex: 4,
 			protectTokens: 100,
@@ -404,7 +404,7 @@ describe("externalized fold priority", () => {
 				vb({ id: "r:b", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "b", order: 2 }),
 			],
 			budget: 80_000,
-			contextWindow: 80_000,
+			contextWindow: 60_000,
 			liveTokens: 40_010,
 			protectedFromIndex: 3,
 			protectTokens: 100,
@@ -418,7 +418,7 @@ describe("externalized fold priority", () => {
 		try {
 			const { e } = ladderEngine();
 			const messages = mixedSession(path);
-			const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+			const out = e.process(messages, { contextWindow: 72_000, tokens: null });
 			const done = out.filter((m) => (m as { role?: string }).role === "user").find((m) => String((m as { content?: string }).content).includes("[subagent-done]"));
 			expect(String((done as { content?: string })?.content ?? "")).toContain("Findings:");
 			expect(String((done as { content?: string })?.content ?? "")).not.toContain("FOLDED");
@@ -432,12 +432,12 @@ describe("externalized fold priority", () => {
 		try {
 			const { e, committed, events } = ladderEngine();
 			const messages = mixedSession(path);
-			const view = e.viewFor(messages, { contextWindow: 80_000, tokens: null });
+			const view = e.viewFor(messages, { contextWindow: 72_000, tokens: null });
 			const extView = view.blocks.find((b) => b.callId === "ext");
 			expect(extView?.externalized).toBe(true);
 			expect(extView?.agentId).toBe("worker-a");
 
-			const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+			const out = e.process(messages, { contextWindow: 72_000, tokens: null });
 			expect(events[0]?.trigger).toBe("threshold");
 			expect(resultText(out, "ext")).toContain("FOLDED");
 			expect(resultText(out, "c0")).not.toContain("FOLDED");
@@ -456,7 +456,7 @@ describe("externalized fold priority", () => {
 	it("does not change a session whose [subagent-done] names a missing findings file", () => {
 		const { e, committed } = ladderEngine();
 		const messages = mixedSession("/no/such/.pi/findings/worker-a.md");
-		const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+		const out = e.process(messages, { contextWindow: 72_000, tokens: null });
 		expect(committed.length).toBe(1);
 		expect(resultText(out, "ext")).toContain("FOLDED");
 		expect(resultText(out, "c0")).toContain("FOLDED");

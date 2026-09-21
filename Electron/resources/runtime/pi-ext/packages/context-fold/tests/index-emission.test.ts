@@ -48,7 +48,7 @@ function bigSession(): AgentMessage[] {
 describe("seed-index emission at fold events", () => {
 	it("writes one record per event with spans that resolve to sha-verified spool envelopes", () => {
 		const { e, index } = setup();
-		e.process(bigSession(), { contextWindow: 80_000, tokens: null });
+		e.process(bigSession(), { contextWindow: 56_000, tokens: null });
 
 		const records = index.readAll();
 		expect(records.length).toBe(1);
@@ -67,7 +67,7 @@ describe("seed-index emission at fold events", () => {
 
 	it("carries planted mid-output identifiers and lowercase-failed errors (index fidelity)", () => {
 		const { e, index } = setup();
-		e.process(bigSession(), { contextWindow: 80_000, tokens: null });
+		e.process(bigSession(), { contextWindow: 56_000, tokens: null });
 		const rec = index.readAll()[0];
 		expect(rec.identifiers).toContain("CAP_X9_LIMIT");
 		expect(rec.identifiers).toContain("52418");
@@ -80,7 +80,7 @@ describe("seed-index emission at fold events", () => {
 	it("a masked block's span content is recoverable byte-exact from the spool", () => {
 		const { e, index } = setup();
 		const messages = bigSession();
-		e.process(messages, { contextWindow: 80_000, tokens: null });
+		e.process(messages, { contextWindow: 56_000, tokens: null });
 		const rec = index.readAll()[0];
 		const span = rec.spans.find((s) => s.blockId === "r:cx");
 		expect(span).toBeDefined();
@@ -92,13 +92,13 @@ describe("seed-index emission at fold events", () => {
 	it("appends across events — earlier records are never rewritten", () => {
 		const { e, index } = setup();
 		const messages = bigSession();
-		e.process(messages, { contextWindow: 80_000, tokens: null });
+		e.process(messages, { contextWindow: 56_000, tokens: null });
 		const afterFirst = index.readAll().length;
 
 		for (let i = 20; i < 28; i++) {
 			messages.splice(messages.length - 1, 0, assistantWithCalls([{ id: `c${i}`, name: "read" }]), bigResult(`c${i}`, 400));
 		}
-		e.process(messages, { contextWindow: 80_000, tokens: null });
+		e.process(messages, { contextWindow: 56_000, tokens: null });
 		const records = index.readAll();
 		expect(records.length).toBeGreaterThan(afterFirst);
 		expect(records[0].seq).toBe(1); // first record intact
@@ -115,7 +115,7 @@ describe("seed-index emission at fold events", () => {
 			event = candidate;
 			return false;
 		};
-		engine.process(bigSession(), { contextWindow: 80_000, tokens: null });
+		engine.process(bigSession(), { contextWindow: 56_000, tokens: null });
 		expect(event).toBeDefined();
 
 		const unavailableIndex = new SeedIndexStore(join(dir, "unavailable-index"));
