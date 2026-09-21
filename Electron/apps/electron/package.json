@@ -120,6 +120,25 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/experiment-lab",
+        "to": "pipiui-runtime/extensions/experiment-lab",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
+        "from": "../../resources/runtime/extensions/experiment-lab/vendor/sandbox-runtime/node_modules",
+        "to": "pipiui-runtime/extensions/experiment-lab/vendor/sandbox-runtime/node_modules",
+        "filter": [
+          "**/*",
+          "!**/.bin",
+          "!**/.bin/**"
+        ]
+      },
+      {
         "from": "../../resources/runtime/extensions/git-capability",
         "to": "pipiui-runtime/extensions/git-capability",
         "filter": [

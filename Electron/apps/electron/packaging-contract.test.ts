@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { FileMatcher } from 'app-builder-lib/out/fileMatcher'
 import { builtinModules } from 'node:module'
 import { resolve } from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -48,6 +49,43 @@ describe('macOS packaging contract', () => {
       from: '../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
       to: 'pipiui-embedded'
     }))
+  })
+
+  it('ships experiment-lab compiled agent and panel entries despite the generic dist exclusion', () => {
+    const runtimeSource = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')
+    expect(runtimeSource?.filter).toContain('!**/dist/**')
+    expect(packageJSON.build.extraResources).toContainEqual({
+      from: '../../resources/runtime/extensions/experiment-lab',
+      to: 'pipiui-runtime/extensions/experiment-lab',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo'],
+    })
+    const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../resources/runtime/extensions/experiment-lab/pipiui-extension.json'), 'utf8'))
+    expect(manifest.agent.extension).toBe('agent/dist/index.js')
+    expect(manifest.app.ui.panels[0].entry).toBe('app/dist/panel.js')
+    const entry = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/experiment-lab')!
+    const source = resolve(import.meta.dirname, entry.from)
+    const filter = new FileMatcher(source, '/unused-package-target', pattern => pattern, entry.filter).createFilter()
+    const fileStat = statSync(resolve(import.meta.dirname, 'package.json'))
+    for (const path of [manifest.agent.extension, manifest.app.ui.panels[0].entry, 'agent/dist/sandbox-supervisor.js']) {
+      expect(filter(resolve(source, path), fileStat), path).toBe(true)
+    }
+    expect(filter(resolve(source, 'node_modules/unrelated/index.js'), fileStat)).toBe(false)
+  })
+
+  it('ships only the pinned experiment-lab sandbox dependency tree without executable bin shims', () => {
+    expect(packageJSON.build.extraResources).toContainEqual({
+      from: '../../resources/runtime/extensions/experiment-lab/vendor/sandbox-runtime/node_modules',
+      to: 'pipiui-runtime/extensions/experiment-lab/vendor/sandbox-runtime/node_modules',
+      filter: ['**/*', '!**/.bin', '!**/.bin/**'],
+    })
+    const entry = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/experiment-lab/vendor/sandbox-runtime/node_modules')!
+    const source = resolve(import.meta.dirname, entry.from)
+    const filter = new FileMatcher(source, '/unused-package-target', pattern => pattern, entry.filter).createFilter()
+    const fileStat = statSync(resolve(import.meta.dirname, 'package.json'))
+    for (const path of ['@anthropic-ai/sandbox-runtime/dist/index.js', '@anthropic-ai/sandbox-runtime/LICENSE', 'zod/index.js', 'node-forge/lib/index.js']) {
+      expect(filter(resolve(source, path), fileStat), path).toBe(true)
+    }
+    expect(filter(resolve(source, '.bin/srt'), fileStat)).toBe(false)
   })
 
   it('ships Hermes through the target-specific embedded runtime, never the source-tree node_modules exclusion', () => {
