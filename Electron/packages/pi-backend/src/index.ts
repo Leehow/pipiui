@@ -235,7 +235,7 @@ import {
   reservedProviderClaimError,
   resolveContributedCatalog,
 } from "./extension-provider-contract.js";
-import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
+import { handleExtEmit, handleExtState, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import { JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
@@ -2556,6 +2556,24 @@ export class PiHostBackend implements HostBackend {
         const op = event.op;
         if (op !== "take") throw new Error("unsupported structured_output op");
         return this.structuredOutputs?.take(sessionId) ?? null;
+      },
+      onExtState: async (input, sessionId) => {
+        const live = this.live.get(sessionId);
+        const projectRoot = live?.projectRoot ?? (live?.cwd ? this.verifiedProjectRoot(live.cwd) : undefined);
+        if (!live || !projectRoot) {
+          return { schemaVersion: 1, ok: false, error: "session unavailable", errorCode: "capability_denied" };
+        }
+        if (!this.extensions.isMounted(sessionId, input.extensionId)) {
+          return { schemaVersion: 1, ok: false, error: "extension not mounted", errorCode: "capability_denied" };
+        }
+        const overlay = await this.mergedExtensionOverlay(projectRoot);
+        return this.withStableExtensionScan(projectRoot, () => {
+          // A session may have ended while the scan/migration lane was awaited.
+          if (this.live.get(sessionId) !== live) {
+            return { schemaVersion: 1 as const, ok: false as const, error: "session unavailable", errorCode: "capability_denied" };
+          }
+          return handleExtState(this.extensions, input, sessionId, overlay);
+        });
       },
       onExtEmit: async (input, sessionId) => {
         let result = handleExtEmit(this.extensions, input, sessionId);
@@ -9131,55 +9149,83 @@ export class PiHostBackend implements HostBackend {
     params: unknown,
     optsValue?: unknown,
   ): Promise<ExtInvokeResult> {
-    if (typeof idValue !== "string" || !idValue.trim()) {
-      return settingsDenied("not_found", "extension id 必须是 string");
+    if (typeof idValue !== "string" || idValue !== idValue.trim() || !/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(idValue)) {
+      return settingsDenied("not_found", "extension id 必须是合法的 command slug");
     }
     if (typeof methodValue !== "string" || !methodValue.trim()) {
       return settingsDenied("capability_denied", "method 必须是 string");
     }
     const id = idValue.trim();
     const method = methodValue.trim();
-    const current = this.extensions.get(id);
-    if (!current) return settingsDenied("not_found", `unknown extension ${id}`);
-    if (current.state === "error" || current.state === "disabled") {
-      return settingsDenied("disabled", `extension ${id} is ${current.state}`);
+    const projectId = isRecord(optsValue) ? optsValue.projectId : undefined;
+    const projectScoped = projectId !== undefined;
+    let projectRoot = this.extensionLoader.loadedProject();
+    if (projectScoped) {
+      if (typeof projectId !== "string" || !projectId.trim()) {
+        return settingsDenied("no_session", "invalid invoke projectId");
+      }
+      try {
+        projectRoot = await this.projectPath(projectId);
+      } catch {
+        return settingsDenied("no_session", `no active session for project ${projectId}`);
+      }
     }
-    let overlayEnabled = current.state === "enabled";
-    try {
-      const projectRoot = this.extensionLoader.loadedProject();
-      const overlay = await this.mergedExtensionOverlay(projectRoot);
-      overlayEnabled = this.extensions.list(overlay).find((item) => item.id === id)?.state === "enabled";
-    } catch {
-      overlayEnabled = current.state === "enabled";
-    }
-    if (!overlayEnabled) return settingsDenied("disabled", `extension ${id} is disabled`);
-    if (!this.extensions.hasCapability(id, "invoke.agent")) {
-      return settingsDenied("capability_denied", "capability_denied");
-    }
+    const overlay = await this.mergedExtensionOverlay(projectRoot);
+    const accessError = await this.withStableExtensionScan(projectRoot, () => {
+      const current = this.extensions.list(overlay).find((item) => item.id === id);
+      if (!current) return settingsDenied("not_found", `unknown extension ${id}`);
+      if (current.state !== "enabled") return settingsDenied("disabled", `extension ${id} is ${current.state}`);
+      if (!this.extensions.hasCapability(id, "invoke.agent")) {
+        return settingsDenied("capability_denied", "capability_denied");
+      }
+      return undefined;
+    });
+    if (accessError) return accessError;
+    const belongsToProject = (live: Live) => !projectScoped || resolve(live.projectRoot ?? live.cwd) === resolve(projectRoot!);
     const sessionId =
       isRecord(optsValue) && typeof optsValue.sessionId === "string" && optsValue.sessionId.trim()
         ? optsValue.sessionId.trim()
-        : [...this.live.keys()].at(-1);
-    if (!sessionId) return settingsDenied("no_session", "no active session");
+        : projectScoped
+          ? [...this.live.entries()].reverse().find(([, live]) => belongsToProject(live) && this.liveProcessUsable(live))?.[0]
+          : [...this.live.keys()].at(-1);
+    const noSessionMessage = projectScoped ? `no active session for project ${projectId}` : "no active session";
+    if (!sessionId) return settingsDenied("no_session", noSessionMessage);
     const live = this.live.get(sessionId);
-    if (!live || !this.liveProcessUsable(live)) return settingsDenied("no_session", "no active session");
+    if (!live || !belongsToProject(live) || !this.liveProcessUsable(live)) return settingsDenied("no_session", noSessionMessage);
     if (!this.extensions.isMounted(sessionId, id)) {
       return settingsDenied("capability_denied", "extension not mounted on session");
     }
     try {
-      const data = await this.writeCommandWithTimeout(
+      // A mounted extension need not register its invoke command. Fail closed:
+      // an unknown slash command otherwise becomes an ordinary LLM prompt.
+      const registered = await this.writeCommandWithTimeout(
         live,
-        { type: "invokeExtension", extensionId: id, method, params },
+        { type: "get_commands" },
         this.extensionInvokeTimeoutMs,
       );
-      return { ok: true, data };
+      if (!Array.isArray(registered?.commands) || !registered.commands.some(
+        (command: unknown) => isRecord(command) && command.source === "extension" && command.name === id,
+      )) {
+        return settingsDenied("agent_error", `extension command /${id} is not registered`);
+      }
+      // Native Pi executes extension commands before its streaming/busy checks.
+      // Never steer/followUp this control message into an LLM turn. The prompt
+      // response is only an ack; business results arrive through extension events.
+      await this.writeCommandWithTimeout(
+        live,
+        { type: "prompt", message: `/${id} ${JSON.stringify({ method, params })}` },
+        this.extensionInvokeTimeoutMs,
+      );
+      return { ok: true, data: undefined };
     } catch (error) {
       if (error instanceof Error && error.message === "timeout") {
         return settingsDenied("timeout", "extension invoke timed out");
       }
       return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
     }
-  }  private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
+  }
+
+  private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
     if (typeof projectId !== "string" || !projectId.trim()) return [];
     let root: string;
     try {

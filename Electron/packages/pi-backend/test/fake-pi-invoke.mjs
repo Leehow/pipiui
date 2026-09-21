@@ -38,7 +38,22 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (command.type === "get_session_stats") {
     return ok({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 });
   }
+  if (command.type === "get_commands") {
+    return ok({ commands: process.env.FAKE_PI_NO_INVOKE_COMMAND
+      ? [{ name: "invoke-agent", source: "prompt" }]
+      : [{ name: "invoke-agent", source: "extension" }] });
+  }
   if (command.type === "prompt") {
+    if (command.message?.startsWith("/invoke-agent ")) {
+      log(invokeLogPath, command);
+      const args = JSON.parse(command.message.slice("/invoke-agent ".length));
+      if (args.method === "hang") return;
+      // Native registerCommand handlers return void. Errors are separate events.
+      if (args.method === "fail") {
+        send({ type: "extension_error", extensionPath: "command:invoke-agent", event: "command", error: "agent boom" });
+      }
+      return ok();
+    }
     ok();
     send({ type: "agent_start" });
     send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ok" } });
@@ -50,12 +65,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     return ok();
   }
   if (command.type === "invokeExtension") {
-    log(invokeLogPath, command);
-    if (command.method === "hang") return;
-    if (command.method === "fail") {
-      return response(command.type, command.id, false, undefined, "agent boom");
-    }
-    return ok({ echoed: command.params, extensionId: command.extensionId, method: command.method });
+    return response(command.type, command.id, false, undefined, "Unknown command: invokeExtension");
   }
   ok();
 });

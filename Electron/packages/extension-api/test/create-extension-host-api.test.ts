@@ -82,6 +82,44 @@ describe('createExtensionHostAPI capability trimming', () => {
     expect(listeners.size).toBe(0)
   })
 
+  it('binds invoke to the panel project without changing the unscoped wire', async () => {
+    const invokeExtension = vi.fn(async () => ({ ok: true as const, data: undefined }))
+    for (const projectId of ['project-a', 'project-b', undefined]) {
+      const api = createExtensionHostAPI({
+        extensionId: 'quota', capabilities: ['invoke.agent'], projectId,
+        host: { invokeExtension },
+      })
+      await api.invoke?.('ping', { n: 1 })
+      expect(invokeExtension).toHaveBeenLastCalledWith(
+        'quota', 'ping', { n: 1 }, ...(projectId === undefined ? [] : [{ projectId }]),
+      )
+    }
+  })
+
+  it.each(['project-a', undefined])('forwards the target session but only the bound project (%s)', async (projectId) => {
+    const invokeExtension = vi.fn(async () => ({ ok: true as const, data: undefined }))
+    const api = createExtensionHostAPI({
+      extensionId: 'quota', capabilities: ['invoke.agent'], projectId,
+      host: { invokeExtension },
+    })
+    const forgedOpts = { sessionId: 'owner-session', projectId: 'forged-project', extra: true }
+    await api.invoke?.('cancel', { trialId: 'trial-a' }, forgedOpts)
+    expect(invokeExtension).toHaveBeenLastCalledWith(
+      'quota', 'cancel', { trialId: 'trial-a' },
+      projectId === undefined ? { sessionId: 'owner-session' } : { sessionId: 'owner-session', projectId },
+    )
+
+    // Caller-supplied project scope cannot override or introduce a project.
+    await api.invoke?.('ping', {}, { projectId: 'forged-project' } as { sessionId?: string })
+    expect(invokeExtension).toHaveBeenLastCalledWith(
+      'quota', 'ping', {}, ...(projectId === undefined ? [] : [{ projectId }]),
+    )
+    await api.invoke?.('ping', {}, {})
+    expect(invokeExtension).toHaveBeenLastCalledWith(
+      'quota', 'ping', {}, ...(projectId === undefined ? [] : [{ projectId }]),
+    )
+  })
+
   it('exposes host-owned secret-free auth status and never login/logout', async () => {
     const status = {
       extensionId: 'acme',

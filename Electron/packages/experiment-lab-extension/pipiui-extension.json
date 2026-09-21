@@ -1,0 +1,20 @@
+{
+  "id": "experiment-lab",
+  "name": "实验台",
+  "version": "0.1.0",
+  "description": "按需创建并冻结实验基线，保留方案、预算和证据；不会自动合并原型。直接说：先比较方案，给我实验报告。",
+  "category": "coding",
+  "defaultEnabled": false,
+  "capabilities": ["bridge.emit", "invoke.agent", "data.read"],
+  "agent": { "extension": "agent/dist/index.js" },
+  "app": {
+    "data": { "read": [".pi/agent/experiments"] },
+    "ui": {
+      "panels": [{ "slot": "toolPanel", "id": "experiment-lab", "title": "实验台", "entry": "app/dist/panel.js" }],
+      "slashCommands": [{ "name": "experiment-lab", "description": "创建、查看或冻结项目实验" }]
+    }
+  },
+  "runtimeAssets": ["vendor/sandbox-runtime"],
+  "settingsVersion": 1,
+  "migrations": []
+}

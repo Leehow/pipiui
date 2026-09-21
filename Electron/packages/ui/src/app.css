@@ -862,7 +862,9 @@ body{overscroll-behavior:none}
   .model-modal-sidebar { flex: none; gap: 12px; padding: 15px 14px 10px; border-right: 0; border-bottom: 1px solid var(--border); }
   .model-modal-sidebar-heading p, .model-modal-tab-hint { display: none; }
   .model-modal-sidebar-heading h2 { font-size: 16px; }
-  .model-modal-tabs { flex-direction: row; gap: 4px; overflow-x: auto; }
+  /* Tabs wrap instead of scrolling sideways; the 扩展 pack sub-nav slot drops to its own
+     full-width row underneath them (styled with the other extensions rules below). */
+  .model-modal-tabs { flex-flow: row wrap; gap: 4px; overflow: visible; }
   .model-modal-tab { min-width: 92px; flex: 1; align-items: center; padding: 7px 10px; text-align: center; }
   .model-modal-tab.active::before { display: none; }
   .model-modal-header { min-height: 78px; padding: 17px 56px 14px 16px !important; }
@@ -1062,10 +1064,15 @@ body{overscroll-behavior:none}
   .extensions-skill-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
-  .extensions-subnav-slot { margin: 0; padding-left: 0; border-left: 0; }
-  .extensions-pack-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* Stacked settings: the pack sub-nav takes its own row under the tab strip and lays its
+     entries out as a chip grid instead of a column squeezed into the tab strip. */
+  .extensions-subnav-slot { order: 1; flex: 1 1 100%; margin: 0; padding: 0; border-left: 0; }
+  .extensions-pack-sidebar { flex-direction: row; flex-wrap: wrap; align-items: flex-start; gap: 6px; padding: 0; }
+  .extensions-pack-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); flex: 1 1 100%; margin-top: 0; }
   .extensions-pack-sidebar-divider, .extensions-pack-sidebar-heading { display: none; }
-  .extensions-capability-nav { display: inline-flex; width: calc(50% - 3px); }
+  .extensions-capability-nav, .extensions-core-soon { display: inline-flex; width: calc(50% - 3px); flex: 0 0 calc(50% - 3px); margin-top: 0; }
+  .extensions-pack-dropdown, .extensions-pack-import, .extensions-pack-create, .extensions-zip-hint { flex: 1 1 100%; }
+  .extensions-zip-hint { margin: 0; padding: 0; }
   .extensions-pack-detail { grid-template-columns: 1fr; }
   .extensions-pack-master { align-items: flex-start; }
   .extensions-pack-detail .extensions-overview-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }

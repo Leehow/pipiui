@@ -34,6 +34,10 @@ export type ModelPinValidateDecisionV1 =
       authorityRevision: number;
       retryable: boolean;
     };
+export type ExtensionStateResultV1 =
+  | { schemaVersion: 1; ok: true; enabled: boolean; mounted: boolean; state: "enabled" | "disabled" | "error" | "unavailable" }
+  | { schemaVersion: 1; ok: false; error: string; errorCode?: string };
+
 export type BridgeHandlers = {
   onAgentEvent(event: BridgeAgentEvent, sessionId: string): void;
   /** Plan tools POST here; a host with no plan surface still has to answer. */
@@ -59,6 +63,8 @@ export type BridgeHandlers = {
    * handler denies everything (fail closed) — there is no legacy fallback.
    */
   onModelPinValidate?(input: ModelPinValidateRequestV1, sessionId: string): ModelPinValidateDecisionV1;
+  /** Read-only lifecycle query, routed only by the minted session capability. */
+  onExtState?(input: { extensionId: string }, sessionId: string): ExtensionStateResultV1 | Promise<ExtensionStateResultV1>;
   /** Spec D4 `ext.emit`. Fail closed when omitted. */
   onExtEmit?(
     input: { extensionId: string; event: string; payload?: unknown },
@@ -204,6 +210,23 @@ export class HostBridge {
     // Fail closed and identically for a missing, stale or forged capability: an unauthorized
     // caller learns nothing about which sessions exist.
     if (!sessionId || body.schemaVersion !== 1) return this.reply(response, 403, { ok: false, error: "unauthorized bridge capability" });
+    if (body.action === "ext.state") {
+      if (typeof body.extensionId !== "string" || !body.extensionId.trim()) {
+        return this.reply(response, 400, { schemaVersion: 1, ok: false, error: "missing extensionId" });
+      }
+      const unavailable = { schemaVersion: 1, ok: false, error: "extension state unavailable", errorCode: "unavailable" };
+      if (!this.handlers.onExtState) return this.reply(response, 503, unavailable);
+      try {
+        const result = await this.handlers.onExtState({ extensionId: body.extensionId }, sessionId);
+        if (!result.ok) return this.reply(response, 403, result);
+        // Keep this surface lifecycle-only even if an internal handler grows extra fields.
+        return this.reply(response, 200, {
+          schemaVersion: 1, ok: true, enabled: result.enabled, mounted: result.mounted, state: result.state,
+        });
+      } catch {
+        return this.reply(response, 503, unavailable);
+      }
+    }
     if (body.action === "ext.emit") {
       const extensionId = body.extensionId;
       const eventName = body.event;

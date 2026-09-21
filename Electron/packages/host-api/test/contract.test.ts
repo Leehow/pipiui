@@ -1373,6 +1373,7 @@ describe('extension architecture M1 host-api contract', () => {
     await expect(host.updateExtensionSettings?.('quota', { 'ext.quota.threshold': 90 })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' })).resolves.toEqual({ ok: true, data: settings })
+    await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 }, { projectId: 'project-a', sessionId: 'sess-a' })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.listExtensions?.()).resolves.toEqual([descriptor])
     await expect(host.listExtensions?.('project-1')).resolves.toEqual([descriptor])
     await expect(host.setExtensionEnabled?.('quota', true, 'project')).resolves.toEqual({ ...descriptor, state: 'enabled' })
@@ -1381,6 +1382,7 @@ describe('extension architecture M1 host-api contract', () => {
     await expect(host.getCapabilityGrant?.('quota')).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.confirmCapabilityGrant?.('quota', ['settings.read'])).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.getExtensionContributions?.('quota')).resolves.toEqual({ slashCommands: [{ name: 'quota', description: '查看当前用量' }] })
+    await expect(host.getExtensionContributions?.('quota', 'project-1')).resolves.toEqual({ slashCommands: [{ name: 'quota', description: '查看当前用量' }] })
     await expect(host.getExtensionUiEntrySource?.('quota', 'app/dist/header.js')).resolves.toContain('HeaderAction')
     await expect(host.getExtensionUiEntrySource?.('quota', 'app/dist/header.js', 'project-1')).resolves.toContain('HeaderAction')
     await expect(host.getExtensionAuthStatus?.('quota')).resolves.toEqual({ extensionId: 'quota', providerId: 'acme-chat', loggedIn: false, usable: false })
@@ -1392,6 +1394,7 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'updateExtensionSettings', params: ['quota', { 'ext.quota.threshold': 90 }] },
       { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }] },
       { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' }] },
+      { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }, { projectId: 'project-a', sessionId: 'sess-a' }] },
       { method: 'listExtensions', params: [] },
       { method: 'listExtensions', params: ['project-1'] },
       { method: 'setExtensionEnabled', params: ['quota', true, 'project'] },
@@ -1400,6 +1403,7 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'getCapabilityGrant', params: ['quota'] },
       { method: 'confirmCapabilityGrant', params: ['quota', ['settings.read']] },
       { method: 'getExtensionContributions', params: ['quota'] },
+      { method: 'getExtensionContributions', params: ['quota', 'project-1'] },
       { method: 'getExtensionUiEntrySource', params: ['quota', 'app/dist/header.js'] },
       { method: 'getExtensionUiEntrySource', params: ['quota', 'app/dist/header.js', 'project-1'] },
       { method: 'getExtensionAuthStatus', params: ['quota'] },

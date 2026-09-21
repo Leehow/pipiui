@@ -311,7 +311,7 @@ export type ExtensionDataAPI = {
 export type ExtensionHostAPI = {
   subscribeExt: (listener: (event: ExtEvent) => void) => () => void;
   settings?: ExtensionSettingsAPI;
-  invoke?: (method: string, params: unknown) => Promise<ExtInvokeResult>;
+  invoke?: (method: string, params: unknown, opts?: { sessionId?: string }) => Promise<ExtInvokeResult>;
   notify?: (title: string, body: string) => void | Promise<void>;
   auth?: ExtensionAuthAPI;
   /** Present only with the `data.read` capability and a declared `app.data.read`. */
@@ -326,7 +326,7 @@ export type ExtensionHostBacking = {
     patch: Record<string, unknown>,
   ): Promise<ExtInvokeResult<Record<string, unknown>>>;
   subscribeExt?(id: string, listener: (event: ExtEvent) => void): (() => void) | void;
-  invokeExtension?(id: string, method: string, params: unknown): Promise<ExtInvokeResult>;
+  invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string; projectId?: string }): Promise<ExtInvokeResult>;
   notify?(title: string, body: string): void | Promise<void>;
   getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
   listExtensionData?(id: string, dir: string, projectId?: string): Promise<ExtensionDataFile[]>;
@@ -348,7 +348,7 @@ export type CreateExtensionHostAPIOptions = {
   extensionId: string;
   capabilities?: readonly string[];
   host: ExtensionHostBacking;
-  /** Which project's files the data API reads; the host resolves the root from it. */
+  /** Project scope for data and agent invocation; the host resolves its root. */
   projectId?: string;
 };
 
@@ -424,9 +424,14 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
   }
 
   if (caps.has("invoke.agent")) {
-    api.invoke = (method, params) => {
+    api.invoke = (method, params, opts) => {
       if (!host.invokeExtension) return Promise.resolve(denied("invoke.agent"));
-      return host.invokeExtension(id, method, params);
+      const invokeOptions: { sessionId?: string; projectId?: string } = {};
+      if (opts?.sessionId !== undefined) invokeOptions.sessionId = opts.sessionId;
+      if (options.projectId !== undefined) invokeOptions.projectId = options.projectId;
+      return invokeOptions.sessionId === undefined && invokeOptions.projectId === undefined
+        ? host.invokeExtension(id, method, params)
+        : host.invokeExtension(id, method, params, invokeOptions);
     };
   }
 

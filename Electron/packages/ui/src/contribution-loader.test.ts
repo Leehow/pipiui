@@ -315,5 +315,20 @@ describe('useDeclarativeContributionLoader', () => {
 
     renderHook(() => useDeclarativeContributionLoader(host))
     await vi.waitFor(() => expect(slashCommandByName('quota')?.description).toBe('查看当前用量'))
+    expect(host.getExtensionContributions).toHaveBeenCalledTimes(1)
+    expect(host.getExtensionContributions).toHaveBeenCalledWith(EXT)
+  })
+
+  it('passes projectId to getExtensionContributions so a project-local extension can resolve', async () => {
+    const contributions = quotaDescriptor('enabled').contributions
+    const host = {
+      listExtensions: vi.fn(async () => [{ id: 'experiment-lab', state: 'enabled' as const, source: 'project' as const }]),
+      getExtensionContributions: vi.fn(async () => contributions),
+    } as unknown as PipiHostAPI
+
+    renderHook(() => useDeclarativeContributionLoader(host, 'p'))
+    await vi.waitFor(() => expect(host.getExtensionContributions).toHaveBeenCalledWith('experiment-lab', 'p'))
+    expect(host.getExtensionContributions).toHaveBeenCalledTimes(1)
+    expect(slashCommandByName('quota')?.description).toBe('查看当前用量')
   })
 })

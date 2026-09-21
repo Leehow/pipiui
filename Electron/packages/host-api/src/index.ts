@@ -1493,7 +1493,7 @@ export interface PipiHostAPI {
   getExtensionSettings?(id: string, projectId?: string): Promise<Record<string, unknown>>;
   updateExtensionSettings?(id: string, patch: Record<string, unknown>, projectId?: string): Promise<ExtInvokeResult<Record<string, unknown>>>;
   /** Reserved: M2 wires this to the session's pi RPC. */
-  invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
+  invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string; projectId?: string }): Promise<ExtInvokeResult>;
   listExtensions?(projectId?: string): Promise<ExtensionDescriptor[]>;
   /** Flattened Skill catalog from built-in, enabled-extension, and project skill roots. */
   listSkillCatalog?(projectId?: string): Promise<SkillCatalogItem[]>;
@@ -1507,7 +1507,7 @@ export interface PipiHostAPI {
   /** Persist a user-confirmed capability set before enable (spec D11). */
   confirmCapabilityGrant?(id: string, capabilities: readonly string[]): Promise<ExtensionCapabilityGrant>;
   /** Optional: declarative contributions when they are not inlined on the descriptor. */
-  getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
+  getExtensionContributions?(id: string, projectId?: string): Promise<ExtensionContributions | undefined>;
   /** Read one manifest-declared controlled UI module without exposing its filesystem path to Chromium. */
   getExtensionUiEntrySource?(id: string, entry: string, projectId?: string): Promise<string>;
   /** `app.data.read`: session-independent, read-only, confined to the project. */
@@ -1740,7 +1740,9 @@ function apiFrom(
     uninstallExtension: id => invoke("uninstallExtension", id),
     getCapabilityGrant: id => invoke("getCapabilityGrant", id),
     confirmCapabilityGrant: (id, capabilities) => invoke("confirmCapabilityGrant", id, capabilities),
-    getExtensionContributions: id => invoke("getExtensionContributions", id),
+    getExtensionContributions: (id, projectId) => projectId === undefined
+      ? invoke("getExtensionContributions", id)
+      : invoke("getExtensionContributions", id, projectId),
     getExtensionUiEntrySource: (id, entry, projectId) => projectId === undefined
       ? invoke("getExtensionUiEntrySource", id, entry)
       : invoke("getExtensionUiEntrySource", id, entry, projectId),

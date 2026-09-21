@@ -43,13 +43,13 @@ function invokeAgentManifest(overrides: Record<string, unknown> = {}) {
   };
 }
 
-async function seedSession(cwd: string, sessionsRoot: string) {
-  const dir = join(sessionsRoot, "project");
+async function seedSession(cwd: string, sessionsRoot: string, sessionId = "session-1") {
+  const dir = join(sessionsRoot, sessionId);
   await mkdir(dir, { recursive: true });
   await mkdir(cwd, { recursive: true });
   await writeFile(
     join(dir, "session.jsonl"),
-    `${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-10T00:00:00.000Z", cwd })}\n`,
+    `${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2026-08-10T00:00:00.000Z", cwd })}\n`,
   );
 }
 
@@ -58,6 +58,7 @@ function backendFor(dirs: {
   sessions: string;
   runtime: string;
   env?: Record<string, string>;
+  logInvokeByCwd?: boolean;
   timeoutMs?: number;
   capture?: { args?: string[]; env?: NodeJS.ProcessEnv };
   headroomRuntime?: HeadroomManagedRuntimeLike;
@@ -78,7 +79,9 @@ function backendFor(dirs: {
       }
       return spawn(process.execPath, [fakePi], {
         ...options,
-        env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin", ...dirs.env },
+        env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin", ...dirs.env,
+          ...(dirs.logInvokeByCwd ? { FAKE_PI_INVOKE_LOG: join(String(options.cwd), "invoke.log") } : {}),
+        },
       }) as any;
     },
   });
@@ -106,6 +109,10 @@ describe("invokeExtension and spawn settings snapshot", () => {
     const backend = backendFor({ agent, sessions: join(root, "sessions"), runtime });
     await backend.handle("listExtensions" as never, []);
 
+    for (const id of ["invoke-agent injected", "invoke-agent\n/other", "/invoke-agent", "invoke-agent\t", " invoke-agent", "invoke-agent\u2028"]) {
+      const invalid = await backend.handle("invokeExtension" as never, [id, "ping", {}]);
+      expect(invalid).toMatchObject({ ok: false, error: { code: "not_found" } });
+    }
     const missing = (await backend.handle("invokeExtension" as never, ["no-such", "ping", {}])) as ExtResult;
     expect(missing).toMatchObject({ ok: false, error: { code: "not_found" } });
 
@@ -122,7 +129,7 @@ describe("invokeExtension and spawn settings snapshot", () => {
     await backend.close();
   });
 
-  it("round-trips invokeExtension, injects settings snapshots on spawn, and times out", async () => {
+  it.each([false, true])("uses native prompt ack, checks command registration (missing=%s), injects settings, and times out", async (missingCommand) => {
     root = await mkdtemp(join(tmpdir(), "pipi-ext-invoke-ok-"));
     const agent = join(root, "agent");
     const cwd = join(root, "project");
@@ -143,7 +150,7 @@ describe("invokeExtension and spawn settings snapshot", () => {
       runtime,
       timeoutMs: 80,
       capture,
-      env: { FAKE_PI_SETTINGS_LOG: settingsLog, FAKE_PI_INVOKE_LOG: invokeLog },
+      env: { FAKE_PI_SETTINGS_LOG: settingsLog, FAKE_PI_INVOKE_LOG: invokeLog, ...(missingCommand ? { FAKE_PI_NO_INVOKE_COMMAND: "1" } : {}) },
     });
     await backend.handle("listExtensions" as never, []);
     await backend.handle("setExtensionEnabled" as never, ["invoke-agent", true, "app"]);
@@ -169,10 +176,24 @@ describe("invokeExtension and spawn settings snapshot", () => {
       { n: 7 },
       { sessionId: "session-1" },
     ])) as ExtResult;
-    expect(happy).toEqual({
-      ok: true,
-      data: { echoed: { n: 7 }, extensionId: "invoke-agent", method: "ping" },
+    if (missingCommand) {
+      expect(happy).toMatchObject({ ok: false, error: { code: "agent_error", message: "extension command /invoke-agent is not registered" } });
+      expect(await readFile(invokeLog, "utf8").catch(() => "")).toBe("");
+      await backend.close();
+      return;
+    }
+    expect(happy).toEqual({ ok: true, data: undefined });
+    const wire = JSON.parse((await readFile(invokeLog, "utf8")).trim());
+    expect(wire).toEqual({
+      id: expect.any(String),
+      type: "prompt",
+      message: '/invoke-agent {"method":"ping","params":{"n":7}}',
     });
+
+    const failedHandler = await backend.handle("invokeExtension" as never, [
+      "invoke-agent", "fail", {}, { sessionId: "session-1" },
+    ]);
+    expect(failedHandler).toEqual({ ok: true, data: undefined });
 
     const timed = (await backend.handle("invokeExtension" as never, [
       "invoke-agent",
@@ -196,6 +217,55 @@ describe("invokeExtension and spawn settings snapshot", () => {
     expect(settingsText).toContain("ext.settings_changed");
     expect(settingsText).toContain("invoke-agent");
     await backend.close();
+  });
+
+  it.each([true, false])("isolates project invoke routing and rejects cross-project sessions (A live=%s)", async (startA) => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-invoke-project-"));
+    const agent = join(root, "agent");
+    const sessions = join(root, "sessions");
+    const a = join(root, "project-a");
+    const b = join(root, "project-b");
+    for (const [cwd, sessionId] of [[a, "session-a"], [b, "session-b"]]) {
+      await seedSession(cwd, sessions, sessionId);
+      const pkg = join(cwd, ".pi", "agent", "extensions", "invoke-agent");
+      await writeManifest(pkg, invokeAgentManifest());
+      await mkdir(join(pkg, "agent"), { recursive: true });
+      await writeFile(join(pkg, "agent", "index.js"), "export default () => {};\n");
+    }
+    const backend = backendFor({ agent, sessions, runtime: join(root, "runtime"), logInvokeByCwd: true });
+    try {
+      const pa = await backend.handle("addProject", [a]) as { id: string };
+      const pb = await backend.handle("addProject", [b]) as { id: string };
+      for (const project of [pa, pb]) {
+        await backend.handle("listExtensions" as never, [project.id]);
+        await backend.handle("setExtensionEnabled" as never, ["invoke-agent", true, "project", project.id]);
+      }
+      if (startA) await backend.handle("sendPrompt", ["session-a", "go"]);
+      await backend.handle("sendPrompt", ["session-b", "go"]);
+      const invoke = (opts?: unknown) => backend.handle("invokeExtension" as never, ["invoke-agent", "ping", {}, opts]);
+      const lines = async (cwd: string) => (await readFile(join(cwd, "invoke.log"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+      // B is the last live session and last scanned project, but A owns this request.
+      expect(await invoke({ projectId: pa.id })).toMatchObject(startA ? { ok: true } : { ok: false, error: { code: "no_session" } });
+      expect(await lines(a)).toHaveLength(startA ? 1 : 0);
+      expect(await lines(b)).toHaveLength(0);
+      expect(await invoke({ projectId: pa.id, sessionId: "session-b" })).toMatchObject({ ok: false, error: { code: "no_session" } });
+      expect(await invoke({ projectId: pb.id })).toMatchObject({ ok: true });
+      expect(await invoke()).toMatchObject({ ok: true }); // Legacy last-live routing.
+      expect(await lines(b)).toHaveLength(2);
+
+      // A's overlay must win even though scanning B most recently leaves B enabled.
+      await backend.handle("setExtensionEnabled" as never, ["invoke-agent", false, "project", pa.id]);
+      await backend.handle("listExtensions" as never, [pb.id]);
+      expect(await invoke({ projectId: pa.id })).toMatchObject({ ok: false, error: { code: "disabled" } });
+      await backend.handle("setExtensionEnabled" as never, ["invoke-agent", true, "project", pa.id]);
+      // Same extension id, different project manifest capabilities.
+      await writeManifest(join(a, ".pi", "agent", "extensions", "invoke-agent"), invokeAgentManifest({ capabilities: ["settings.read"] }));
+      await backend.handle("listExtensions" as never, [pb.id]);
+      expect(await invoke({ projectId: pa.id })).toMatchObject({ ok: false, error: { code: "capability_denied" } });
+      expect(await lines(b)).toHaveLength(2);
+    } finally {
+      await backend.close();
+    }
   });
 
   it("injects the host-managed Headroom endpoint without persisting it as user settings", async () => {

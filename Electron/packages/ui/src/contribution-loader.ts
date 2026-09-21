@@ -109,10 +109,13 @@ export async function syncExtensionContributions(
 async function resolveContributions(
   host: PipiHostAPI,
   descriptor: ExtensionDescriptor,
+  projectId?: string,
 ): Promise<ExtensionDescriptor> {
   if (descriptor.contributions || descriptor.id === BUILTIN_EXTENSION_ID) return descriptor
   try {
-    const extra: ExtensionContributions | undefined = await host.getExtensionContributions?.(descriptor.id)
+    const extra: ExtensionContributions | undefined = await (projectId === undefined
+      ? host.getExtensionContributions?.(descriptor.id)
+      : host.getExtensionContributions?.(descriptor.id, projectId))
     return extra ? { ...descriptor, contributions: extra } : descriptor
   } catch {
     return descriptor
@@ -151,7 +154,7 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, 
         list = []
       }
       if (!isCurrent()) return
-      const resolved = await Promise.all(list.map(descriptor => resolveContributions(host, descriptor)))
+      const resolved = await Promise.all(list.map(descriptor => resolveContributions(host, descriptor, projectId)))
       if (!isCurrent()) return
       await syncExtensionContributions(resolved, host, projectId)
       if (!isCurrent()) return

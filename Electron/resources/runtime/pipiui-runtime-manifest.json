@@ -4,6 +4,7 @@
     "grok-build-oauth",
     "code-retrieval",
     "jev-optimizer",
+    "experiment-lab",
     "git-capability",
     "deepseek",
     "flapcode",

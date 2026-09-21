@@ -18,7 +18,7 @@ import {
   type PanelRenderContext,
   type ToolRenderProps,
 } from './ui-registries'
-import { listWorkbenchContainers, listWorkbenchViews } from './workbench/workbench-contributions'
+import { disposeWorkbenchContributions, listWorkbenchContainers, listWorkbenchViews } from './workbench/workbench-contributions'
 import { disposeHeaderActions, listHeaderActions, type HeaderActionContext } from './workbench/header-actions'
 
 const EXT = 'quota'
@@ -244,6 +244,125 @@ describe('loadControlledContributions', () => {
     expect(rendered.getByTestId('host-source-header').textContent).toBe('workspace-a')
 
     for (const dispose of disposers) dispose()
+  })
+
+  it('loads a controlled panel from host-read source via createComponent', async () => {
+    const readExtensionUiEntrySource = vi.fn(async () => [
+      'export function createComponent(React) {',
+      '  return function Panel(props) {',
+      "    return React.createElement('div', { 'data-testid': 'host-source-panel', 'data-title': String(props.title) })",
+      '  }',
+      '}',
+    ].join('\n'))
+    const host = hostStub()
+    host.getExtensionUiEntrySource = readExtensionUiEntrySource
+    const disposers = await loadControlledContributions({
+      id: EXT,
+      directory: '/filesystem-path-chromium-cannot-import',
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'app/dist/panel.js' }] },
+    }, host, undefined, 'project-a')
+
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/panel.js', 'project-a')
+    const panel = listPanels().find(item => item.id === 'quota')
+    const { container } = render(panel!.render(panelCtx()))
+    const node = container.querySelector('[data-testid="host-source-panel"]')
+    expect(node).toBeTruthy()
+    expect(node?.getAttribute('data-title')).toBe('用量')
+
+    for (const dispose of disposers) dispose()
+  })
+
+  it('loads a controlled view from host-read source via createComponent', async () => {
+    const readExtensionUiEntrySource = vi.fn(async () => [
+      'export function createComponent(React) {',
+      '  return function View(props) {',
+      "    return React.createElement('div', { 'data-testid': 'host-source-view', 'data-id': String(props.id), 'data-active': String(props.active) })",
+      '  }',
+      '}',
+    ].join('\n'))
+    const host = hostStub()
+    host.getExtensionUiEntrySource = readExtensionUiEntrySource
+    const disposers = await loadControlledContributions({
+      id: EXT,
+      directory: '/filesystem-path-chromium-cannot-import',
+      ui: {
+        viewContainers: [{ id: 'quota.navigator', location: 'primarySidebar', title: 'Quota' }],
+        views: [{ id: 'quota.navigator.main', container: 'quota.navigator', entry: 'app/dist/view.js' }],
+      },
+    }, host, undefined, 'project-a')
+
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/view.js', 'project-a')
+    const view = listWorkbenchViews().find(item => item.id === 'quota.navigator.main')!
+    const rendered = render(view.render({ active: true }))
+    const node = rendered.getByTestId('host-source-view')
+    expect(node.getAttribute('data-id')).toBe('quota.navigator.main')
+    expect(node.getAttribute('data-active')).toBe('true')
+
+    for (const dispose of disposers) dispose()
+  })
+
+  it('shows a readable placeholder when host-read source fails or is malicious and keeps a sibling extension', async () => {
+    const SIBLING = 'quota-ok'
+    const readExtensionUiEntrySource = vi.fn(async (id: string, entry: string) => {
+      if (id === SIBLING) {
+        return [
+          'export function createComponent(React) {',
+          '  return function Panel() {',
+          "    return React.createElement('div', { 'data-testid': 'host-source-sibling' })",
+          '  }',
+          '}',
+        ].join('\n')
+      }
+      if (entry.includes('throws')) throw new Error('cannot read entry')
+      return '}); window.pipiHost = { pwned: true }; not valid javascript {{{'
+    })
+    const host = hostStub()
+    host.getExtensionUiEntrySource = readExtensionUiEntrySource
+
+    const failed = await loadControlledContributions({
+      id: EXT,
+      directory: '/filesystem-path-chromium-cannot-import',
+      ui: {
+        panels: [
+          { id: 'broken-read', title: '坏读取', entry: 'app/dist/throws.js' },
+          { id: 'broken-source', title: '坏源码', entry: 'app/dist/malicious.js' },
+        ],
+        views: [{ id: 'broken-view', container: 'quota.navigator', entry: 'app/dist/throws.js' }],
+      },
+    }, host, undefined, 'project-a')
+    const ok = await loadControlledContributions({
+      id: SIBLING,
+      directory: '/filesystem-path-chromium-cannot-import',
+      ui: { panels: [{ id: 'ok', title: '完好', entry: 'app/dist/panel.js' }] },
+    }, host, undefined, 'project-a')
+
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/throws.js', 'project-a')
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/malicious.js', 'project-a')
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(SIBLING, 'app/dist/panel.js', 'project-a')
+
+    const brokenRead = listPanels().find(item => item.id === 'broken-read')
+    const brokenReadText = render(brokenRead!.render(panelCtx())).container.querySelector('[data-testid="ext-contribution-error"]')?.textContent ?? ''
+    expect(brokenReadText).toMatch(/加载失败/)
+    expect(brokenReadText).toMatch(/cannot read entry/)
+    cleanup()
+
+    const brokenSource = listPanels().find(item => item.id === 'broken-source')
+    const brokenSourceText = render(brokenSource!.render(panelCtx())).container.querySelector('[data-testid="ext-contribution-error"]')?.textContent ?? ''
+    expect(brokenSourceText).toMatch(/加载失败/)
+    cleanup()
+
+    const view = listWorkbenchViews().find(item => item.id === 'broken-view')!
+    expect(render(view.render({ active: true })).container.querySelector('[data-testid="ext-contribution-error"]')?.textContent).toMatch(/加载失败/)
+    cleanup()
+
+    const sibling = listPanels().find(item => item.id === 'ok')
+    expect(render(sibling!.render(panelCtx())).container.querySelector('[data-testid="host-source-sibling"]')).toBeTruthy()
+    expect(window.pipiHost).toBeUndefined()
+
+    for (const dispose of [...failed, ...ok]) dispose()
+    disposeUiContributions(SIBLING)
+    disposeWorkbenchContributions(EXT)
+    disposeWorkbenchContributions(SIBLING)
   })
 
   it('shows a readable panel placeholder when entry import fails and does not throw', async () => {

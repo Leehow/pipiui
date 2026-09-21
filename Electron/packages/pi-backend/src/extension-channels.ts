@@ -1,4 +1,5 @@
 import { PIPI_HOST_PROTOCOL_VERSION } from "@pipi/host-api";
+import type { ExtensionStateResultV1 } from "./bridge.js";
 import {
   authorizeExtEmit,
   type ExtEmitAuth,
@@ -40,6 +41,23 @@ export function handleExtEmit(
       event: { type: input.event, payload: input.payload },
     },
   };
+}
+
+/** Read only this session's mounted extension; no emit grant or settings exposure. */
+export function handleExtState(
+  registry: ExtensionRegistry,
+  input: { extensionId: string },
+  sessionId: string,
+  overlay: Record<string, boolean>,
+): ExtensionStateResultV1 {
+  const mounted = registry.isMounted(sessionId, input.extensionId);
+  if (!mounted) {
+    return { schemaVersion: 1, ok: false, error: "extension not mounted", errorCode: "capability_denied" };
+  }
+  const current = registry.list(overlay).find((item) => item.id === input.extensionId);
+  const state = current?.state === "enabled" || current?.state === "disabled" || current?.state === "error"
+    ? current.state : "unavailable";
+  return { schemaVersion: 1, ok: true, enabled: state === "enabled", mounted, state };
 }
 
 /**

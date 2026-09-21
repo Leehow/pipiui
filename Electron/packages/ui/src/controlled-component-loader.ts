@@ -252,10 +252,12 @@ export async function loadControlledContributions(
   const readUiEntrySource = host.getExtensionUiEntrySource
     ? (entry: string) => host.getExtensionUiEntrySource!(descriptor.id, entry, projectId)
     : undefined
-  const loadHeaderEntryModule: EntryModuleLoader = async entry => {
-    if (!importModule && host.getExtensionUiEntrySource) {
-      const source = await host.getExtensionUiEntrySource(descriptor.id, entry, projectId)
-      return importExtensionSource(source)
+  // Injected `importModule` stays first (tests). Otherwise the confined host reader
+  // supplies source for every controlled entry so Chromium never hits file://.
+  // No reader → the previous file:// / specifier path.
+  const loadControlledEntryModule: EntryModuleLoader = async entry => {
+    if (!importModule && readUiEntrySource) {
+      return importExtensionSource(await readUiEntrySource(entry))
     }
     return loadFileEntryModule(entry)
   }
@@ -278,7 +280,7 @@ export async function loadControlledContributions(
     const entry = action.entry?.trim()
     if (!entry || !action.id) continue
     try {
-      const Component = await loadHeaderActionComponent(entry, loadHeaderEntryModule)
+      const Component = await loadHeaderActionComponent(entry, loadControlledEntryModule)
       disposers.push(registerHeaderAction(descriptor.id, {
         id: action.id,
         ...(action.order !== undefined ? { order: action.order } : {}),
@@ -317,7 +319,7 @@ export async function loadControlledContributions(
     const entry = view.entry?.trim()
     if (!entry) continue
     try {
-      const Component = await loadComponent(entry, loadFileEntryModule)
+      const Component = await loadComponent(entry, loadControlledEntryModule)
       disposers.push(registerWorkbenchView(descriptor.id, {
         id: view.id,
         container: view.container,
@@ -338,7 +340,7 @@ export async function loadControlledContributions(
     seenPanel.add(panel.id)
     const railIcon = (await loadPanelIcon(descriptor.id, panel.icon, readUiEntrySource)) ?? EXTENSION_PANEL_ICON
     try {
-      const Component = await loadComponent(entry, loadFileEntryModule)
+      const Component = await loadComponent(entry, loadControlledEntryModule)
       const title = panel.title ?? panel.id
       disposers.push(registerPanel(descriptor.id, {
         id: panel.id,
@@ -357,7 +359,7 @@ export async function loadControlledContributions(
     if (!entry || !renderer.tool || seenTool.has(renderer.tool)) continue
     seenTool.add(renderer.tool)
     try {
-      const Component = await loadComponent(entry, loadFileEntryModule)
+      const Component = await loadComponent(entry, loadControlledEntryModule)
       disposers.push(registerToolRenderer(descriptor.id, {
         toolName: renderer.tool,
         render: ({ content, details, images }) => createElement(Component, { content, details, images }),
@@ -374,7 +376,7 @@ export async function loadControlledContributions(
     if (!entry || !renderer.id || seenDocumentRenderer.has(renderer.id)) continue
     seenDocumentRenderer.add(renderer.id)
     try {
-      const Component = await loadComponent(entry, loadFileEntryModule)
+      const Component = await loadComponent(entry, loadControlledEntryModule)
       disposers.push(registerDocumentRenderer(descriptor.id, {
         id: renderer.id,
         kinds: renderer.kinds?.length ? [...renderer.kinds] : undefined,
@@ -395,7 +397,7 @@ export async function loadControlledContributions(
     seenSection.add(section.id)
     const title = section.title ?? section.id
     try {
-      const Component = await loadComponent(entry, loadFileEntryModule)
+      const Component = await loadComponent(entry, loadControlledEntryModule)
       disposers.push(registerSettingsSection(descriptor.id, {
         id: section.id,
         label: title,

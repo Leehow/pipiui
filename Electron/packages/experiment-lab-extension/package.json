@@ -1,0 +1,24 @@
+{
+  "name": "@pipiui/experiment-lab-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "description": "按需冻结实验基线、验证候选方案并保留可追溯证据",
+  "scripts": {
+    "build": "node scripts/prepare-sandbox.mjs && tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs experiment-lab-extension",
+    "pretest": "npm run build",
+    "test": "vitest run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^18.3.12",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  },
+  "peerDependencies": {
+    "@pipiui/extension-api": "*",
+    "react": "^18.0.0"
+  }
+}

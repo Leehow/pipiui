@@ -1,0 +1,7 @@
+{
+  "name": "pipiui-experiment-sandbox-runtime",
+  "version": "0.0.77",
+  "private": true,
+  "description": "Isolated production dependency tree; preserve upstream LICENSE files",
+  "dependencies": { "@anthropic-ai/sandbox-runtime": "0.0.77" }
+}
