@@ -6,10 +6,10 @@
   "category": "coding",
   "capabilities": [],
   "agent": {
-    "extension": "vendor/pi-autoresearch/extensions/pi-autoresearch/index.ts",
+    "extension": "mount/autoresearch.ts",
     "skills": ["skills", "vendor/pi-autoresearch/skills"]
   },
-  "runtimeAssets": ["vendor/pi-autoresearch", "skills"],
+  "runtimeAssets": ["vendor/pi-autoresearch", "skills", "mount"],
   "updateComponents": [
     {
       "id": "pi-autoresearch",
