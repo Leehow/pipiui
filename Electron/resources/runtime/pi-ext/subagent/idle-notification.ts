@@ -67,21 +67,37 @@ export function idleNotificationApi<T extends {
 	});
 }
 
-/** Only a revision is retained while busy, never a payload or a queue of events. */
+/**
+ * Only worker identities are retained while busy, never a payload or a queue of events.
+ *
+ * Consumption is scoped, because a whole-board read is not the only way the Boss looks:
+ * inspecting one worker answers that worker just as completely. A revision counter cannot
+ * express that — the Boss read one worker, the counter stayed unread, and the hint fired
+ * again at the next settle for a result the Boss had already reported. Keys are
+ * `<agentId>\0<runId>` so a scoped read can retire exactly the workers it covered.
+ *
+ * Only an explicit status read consumes. Reading a findings file is deliberately NOT
+ * consumption: that artifact is the worker's own final text, so it cannot stand in for a
+ * Supervisor decision on the same run, and it would retire notices the Boss never saw.
+ */
 export class IdleNotificationState {
-	private revision = 0;
-	private seen = 0;
-	changed(): void { this.revision += 1; }
-	read(): void { this.seen = this.revision; }
-	get unread(): boolean { return this.seen < this.revision; }
-	reset(): void { this.revision = 0; this.seen = 0; }
+	private unreadKeys = new Set<string>();
+	changed(key: string): void { this.unreadKeys.add(key); }
+	/** No argument consumes the whole board; an agent id consumes only that worker's runs. */
+	read(agentId?: string): void {
+		if (!agentId) { this.unreadKeys.clear(); return; }
+		const prefix = `${agentId}\0`;
+		for (const key of [...this.unreadKeys]) if (key.startsWith(prefix)) this.unreadKeys.delete(key);
+	}
+	get unread(): boolean { return this.unreadKeys.size > 0; }
+	reset(): void { this.unreadKeys.clear(); }
 
 	remind(send: () => void): boolean {
-		if (!this.unread) return false;
-		const revision = this.revision;
+		if (!this.unreadKeys.size) return false;
+		const pending = [...this.unreadKeys];
 		try { send(); } catch { return false; }
 		// A synchronous callback may observe another completion: do not consume it.
-		this.seen = revision;
+		for (const key of pending) this.unreadKeys.delete(key);
 		return true;
 	}
 }

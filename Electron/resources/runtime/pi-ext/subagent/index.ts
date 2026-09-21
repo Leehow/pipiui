@@ -5950,7 +5950,7 @@ function deliverSupervisorNoticeToBoss(pi: ExtensionAPI, agentId: string, runId:
 	supervisorNotices.set(key, { agentId, runId, text: bounded });
 	if (supervisorNotices.size > 64) supervisorNotices.delete(supervisorNotices.keys().next().value!);
 	resetBossStatusPoll?.(); // Same worker state, but a new decision is actionable.
-	idleNotificationState.changed();
+	idleNotificationState.changed(key);
 	return remindIdleBoss(pi) ? true : "recorded";
 }
 
@@ -6428,7 +6428,7 @@ async function deliverConfirmedDoneToBossAsync(
 		try {
 			doneDeliveryStore?.markAcknowledged(obligation.id, "Live notification only; replay retired. Worker result and episode disposition are unchanged.");
 		} catch (error) { logDonePersistenceFailure("retire-notification", obligation.id, error); }
-		idleNotificationState.changed();
+		idleNotificationState.changed(`${agentId}\0${runId}`);
 		// Retire replay without claiming a wake when only queryable state changed.
 		return remindIdleBoss(pi) ? true : "recorded";
 	}
@@ -11353,7 +11353,11 @@ export default function (pi: ExtensionAPI) {
 				full: params.full === true,
 			};
 			const formatted = [formatJobsStatus(query), supervisorNoticeStatus(query.agentId)].filter(Boolean).join("\n\n");
-			if (!query.agentId && !query.onlyRunning) idleNotificationState.read();
+			// Scoped consumption: a per-worker read retires that worker, a whole-board read
+			// retires everything. A running-only board omits the terminal states these hints
+			// are about, so it consumes nothing.
+			if (query.agentId) idleNotificationState.read(query.agentId);
+			else if (!query.onlyRunning) idleNotificationState.read();
 			const snapshot = decideAdjacentStatusSnapshot(
 				previousUnfilteredStatusSemanticKey,
 				formatted,

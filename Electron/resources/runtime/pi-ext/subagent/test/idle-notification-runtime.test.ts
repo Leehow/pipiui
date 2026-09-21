@@ -175,3 +175,31 @@ test("running-worker escalation remains queryable and reopens status without a s
 	assert.match((await poll()).reason, /verification needs a decision/, "blocked duplicate still carries the decision");
 	runtime.jobRegistry.delete(row.agentId);
 });
+
+// Reported defect (chatrpgv4-wt-pi-coc-v2 bd865722, 2026-09-21T02:07:49Z): the Boss inspected a
+// finished worker by agentId while busy, reported it, and the hint for that same worker still
+// fired at the end of the turn — a whole turn spent to find nothing new. Consumption must
+// follow the read the Boss actually made. This runs last and asserts deltas because `sent` is
+// shared across this file.
+test("a per-worker status read retires that worker's hint before the next settle", async () => {
+	await tools.get("subagent_status").execute("clear-board", {});
+	const before = sent.length;
+	idle = false;
+	runtime.bossTurnBusy = true;
+	const inspected = job("inspected-worker");
+	const other = job("other-worker");
+	await done.deliverToBoss(pi as never, inspected.agentId, inspected.runId, "LONG-INSPECTED");
+	await done.deliverToBoss(pi as never, other.agentId, other.runId, "LONG-OTHER");
+	assert.equal(sent.length, before, "busy deliveries never wake the Boss");
+	const status = await tools.get("subagent_status").execute("inspect-one", { agentId: inspected.agentId, full: true });
+	assert.match(status.content[0].text, /inspected-worker/);
+	idle = true;
+	await fire("agent_settled");
+	assert.equal(sent.length, before + 1, "only the worker the Boss never inspected may wake it");
+	idle = true;
+	await fire("agent_settled");
+	assert.equal(sent.length, before + 1, "the retired worker never re-fires");
+	await tools.get("subagent_status").execute("clear-after", {});
+	runtime.jobRegistry.delete(inspected.agentId);
+	runtime.jobRegistry.delete(other.agentId);
+});

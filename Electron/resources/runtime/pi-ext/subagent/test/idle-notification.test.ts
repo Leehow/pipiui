@@ -113,17 +113,31 @@ test("native guard closes the race after an extension idle check", () => {
 
 test("busy revisions coalesce; a status read consumes them without a later wake", () => {
 	const state = new IdleNotificationState();
-	for (let i = 0; i < 100; i++) state.changed();
+	for (let i = 0; i < 100; i++) state.changed(`busy-${i}\0run-${i}`);
 	assert.equal(state.remind(() => { throw new Error(IDLE_NOTIFICATION_SKIPPED); }), false);
 	assert.equal(state.unread, true);
 	state.read();
 	assert.equal(state.remind(() => assert.fail("already queried, do not wake")), false);
 });
 
+test("a per-worker read retires only that worker and a later change re-arms it", () => {
+	const state = new IdleNotificationState();
+	state.changed("alpha\0run-1");
+	state.changed("beta\0run-2");
+	state.read("alpha");
+	assert.equal(state.unread, true, "beta is still unread");
+	let sends = 0;
+	assert.equal(state.remind(() => { sends++; }), true);
+	assert.equal(state.unread, false);
+	state.changed("alpha\0run-3");
+	assert.equal(state.remind(() => { sends++; }), true, "the same worker re-arms on a new change");
+	assert.equal(sends, 2);
+});
+
 test("completion after the final status read gets one short idle hint, never old payloads", () => {
 	const state = new IdleNotificationState();
 	state.read();
-	state.changed();
+	state.changed("late-a\0run");
 	let sends = 0;
 	assert.equal(state.remind(() => { sends++; }), true);
 	assert.equal(state.remind(() => { sends++; }), false);
@@ -134,8 +148,8 @@ test("completion after the final status read gets one short idle hint, never old
 
 test("new completion during send remains unread and install is idempotent", () => {
 	const state = new IdleNotificationState();
-	state.changed();
-	state.remind(() => state.changed());
+	state.changed("first\0run");
+	state.remind(() => state.changed("second\0run"));
 	assert.equal(state.unread, true);
 	assert.equal(installIdleNotificationGuard(AgentSession), true);
 	assert.equal(installIdleNotificationGuard({ prototype: {} }), false);
