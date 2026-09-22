@@ -6,6 +6,7 @@ import { projectPiAgentDir } from "./project-pi-home.js";
 export const JEV_EXTENSION_ID = "jev-optimizer";
 export const JEV_SECRET_KEY = "ext.jev-optimizer.apiKey";
 export const JEV_BROWSER_ENABLED_KEY = "ext.jev-optimizer.browserEnabled";
+export const JEV_CONTEXT_ENABLED_KEY = "ext.jev-optimizer.contextEnabled";
 export const JEV_SECRET_ENV = "EXT_JEV_OPTIMIZER_APIKEY";
 export const JEV_STATE_FILE_ENV = "PIPIUI_JEV_STATE_FILE";
 export const JEV_GENERATION_ENV = "PIPIUI_JEV_GENERATION";
@@ -17,6 +18,7 @@ export type JevRuntimeState = {
   generation: string;
   browserEnabled: boolean;
   browserGeneration: string;
+  contextEnabled?: boolean;
 };
 export type JevRuntimeSnapshot = { file: string; generation: string };
 
@@ -47,7 +49,7 @@ export class JevRuntimeStateStore {
   }
 
   /** A new host never trusts a prior host's generation (its memory vault may be empty). */
-  ensure(projectRoot: string, input: { enabled: boolean; hasKey: boolean; browserEnabled?: boolean }, rotate = false): JevRuntimeSnapshot {
+  ensure(projectRoot: string, input: { enabled: boolean; hasKey: boolean; browserEnabled?: boolean; contextEnabled?: boolean }, rotate = false): JevRuntimeSnapshot {
     const root = this.root(projectRoot);
     const previous = this.states.get(root);
     const browserEnabled = input.browserEnabled === true;
@@ -63,6 +65,7 @@ export class JevRuntimeStateStore {
       : randomUUID();
     const state: JevRuntimeState = {
       schemaVersion: 1, enabled: input.enabled, hasKey: input.hasKey, generation, browserEnabled, browserGeneration,
+      ...(input.contextEnabled === true ? { contextEnabled: true } : {}),
     };
     const file = jevRuntimeStateFile(root);
     mkdirSync(dirname(file), { recursive: true });
@@ -88,6 +91,14 @@ export class JevRuntimeStateStore {
   revokeBrowser(projectRoot: string): void {
     const previous = this.states.get(this.root(projectRoot));
     if (previous?.browserEnabled !== true) return;
-    this.ensure(projectRoot, { enabled: previous.enabled, hasKey: previous.hasKey, browserEnabled: false });
+    this.ensure(projectRoot, { enabled: previous.enabled, hasKey: previous.hasKey, browserEnabled: false, contextEnabled: previous.contextEnabled });
+  }
+
+  /** Context-only revocation preserves retrieval and browser authority. */
+  revokeContext(projectRoot: string): void {
+    const previous = this.states.get(this.root(projectRoot));
+    if (previous?.contextEnabled !== true) return;
+    this.ensure(projectRoot, { enabled: previous.enabled, hasKey: previous.hasKey,
+      browserEnabled: previous.browserEnabled, contextEnabled: false });
   }
 }

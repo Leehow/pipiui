@@ -8,7 +8,7 @@ import { projectPiAgentDir } from "../src/project-pi-home.js";
 import { resetInMemoryVault } from "../src/secret-vault.js";
 import * as extensionSettings from "../src/extension-settings.js";
 import {
-  JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
+  JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
   JevRuntimeStateStore, jevRuntimeStateFile, type JevRuntimeState,
 } from "../src/jev-runtime-state.js";
 import { assemblePiSpawn, mergedSpawnEnvironment, workerRegisteredExtensionArgs, type SpawnRegisteredExtension } from "../src/spawn-assembly.js";
@@ -41,6 +41,7 @@ async function fixture(scope: "project" | "app" = "project") {
     app: { settings: { scope, schema: { type: "object", properties: {
       [JEV_SECRET_KEY]: { type: "string", format: "secret" },
       [JEV_BROWSER_ENABLED_KEY]: { type: "boolean" },
+      [JEV_CONTEXT_ENABLED_KEY]: { type: "boolean" },
     } } } },
   }));
   const agentDir = join(root, "host-agent");
@@ -68,14 +69,27 @@ async function fixture(scope: "project" | "app" = "project") {
   const enable = (id: string, value: boolean) => backend.handle("setExtensionEnabled" as never, [JEV_EXTENSION_ID, value, "project", id]);
   const key = (id: string, value: string | null) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_SECRET_KEY]: value }, id]);
   const browser = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_BROWSER_ENABLED_KEY]: value }, id]);
+  const context = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_CONTEXT_ENABLED_KEY]: value }, id]);
   async function spawn(path: string) {
     const packages = await probe.registeredExtensionsForSpawn(path);
     return { packages, ...assemblePiSpawn({ cwd: path, paths: {}, registeredExtensions: packages }) };
   }
-  return { backend, probe, a, b, unopened, enable, key, browser, spawn, agentDir };
+  return { backend, probe, a, b, unopened, enable, key, browser, context, spawn, agentDir };
 }
 
 describe("Jev host state projection", () => {
+  it("projects context selection settings to new sessions and revokes without disabling browser or retrieval", async () => {
+    const f = await fixture();
+    await f.enable(f.a.id, true); await f.key(f.a.id, "context-test-key");
+    await f.browser(f.a.id, true); await f.context(f.a.id, true);
+    const on = await f.spawn(f.a.path);
+    expect(state(f.a.path)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: true, contextEnabled: true });
+    expect(JSON.parse(on.env.PIPIUI_EXT_SETTINGS_JEV_OPTIMIZER)).toMatchObject({ [JEV_CONTEXT_ENABLED_KEY]: true });
+    const generation = state(f.a.path).generation;
+    await f.context(f.a.id, false);
+    expect(state(f.a.path).contextEnabled).not.toBe(true);
+    expect(state(f.a.path)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: true, generation });
+  });
   it("atomically replaces complete nonsecret state and rotates only on authority changes", async () => {
     const root = await temporary();
     const store = new JevRuntimeStateStore();

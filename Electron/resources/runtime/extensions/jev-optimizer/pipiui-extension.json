@@ -1,9 +1,9 @@
 {
   "id": "jev-optimizer",
   "name": "Jev 优化",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "category": "knowledge",
-  "description": "TypeSafe Jev 决策扩展：共用一份凭据提供检索评分与浏览器 Choice 动作控制。默认关闭；无 key 时基础检索与普通浏览器工具不受影响。",
+  "description": "TypeSafe Jev 决策扩展：共用一份凭据提供会话上下文选择、检索评分与浏览器 Choice 动作控制。默认关闭；无 key 时基础检索与普通浏览器工具不受影响。",
   "defaultEnabled": false,
   "capabilities": [],
   "agent": {
@@ -15,6 +15,12 @@
       "schema": {
         "type": "object",
         "properties": {
+          "ext.jev-optimizer.contextEnabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "按任务选择会话上下文",
+            "description": "新会话首次请求前，用 Jev 选择相关工具和工作指导。选中内容在会话内保留，后续只增加；缺失能力可按需补载。会发送当前请求、有限近期对话及能力短说明到 TypeSafe，可能收费。新增原生工具可能触发模型缓存重建；启用后需开启新会话。"
+          },
           "ext.jev-optimizer.browserEnabled": {
             "type": "boolean",
             "default": false,
@@ -25,7 +31,7 @@
             "type": "string",
             "format": "secret",
             "title": "TypeSafe API Key",
-            "description": "本项目所有 Jev 功能共用此 key，包括代码检索评分与浏览器 Choice / Score。凭据加密持久保存，重启后恢复；不需要在通用密钥库另填一份。检索启用后会发送查询及受限源码片段，浏览器外发由上方开关控制。更换 key 后需开启新会话。"
+            "description": "本项目所有 Jev 功能共用此 key，包括会话上下文选择、代码检索评分与浏览器 Choice / Score。凭据加密持久保存，重启后恢复；不需要在通用密钥库另填一份。检索启用后会发送查询及受限源码片段，浏览器和上下文外发由各自开关控制。更换 key 后需开启新会话。"
           }
         }
       }

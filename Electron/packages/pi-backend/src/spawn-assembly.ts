@@ -627,7 +627,11 @@ function appendRegisteredExtensions(args:string[], env:Record<string,string>, pa
     keyCount.set(mount.key, (keyCount.get(mount.key) ?? 0) + 1);
   }
   const mounted:{id:string;path:string}[]=[];
-  for (const { pkg, key } of classified) {
+  // Jev freezes the composed prompt after philosophy and skill-loader have contributed.
+  // Stable partition preserves all other extension order and the worker snapshot order.
+  const ordered = [...classified.filter(({ pkg }) => pkg.id !== JEV_EXTENSION_ID),
+    ...classified.filter(({ pkg }) => pkg.id === JEV_EXTENSION_ID)];
+  for (const { pkg, key } of ordered) {
     if ((keyCount.get(key) ?? 0) > 1 || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
     if (pkg.secretEnv) Object.assign(env, pkg.secretEnv);

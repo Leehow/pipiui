@@ -4,6 +4,8 @@ export { executeBrowserRerank } from "./browser-rerank.js";
 import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, executeBrowserChoiceAvailability, executeBrowserChoice, type BrowserChoiceOffer } from "./browser-choice.js";
 export * from "./browser-choice.js";
 import { executeAvailability, executeRerank } from "./rerank.js";
+import { registerContextSelector } from "./context-selector.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { JevDeps, JevExtensionAPI, RerankOffer, RerankWithdraw } from "./types.js";
 
 export type { JevDeps, RerankInput, RerankOutcome, RerankOffer } from "./types.js";
@@ -43,6 +45,8 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     withdrawn: () => withdrawn,
     signal: sessionAbort.signal,
   };
+
+  registerContextSelector(pi as unknown as ExtensionAPI, deps, gate);
 
   const offer = (): RerankOffer => ({
     version: 1,

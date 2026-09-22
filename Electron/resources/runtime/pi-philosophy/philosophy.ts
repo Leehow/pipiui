@@ -24,6 +24,8 @@ import {
   parseLayer,
   resolveAgent,
   resolveRole,
+  resolvePlaceholders,
+  renderAgents,
 } from "./compose.ts";
 import {
   createRetrievalAttribution,
@@ -268,6 +270,24 @@ function buildReport(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  // Publish structured, eligible contributions to an optional context selector. The
+  // philosophy owns role/model/config gates and exact text; the selector owns relevance.
+  pi.events.on("pipiui.context-layers.request.v1", (request: any) => {
+    if (!request || typeof request.reply !== "function") return;
+    const { layers, capabilities } = loadLayers();
+    const result = composePhilosophy({ layers, capabilities, config: readConfig(),
+      role: resolveRole(process.env), agent: resolveAgent(process.env), activeTools: request.tools,
+      model: formatModel(request.ctx?.model), modelCapabilities: modelCapabilitiesOf(request.ctx?.model) });
+    request.reply(result.included.map(layer => ({ id: layer.id, summary: `${layer.name}: ${layer.summary}`,
+      body: (() => { const resolved = resolvePlaceholders(layer, capabilities, request.tools); return resolved.ok ? resolved.body : ""; })(),
+      template: layer.body.replace(/\{\{agents\}\}/g, renderAgents(capabilities.agents)),
+      bindings: Object.fromEntries(Object.entries(capabilities.capabilities).map(([key, cap]) => [key, { tool: cap.tool, absent: cap.absent }])),
+      requires: layer.requires,
+      tools: layer.requiresCapabilities.map(key => capabilities.capabilities[key]?.tool).filter(Boolean),
+      pinned: layer.source === "user" || ["foundation", "method", "thinking", "toolcall"].includes(layer.id)
+        || layer.requiresModels.length > 0 || layer.excludesModels.length > 0 || layer.requiresModelCapabilities.length > 0,
+    })));
+  });
   let attribution: ReturnType<typeof createRetrievalAttribution> | undefined;
   try {
     attribution = createRetrievalAttribution({ agentDir: AGENT_DIR });
@@ -299,10 +319,13 @@ export default function (pi: ExtensionAPI) {
         modelCapabilities: modelCapabilitiesOf(ctx.model),
       });
       // Published before the turn runs, so any tool called during it sees this turn's truth.
-      layerIds = result.included.map((l) => l.id);
+      let selection: { text: string; layerIds: string[] } | undefined;
+      pi.events.emit("pipiui.context-selection.request.v1", { reply: (value: typeof selection) => { selection = value; } });
+      layerIds = selection?.layerIds ?? result.included.map((l) => l.id);
       publishState(layerIds);
-      if (result.text) {
-        nextPrompt = `${event.systemPrompt.trimEnd()}\n\n${MARKER}\n${result.text}`;
+      const selectedText = selection?.text ?? result.text;
+      if (selectedText) {
+        nextPrompt = `${event.systemPrompt.trimEnd()}\n\n${MARKER}\n${selectedText}`;
         injected = true;
       }
     } else {

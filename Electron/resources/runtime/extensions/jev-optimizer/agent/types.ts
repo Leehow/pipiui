@@ -49,6 +49,7 @@ export type JevHostState = {
   generation: string;
   browserEnabled?: boolean;
   browserGeneration?: string;
+  contextEnabled?: boolean;
 };
 
 export type JevFetch = (url: string, init?: RequestInit) => Promise<Response>;

@@ -32,6 +32,7 @@ export function parseHostState(raw: string): JevHostState | undefined {
     hasKey: parsed.hasKey,
     generation: parsed.generation,
     browserEnabled: parsed.browserEnabled === true,
+    contextEnabled: parsed.contextEnabled === true,
     browserGeneration: typeof parsed.browserGeneration === "string" && parsed.browserGeneration
       ? parsed.browserGeneration : undefined,
   };
