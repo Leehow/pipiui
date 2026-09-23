@@ -115,7 +115,7 @@
             "image"
           ],
           "reasoning": true,
-          "contextWindow": 1000000,
+          "contextWindow": 1050000,
           "maxTokens": 128000,
           "cost": {
             "input": 10,
@@ -131,6 +131,66 @@
             "xhigh": "xhigh",
             "max": "max",
             "off": null
+          },
+          "compat": {
+            "supportsLongCacheRetention": false,
+            "supportsStrictMode": true
+          }
+        },
+        {
+          "id": "gpt-6-sol",
+          "name": "GPT-6 Sol (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 1050000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          },
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false,
+            "supportsStrictMode": true
+          }
+        },
+        {
+          "id": "gpt-6-luna",
+          "name": "GPT-6 Luna (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 1050000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 0.1,
+            "output": 0.5,
+            "cacheRead": 0.01,
+            "cacheWrite": 0.125
+          },
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
           },
           "compat": {
             "supportsLongCacheRetention": false,

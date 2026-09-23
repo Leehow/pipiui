@@ -2,8 +2,8 @@
  * Flapcode model catalog (single source).
  *
  * Flapcode is a Codex relay (Responses wire API, Bearer key). Model
- * parameters mirror pi's built-in `openai-codex` catalog; the transport
- * here is plain `openai-responses` because the relay speaks the standard
+ * parameters follow the upstream catalog and documented GPT-6 specs. The
+ * transport here is plain `openai-responses` because the relay speaks the standard
  * Responses API with an API key, not the ChatGPT backend session protocol.
  */
 
@@ -19,8 +19,9 @@
  * a `session-id` request header and `store:false` + `stream:true` +
  * structured list `input` in the Responses payload — pi's openai-responses
  * streamer already satisfies the payload side; the header is added by
- * provider.ts. `/v1/models` is not served (404): the catalog below is the
- * probed-verified model set (all five returned response.completed).
+ * provider.ts. `/v1/models` is not served (404), so the catalog is maintained
+ * explicitly. The original five models were relay-probed; GPT-6 Sol/Luna
+ * metadata comes from OpenAI's model docs, not a relay availability probe.
  */
 
 export const FLAPCODE_PROVIDER_ID = "flapcode";
@@ -59,7 +60,7 @@ export type FlapcodeModel = {
  * are accepted verbatim. `off` stays absent, which both keeps it in the picker
  * and sends the accepted `none`.
  */
-const GPT_5_6_THINKING_MAP: Record<string, string | null> = {
+const GPT_THINKING_MAP: Record<string, string | null> = {
   minimal: "low",
   low: "low",
   medium: "medium",
@@ -92,7 +93,7 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
     contextWindow: 1000000,
     maxTokens: 128000,
-    thinkingLevelMap: { ...GPT_5_6_THINKING_MAP },
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
     compat: { ...FLAPCODE_COMPAT },
   },
   {
@@ -104,7 +105,7 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     cost: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
     contextWindow: 1000000,
     maxTokens: 128000,
-    thinkingLevelMap: { ...GPT_5_6_THINKING_MAP },
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
     compat: { ...FLAPCODE_COMPAT },
   },
   {
@@ -116,7 +117,7 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     cost: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
     contextWindow: 1000000,
     maxTokens: 128000,
-    thinkingLevelMap: { ...GPT_5_6_THINKING_MAP },
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
     compat: { ...FLAPCODE_COMPAT },
   },
   {
@@ -126,12 +127,40 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     reasoning: true,
     input: ["text", "image"],
     cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
-    contextWindow: 1000000,
+    // https://developers.openai.com/api/docs/models/gpt-6-astra
+    contextWindow: 1050000,
     maxTokens: 128000,
-    // Same probe as GPT_5_6_THINKING_MAP, except `off`: astra rejects the
+    // Same probe as GPT_THINKING_MAP, except `off`: astra rejects the
     // `none` effort ("Unsupported value: 'none'"), so thinking cannot be
     // turned off for it and the level is marked unsupported.
-    thinkingLevelMap: { ...GPT_5_6_THINKING_MAP, off: null },
+    thinkingLevelMap: { ...GPT_THINKING_MAP, off: null },
+    compat: { ...FLAPCODE_COMPAT },
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6-sol
+  // https://developers.openai.com/api/docs/models/gpt-6-luna
+  // Standard API list prices; Flapcode subscription billing is separate.
+  {
+    id: "gpt-6-sol",
+    name: "GPT-6 Sol (Flapcode)",
+    api: "openai-responses",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+    contextWindow: 1050000,
+    maxTokens: 128000,
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
+    compat: { ...FLAPCODE_COMPAT },
+  },
+  {
+    id: "gpt-6-luna",
+    name: "GPT-6 Luna (Flapcode)",
+    api: "openai-responses",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+    contextWindow: 1050000,
+    maxTokens: 128000,
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
     compat: { ...FLAPCODE_COMPAT },
   },
   {
@@ -143,9 +172,9 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
     contextWindow: 1000000,
     maxTokens: 128000,
-    // Same probe as GPT_5_6_THINKING_MAP, except `max`, which 5.5 rejects
+    // Same probe as GPT_THINKING_MAP, except `max`, which 5.5 rejects
     // ("Unsupported value: 'max'"): null keeps it out of the picker.
-    thinkingLevelMap: { ...GPT_5_6_THINKING_MAP, max: null },
+    thinkingLevelMap: { ...GPT_THINKING_MAP, max: null },
     compat: { ...FLAPCODE_COMPAT },
   },
 ];
