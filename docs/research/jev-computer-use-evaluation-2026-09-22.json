@@ -1,0 +1,1799 @@
+{
+  "schema": "pipiui.ax-eval-batch.v1",
+  "generator": "pipiui-ax-eval-baseline",
+  "group": "B",
+  "status": "completed",
+  "synthetic": true,
+  "syntheticLabel": "synthetic-stand-in",
+  "service": "stand-in",
+  "measured": true,
+  "realEvaluation": "skipped",
+  "note": "Group B is a deterministic stand-in on synthetic AX fixtures. It is not main-model group A and not real Jev group C.",
+  "records": [
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-visible-toggle-r0-o0",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-visible-toggle",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 0,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 3,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 2,
+        "screenshotMs": 2,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-rear-toggle-r0-o1",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-rear-toggle",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 1,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 1,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-flat-page-r0-o2",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-flat-page",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 2,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 1,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-group-page-r0-o3",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-group-page",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 3,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-duplicate-enable-r0-o4",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-duplicate-enable",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 4,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-modal-keep-r0-o5",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-modal-keep",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 5,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-stale-apply-r0-o6",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-stale-apply",
+      "taskId": "settings-nav",
+      "repeat": 0,
+      "order": 6,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-expand-find-r0-o7",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-expand-find",
+      "taskId": "menu-find",
+      "repeat": 0,
+      "order": 7,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-disabled-noop-r0-o8",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-disabled-noop",
+      "taskId": "menu-find",
+      "repeat": 0,
+      "order": 8,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-known-term-r0-o9",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-known-term",
+      "taskId": "known-input",
+      "repeat": 0,
+      "order": 9,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-secure-field-r0-o10",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-secure-field",
+      "taskId": "known-input",
+      "repeat": 0,
+      "order": 10,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-scroll-reveal-row-r0-o11",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "scroll-reveal-row",
+      "taskId": "scroll-find",
+      "repeat": 0,
+      "order": 11,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-coverage-incomplete-r0-o12",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "coverage-incomplete",
+      "taskId": "scroll-find",
+      "repeat": 0,
+      "order": 12,
+      "success": false,
+      "failureReason": "incomplete_coverage",
+      "claimedDone": false,
+      "completed": false,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 1,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 1,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-disabled-noop-r1-o13",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-disabled-noop",
+      "taskId": "menu-find",
+      "repeat": 1,
+      "order": 13,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-expand-find-r1-o14",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-expand-find",
+      "taskId": "menu-find",
+      "repeat": 1,
+      "order": 14,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-secure-field-r1-o15",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-secure-field",
+      "taskId": "known-input",
+      "repeat": 1,
+      "order": 15,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-known-term-r1-o16",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-known-term",
+      "taskId": "known-input",
+      "repeat": 1,
+      "order": 16,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-coverage-incomplete-r1-o17",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "coverage-incomplete",
+      "taskId": "scroll-find",
+      "repeat": 1,
+      "order": 17,
+      "success": false,
+      "failureReason": "incomplete_coverage",
+      "claimedDone": false,
+      "completed": false,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 1,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 1,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-scroll-reveal-row-r1-o18",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "scroll-reveal-row",
+      "taskId": "scroll-find",
+      "repeat": 1,
+      "order": 18,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-rear-toggle-r1-o19",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-rear-toggle",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 19,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 2,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 2,
+        "screenshotMs": 2,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-flat-page-r1-o20",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-flat-page",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 20,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-group-page-r1-o21",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-group-page",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 21,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-duplicate-enable-r1-o22",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-duplicate-enable",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 22,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-modal-keep-r1-o23",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-modal-keep",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 23,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-stale-apply-r1-o24",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-stale-apply",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 24,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-visible-toggle-r1-o25",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-visible-toggle",
+      "taskId": "settings-nav",
+      "repeat": 1,
+      "order": 25,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-known-term-r2-o26",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-known-term",
+      "taskId": "known-input",
+      "repeat": 2,
+      "order": 26,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-search-secure-field-r2-o27",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "search-secure-field",
+      "taskId": "known-input",
+      "repeat": 2,
+      "order": 27,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-scroll-reveal-row-r2-o28",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "scroll-reveal-row",
+      "taskId": "scroll-find",
+      "repeat": 2,
+      "order": 28,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-coverage-incomplete-r2-o29",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "coverage-incomplete",
+      "taskId": "scroll-find",
+      "repeat": 2,
+      "order": 29,
+      "success": false,
+      "failureReason": "incomplete_coverage",
+      "claimedDone": false,
+      "completed": false,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 1,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 1,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-flat-page-r2-o30",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-flat-page",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 30,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-group-page-r2-o31",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-group-page",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 31,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 1,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 1,
+        "screenshotMs": 1,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-duplicate-enable-r2-o32",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-duplicate-enable",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 32,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-modal-keep-r2-o33",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-modal-keep",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 33,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-stale-apply-r2-o34",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-stale-apply",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 34,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-visible-toggle-r2-o35",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-visible-toggle",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 35,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-settings-rear-toggle-r2-o36",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "settings-rear-toggle",
+      "taskId": "settings-nav",
+      "repeat": 2,
+      "order": 36,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 1,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 2,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-expand-find-r2-o37",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-expand-find",
+      "taskId": "menu-find",
+      "repeat": 2,
+      "order": 37,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    },
+    {
+      "schema": "pipiui.ax-eval-run.v1",
+      "runId": "b-menu-disabled-noop-r2-o38",
+      "group": "B",
+      "service": "stand-in",
+      "synthetic": true,
+      "provenance": "fixture-stand-in",
+      "scenarioId": "menu-disabled-noop",
+      "taskId": "menu-find",
+      "repeat": 2,
+      "order": 38,
+      "success": true,
+      "claimedDone": true,
+      "completed": true,
+      "durationMs": 0,
+      "mainModelCalls": 0,
+      "jevRequests": 0,
+      "standInDecisions": 2,
+      "mainModelUsage": {
+        "availability": "unavailable"
+      },
+      "jevUsage": {
+        "availability": "unavailable"
+      },
+      "billing": "unverified",
+      "timings": {
+        "axMs": 0,
+        "screenshotMs": 0,
+        "indexMs": 0,
+        "decisionMs": 0,
+        "networkMs": null,
+        "executionMs": 0
+      },
+      "screenshotCaptures": 3,
+      "screenshotsInjectedToMainModel": 0,
+      "wrongActions": 0,
+      "noopActions": 0,
+      "retries": 0,
+      "handoffs": 0,
+      "forbiddenViolations": [],
+      "noProgressStreak": 0
+    }
+  ],
+  "summary": {
+    "schema": "pipiui.ax-eval-summary.v1",
+    "measured": true,
+    "groups": {
+      "A": {
+        "present": false,
+        "executed": false,
+        "runs": 0,
+        "successes": null,
+        "failures": null,
+        "durationP50Ms": null,
+        "durationP95Ms": null,
+        "mainModelCalls": null,
+        "jevRequests": null,
+        "screenshotCaptures": null,
+        "screenshotsInjectedToMainModel": null,
+        "wrongActions": null,
+        "handoffs": null,
+        "usage": {
+          "main": "unmeasured",
+          "jev": "unmeasured"
+        },
+        "usageTotals": {
+          "main": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          },
+          "jev": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          }
+        },
+        "billing": "unverified"
+      },
+      "B": {
+        "present": true,
+        "executed": true,
+        "runs": 39,
+        "successes": 36,
+        "failures": 3,
+        "durationP50Ms": 0,
+        "durationP95Ms": 2,
+        "mainModelCalls": 0,
+        "jevRequests": 0,
+        "screenshotCaptures": 99,
+        "screenshotsInjectedToMainModel": 0,
+        "wrongActions": 0,
+        "handoffs": 3,
+        "usage": {
+          "main": "unavailable",
+          "jev": "unavailable"
+        },
+        "usageTotals": {
+          "main": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          },
+          "jev": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          }
+        },
+        "billing": "unverified"
+      },
+      "C": {
+        "present": false,
+        "executed": false,
+        "runs": 0,
+        "successes": null,
+        "failures": null,
+        "durationP50Ms": null,
+        "durationP95Ms": null,
+        "mainModelCalls": null,
+        "jevRequests": null,
+        "screenshotCaptures": null,
+        "screenshotsInjectedToMainModel": null,
+        "wrongActions": null,
+        "handoffs": null,
+        "usage": {
+          "main": "unmeasured",
+          "jev": "unmeasured"
+        },
+        "usageTotals": {
+          "main": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          },
+          "jev": {
+            "actual": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            },
+            "estimated": {
+              "runs": 0,
+              "inputTokens": null,
+              "outputTokens": null
+            }
+          }
+        },
+        "billing": "unverified"
+      }
+    }
+  }
+}

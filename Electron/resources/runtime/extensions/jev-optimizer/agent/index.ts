@@ -3,6 +3,8 @@ import { BROWSER_DISCOVER, BROWSER_PROVIDE, BROWSER_WITHDRAW, executeBrowserAvai
 export { executeBrowserRerank } from "./browser-rerank.js";
 import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, executeBrowserChoiceAvailability, executeBrowserChoice, type BrowserChoiceOffer } from "./browser-choice.js";
 export * from "./browser-choice.js";
+import { COMPUTER_CHOICE_DISCOVER, COMPUTER_CHOICE_PROVIDE, COMPUTER_CHOICE_WITHDRAW, executeComputerChoiceAvailability, executeComputerChoice, type ComputerChoiceOffer } from "./computer-choice.js";
+export * from "./computer-choice.js";
 import { executeAvailability, executeRerank } from "./rerank.js";
 import { registerContextSelector } from "./context-selector.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -38,6 +40,7 @@ function newInstanceId(): string {
 export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): JevHandle {
   const instanceId = newInstanceId();
   const sessionAbort = new AbortController();
+  const computerAbort = new AbortController();
   let withdrawn = false;
   const unsubscribers: Array<() => void> = [];
 
@@ -45,6 +48,8 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     withdrawn: () => withdrawn,
     signal: sessionAbort.signal,
   };
+
+  const computerGate = { withdrawn: () => withdrawn, signal: computerAbort.signal };
 
   registerContextSelector(pi as unknown as ExtensionAPI, deps, gate);
 
@@ -80,10 +85,21 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     pi.events?.emit(BROWSER_CHOICE_PROVIDE, choice);
   };
 
+  const emitComputerChoiceOffer = () => {
+    if (withdrawn) return;
+    const choice: ComputerChoiceOffer = {
+      version: 1, provider: JEV_PROVIDER, instanceId,
+      availability: (root, signal) => executeComputerChoiceAvailability(root, deps, computerGate, signal),
+      choose: (input) => executeComputerChoice(input, deps, computerGate),
+    };
+    pi.events?.emit(COMPUTER_CHOICE_PROVIDE, choice);
+  };
+
   const dispose = () => {
     if (withdrawn) return;
     withdrawn = true;
     sessionAbort.abort();
+    computerAbort.abort();
     for (const unsubscribe of unsubscribers.splice(0)) {
       try {
         unsubscribe();
@@ -92,7 +108,7 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
       }
     }
     const payload: RerankWithdraw = { version: 1, provider: JEV_PROVIDER, instanceId };
-    for (const channel of [CHANNEL_WITHDRAW, BROWSER_WITHDRAW, BROWSER_CHOICE_WITHDRAW]) {
+    for (const channel of [CHANNEL_WITHDRAW, BROWSER_WITHDRAW, BROWSER_CHOICE_WITHDRAW, COMPUTER_CHOICE_WITHDRAW]) {
       try { pi.events?.emit(channel, payload); } catch { /* One consumer cannot prevent another withdrawal. */ }
     }
   };
@@ -107,9 +123,12 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     if (typeof browserUnsub === "function") unsubscribers.push(browserUnsub);
     const choiceUnsub = bus.on(BROWSER_CHOICE_DISCOVER, emitChoiceOffer);
     if (typeof choiceUnsub === "function") unsubscribers.push(choiceUnsub);
+    const computerUnsub = bus.on(COMPUTER_CHOICE_DISCOVER, emitComputerChoiceOffer);
+    if (typeof computerUnsub === "function") unsubscribers.push(computerUnsub);
     emitOffer();
     emitBrowserOffer();
     emitChoiceOffer();
+    emitComputerChoiceOffer();
   }
 
   if (typeof pi.on === "function") {

@@ -32,6 +32,10 @@ export function parseHostState(raw: string): JevHostState | undefined {
     hasKey: parsed.hasKey,
     generation: parsed.generation,
     browserEnabled: parsed.browserEnabled === true,
+    computerEnabled: parsed.computerEnabled === true,
+    computerUseEnabled: parsed.computerUseEnabled === true,
+    computerGeneration: typeof parsed.computerGeneration === "string" && parsed.computerGeneration.trim()
+      ? parsed.computerGeneration : undefined,
     contextEnabled: parsed.contextEnabled === true,
     browserGeneration: typeof parsed.browserGeneration === "string" && parsed.browserGeneration
       ? parsed.browserGeneration : undefined,
@@ -90,6 +94,23 @@ export async function checkBrowserAvailability(
     return { ready: false, reason: "browser-disabled" };
   }
   return { ...code, browserGeneration: loaded.state.browserGeneration };
+}
+
+export async function checkComputerAvailability(
+  deps: JevDeps,
+  signal?: AbortSignal,
+): Promise<AvailabilityResult & { apiKey?: string; computerGeneration?: string }> {
+  if (signal?.aborted) return { ready: false, reason: "aborted" };
+  if (!envValue(deps.env ?? process.env, API_KEY_ENV)) return { ready: false, reason: "no-key" };
+  const loaded = await loadHostState(deps, signal);
+  if (signal?.aborted) return { ready: false, reason: "aborted" };
+  const ready = evaluateReadiness(loaded.state, deps.env ?? process.env, loaded.reason);
+  if (!ready.ready) return ready;
+  if (loaded.state?.computerUseEnabled !== true) return { ready: false, reason: "computer-execution-disabled" };
+  if (!loaded.state.computerEnabled || !loaded.state.computerGeneration) {
+    return { ready: false, reason: "computer-disabled" };
+  }
+  return { ...ready, computerGeneration: loaded.state.computerGeneration };
 }
 
 export async function checkAvailability(

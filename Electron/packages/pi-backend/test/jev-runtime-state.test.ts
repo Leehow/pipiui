@@ -8,10 +8,12 @@ import { projectPiAgentDir } from "../src/project-pi-home.js";
 import { resetInMemoryVault } from "../src/secret-vault.js";
 import * as extensionSettings from "../src/extension-settings.js";
 import {
-  JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
+  JEV_COMPUTER_ENABLED_KEY, JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
   JevRuntimeStateStore, jevRuntimeStateFile, type JevRuntimeState,
 } from "../src/jev-runtime-state.js";
 import { assemblePiSpawn, mergedSpawnEnvironment, workerRegisteredExtensionArgs, type SpawnRegisteredExtension } from "../src/spawn-assembly.js";
+import { executeComputerChoice, executeComputerChoiceAvailability } from "../../../resources/runtime/extensions/jev-optimizer/agent/computer-choice.js";
+import { checkAvailability, checkBrowserAvailability } from "../../../resources/runtime/extensions/jev-optimizer/agent/state.js";
 
 const roots: string[] = [];
 const backends: ReturnType<typeof createPiHostBackend>[] = [];
@@ -27,9 +29,13 @@ async function temporary() {
   return root;
 }
 const state = (root: string): JevRuntimeState => JSON.parse(readFileSync(jevRuntimeStateFile(root), "utf8"));
-type Probe = { registeredExtensionsForSpawn(root: string): Promise<SpawnRegisteredExtension[]> };
+type Probe = {
+  registeredExtensionsForSpawn(root: string): Promise<SpawnRegisteredExtension[]>;
+  updateSettings<T>(update: (settings: Record<string, unknown>) => T): Promise<T>;
+  loadComputerUseEnabled(): Promise<boolean>;
+};
 
-async function fixture(scope: "project" | "app" = "project") {
+async function fixture(scope: "project" | "app" = "project", initialExecution?: boolean) {
   const root = await temporary();
   const runtimeRoot = join(root, "runtime");
   const extensionRoot = join(runtimeRoot, "extensions", JEV_EXTENSION_ID);
@@ -42,10 +48,12 @@ async function fixture(scope: "project" | "app" = "project") {
       [JEV_SECRET_KEY]: { type: "string", format: "secret" },
       [JEV_BROWSER_ENABLED_KEY]: { type: "boolean" },
       [JEV_CONTEXT_ENABLED_KEY]: { type: "boolean" },
+      [JEV_COMPUTER_ENABLED_KEY]: { type: "boolean", default: false },
     } } } },
   }));
   const agentDir = join(root, "host-agent");
   await mkdir(agentDir);
+  if (initialExecution !== undefined) await writeFile(join(agentDir, "pipiui-settings.json"), JSON.stringify({ computerUseEnabled: initialExecution }));
   const backend = createPiHostBackend({
     agentDir, vaultDir: agentDir, runtimeRoot, profileMode: "isolated", canonicalProjectPaths: async () => undefined,
     // Test-only cipher; production uses Electron OS encryption, never a RAM success fallback.
@@ -70,14 +78,211 @@ async function fixture(scope: "project" | "app" = "project") {
   const key = (id: string, value: string | null) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_SECRET_KEY]: value }, id]);
   const browser = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_BROWSER_ENABLED_KEY]: value }, id]);
   const context = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_CONTEXT_ENABLED_KEY]: value }, id]);
+  const computer = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_COMPUTER_ENABLED_KEY]: value }, id]);
   async function spawn(path: string) {
     const packages = await probe.registeredExtensionsForSpawn(path);
     return { packages, ...assemblePiSpawn({ cwd: path, paths: {}, registeredExtensions: packages }) };
   }
-  return { backend, probe, a, b, unopened, enable, key, browser, context, spawn, agentDir };
+  const execution = (value: unknown) => backend.handle("setComputerUseEnabled", [value]);
+  return { backend, probe, a, b, unopened, enable, key, browser, context, computer, execution, spawn, agentDir };
 }
 
 describe("Jev host state projection", () => {
+  it.each([undefined, false])("projects missing or already-disabled execution settings before any goal (%s)", async initialExecution => {
+    const f = await fixture("project", initialExecution);
+    await f.enable(f.a.id, true); await f.key(f.a.id, "desktop-execution-test-key");
+    await f.browser(f.a.id, true); await f.context(f.a.id, true); await f.computer(f.a.id, true);
+    const spawned = await f.spawn(f.a.path);
+    const projected = state(f.a.path);
+    expect(projected).toMatchObject({ enabled: true, hasKey: true, browserEnabled: true, contextEnabled: true, computerEnabled: true, computerUseEnabled: false });
+    const fetch = vi.fn(async () => { throw Error("unexpected HTTP"); });
+    const deps = { env: spawned.env, fetch };
+    expect(await executeComputerChoiceAvailability(f.a.path, deps)).toEqual({ ready: false, reason: "computer-execution-disabled" });
+    expect(await executeComputerChoice({ projectRoot: f.a.path, goal: "Stop", candidates: [{ id: "finish", description: "Finish" }] }, deps)).toEqual({ status: "skipped", reason: "computer-execution-disabled" });
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await checkBrowserAvailability(deps)).ready).toBe(true);
+    expect((await checkAvailability(deps)).ready).toBe(true);
+    await expect(f.execution("true")).rejects.toThrow("computerUseEnabled");
+    expect(state(f.a.path)).toEqual(projected);
+  });
+
+  it("revokes all projected desktops before settings I/O and enables only after persistence through the real entry", async () => {
+    const f = await fixture();
+    for (const project of [f.a, f.b]) {
+      await f.enable(project.id, true); await f.key(project.id, "desktop-execution-test-key");
+      await f.browser(project.id, true); await f.context(project.id, true); await f.computer(project.id, true);
+    }
+    expect(await f.execution(true)).toEqual({ enabled: true });
+    const before = [state(f.a.path), state(f.b.path)];
+    expect(before.every(value => value.computerUseEnabled)).toBe(true);
+    const update = f.probe.updateSettings.bind(f.probe);
+    let release!: () => void; let entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const writing = new Promise<void>(resolve => { entered = resolve; });
+    const spy = vi.spyOn(f.probe, "updateSettings").mockImplementationOnce(async callback => {
+      entered(); await held; return update(callback);
+    });
+    const disabling = f.execution(false);
+    await writing;
+    for (const [i, root] of [f.a.path, f.b.path].entries()) {
+      expect(state(root)).toMatchObject({ ...before[i]!, computerUseEnabled: false, computerGeneration: expect.any(String) });
+      expect(state(root).computerGeneration).not.toBe(before[i]!.computerGeneration);
+    }
+    let spawned = false;
+    const pendingSpawn = f.spawn(f.a.path).then(value => { spawned = true; return value; });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(spawned).toBe(false);
+    release();
+    expect(await disabling).toEqual({ enabled: false });
+    await pendingSpawn;
+    const disabled = [state(f.a.path), state(f.b.path)];
+    expect(disabled.every(value => !value.computerUseEnabled)).toBe(true);
+    expect(await f.backend.handle("getComputerUseState", [])).toEqual({ enabled: false });
+    spy.mockRestore();
+
+    let enableRelease!: () => void; let enableEntered!: () => void;
+    const enableHeld = new Promise<void>(resolve => { enableRelease = resolve; });
+    const enablingWrite = new Promise<void>(resolve => { enableEntered = resolve; });
+    vi.spyOn(f.probe, "updateSettings").mockImplementationOnce(async callback => {
+      enableEntered(); await enableHeld; return update(callback);
+    });
+    const enabling = f.execution(true);
+    await enablingWrite;
+    expect([state(f.a.path), state(f.b.path)]).toEqual(disabled);
+    enableRelease();
+    expect(await enabling).toEqual({ enabled: true });
+    for (const [i, root] of [f.a.path, f.b.path].entries()) {
+      expect(state(root)).toMatchObject({ ...before[i]!, computerGeneration: expect.any(String) });
+      expect(state(root).computerGeneration).not.toBe(disabled[i]!.computerGeneration);
+      expect(state(root).computerGeneration).not.toBe(before[i]!.computerGeneration);
+    }
+    const on = state(f.a.path);
+    await f.execution(true);
+    expect(state(f.a.path)).toEqual(on);
+    await f.browser(f.a.id, false); await f.context(f.a.id, false);
+    expect(state(f.a.path)).toMatchObject({ computerUseEnabled: true, computerEnabled: true, computerGeneration: on.computerGeneration });
+    await f.computer(f.a.id, false);
+    expect(state(f.a.path).computerUseEnabled).toBe(true);
+    expect(existsSync(jevRuntimeStateFile(f.unopened))).toBe(false);
+    await f.spawn(f.unopened);
+    expect(state(f.unopened).computerUseEnabled).toBe(true);
+  });
+
+  it("never publishes execution enablement on failed persistence and revokes even when disabling fails", async () => {
+    const f = await fixture("project", false);
+    await f.enable(f.a.id, true); await f.key(f.a.id, "desktop-execution-test-key"); await f.computer(f.a.id, true);
+    const off = state(f.a.path);
+    vi.spyOn(f.probe, "updateSettings").mockRejectedValueOnce(Error("synthetic write failure"));
+    await expect(f.execution(true)).rejects.toThrow("synthetic write failure");
+    expect(state(f.a.path)).toEqual(off);
+    await f.execution(true);
+    const on = state(f.a.path);
+    vi.spyOn(f.probe, "updateSettings").mockRejectedValueOnce(Error("synthetic write failure"));
+    await expect(f.execution(false)).rejects.toThrow("synthetic write failure");
+    expect(state(f.a.path)).toMatchObject({ computerUseEnabled: false, generation: on.generation, browserGeneration: on.browserGeneration });
+    expect(state(f.a.path).computerGeneration).not.toBe(on.computerGeneration);
+  });
+
+  it("does not let an already-running spawn resurrect execution during a queued disable", async () => {
+    const f = await fixture("project", true);
+    await f.enable(f.a.id, true); await f.key(f.a.id, "desktop-execution-test-key"); await f.computer(f.a.id, true);
+    const on = state(f.a.path);
+    let release!: (value: boolean) => void; let entered!: () => void;
+    const held = new Promise<boolean>(resolve => { release = resolve; });
+    const reading = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(f.probe, "loadComputerUseEnabled").mockImplementationOnce(() => { entered(); return held; });
+    const spawning = f.spawn(f.a.path);
+    await reading;
+    const disabling = f.execution(false);
+    await vi.waitFor(() => expect(state(f.a.path).computerUseEnabled).toBe(false));
+    release(true); // Snapshot had read the pre-disable setting while owning the Jev lane.
+    await spawning; await disabling;
+    expect(state(f.a.path)).toMatchObject({ computerUseEnabled: false, generation: on.generation, browserGeneration: on.browserGeneration });
+    expect(state(f.a.path).computerGeneration).not.toBe(on.computerGeneration);
+  });
+
+  it("keeps desktop, browser and context revocations independent and base revocation invalidates all", async () => {
+    const root = await temporary();
+    const store = new JevRuntimeStateStore();
+    store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true, contextEnabled: true, computerEnabled: true });
+    const on = state(root);
+    store.revokeBrowser(root);
+    expect(state(root)).toMatchObject({ generation: on.generation, computerGeneration: on.computerGeneration, computerEnabled: true, contextEnabled: true, browserEnabled: false });
+    store.revokeContext(root);
+    expect(state(root)).toMatchObject({ generation: on.generation, computerGeneration: on.computerGeneration, computerEnabled: true });
+    store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true, contextEnabled: true, computerEnabled: true });
+    const restored = state(root);
+    store.revokeComputer(root);
+    const off = state(root);
+    expect(off).toMatchObject({ enabled: true, hasKey: true, generation: restored.generation, browserGeneration: restored.browserGeneration, browserEnabled: true, contextEnabled: true, computerEnabled: false });
+    expect(off.computerGeneration).not.toBe(restored.computerGeneration);
+    store.revokeComputer(root);
+    expect(state(root)).toEqual(off);
+    store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true, contextEnabled: true, computerEnabled: true });
+    const again = state(root);
+    expect(again.computerGeneration).not.toBe(off.computerGeneration);
+    expect(again.generation).toBe(on.generation);
+    store.revoke(root);
+    const revoked = state(root);
+    expect(revoked).toMatchObject({ enabled: false, browserEnabled: false, computerEnabled: false });
+    expect(revoked.contextEnabled).not.toBe(true);
+    expect(revoked.generation).not.toBe(again.generation);
+    expect(revoked.computerGeneration).not.toBe(again.computerGeneration);
+    expect(revoked.browserGeneration).not.toBe(again.browserGeneration);
+  });
+
+  it("projects desktop settings into spawn and revokes before project settings writes", async () => {
+    const f = await fixture();
+    await f.enable(f.a.id, true); await f.key(f.a.id, "desktop-test-key");
+    await f.browser(f.a.id, true); await f.context(f.a.id, true);
+    const before = state(f.a.path);
+    expect(before.computerEnabled).toBe(false);
+    await expect(f.backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_COMPUTER_ENABLED_KEY]: 1 }, f.a.id])).resolves.toMatchObject({ ok: false });
+    expect(state(f.a.path)).toEqual(before);
+    await f.computer(f.a.id, true);
+    const on = state(f.a.path);
+    expect(on).toMatchObject({ generation: before.generation, browserGeneration: before.browserGeneration, computerEnabled: true });
+    expect(on.computerGeneration).not.toBe(before.computerGeneration);
+    const spawned = await f.spawn(f.a.path);
+    expect(JSON.parse(spawned.env.PIPIUI_EXT_SETTINGS_JEV_OPTIMIZER)).toMatchObject({ [JEV_COMPUTER_ENABLED_KEY]: true });
+    expect(state(f.a.path)).toEqual(on);
+    await f.spawn(f.b.path);
+    const other = state(f.b.path);
+    const write = extensionSettings.writeProjectExtensionSettingsValues;
+    vi.spyOn(extensionSettings, "writeProjectExtensionSettingsValues").mockImplementationOnce(async (...args) => {
+      expect(state(f.a.path)).toMatchObject({ computerEnabled: false, generation: on.generation, browserGeneration: on.browserGeneration, browserEnabled: true, contextEnabled: true });
+      expect(state(f.a.path).computerGeneration).not.toBe(on.computerGeneration);
+      return write(...args);
+    });
+    await f.computer(f.a.id, false);
+    expect(state(f.b.path)).toEqual(other);
+    await f.computer(f.a.id, true);
+    const reenabled = state(f.a.path);
+    await f.key(f.a.id, "desktop-replaced-key");
+    expect(state(f.a.path).computerEnabled).toBe(true);
+    expect(state(f.a.path).computerGeneration).not.toBe(reenabled.computerGeneration);
+    const replaced = state(f.a.path);
+    await f.enable(f.a.id, false);
+    expect(state(f.a.path).computerEnabled).toBe(false);
+    expect(state(f.a.path).computerGeneration).not.toBe(replaced.computerGeneration);
+  });
+
+  it("projects app-scoped desktop settings to open roots without changing other authority", async () => {
+    const f = await fixture("app");
+    await f.enable(f.a.id, true); await f.enable(f.b.id, true);
+    await f.key(f.a.id, "desktop-shared-key");
+    await f.browser(f.a.id, true); await f.context(f.a.id, true);
+    await f.computer(f.a.id, true);
+    const a = state(f.a.path); const b = state(f.b.path);
+    expect(a.computerEnabled).toBe(true); expect(b.computerEnabled).toBe(true);
+    await f.computer(f.a.id, false);
+    for (const [root, before] of [[f.a.path, a], [f.b.path, b]] as const) {
+      expect(state(root)).toMatchObject({ computerEnabled: false, generation: before.generation, browserGeneration: before.browserGeneration, browserEnabled: true, contextEnabled: true });
+      expect(state(root).computerGeneration).not.toBe(before.computerGeneration);
+    }
+    expect(existsSync(jevRuntimeStateFile(f.unopened))).toBe(false);
+  });
+
   it("projects context selection settings to new sessions and revokes without disabling browser or retrieval", async () => {
     const f = await fixture();
     await f.enable(f.a.id, true); await f.key(f.a.id, "context-test-key");
@@ -111,7 +316,7 @@ describe("Jev host state projection", () => {
       const again = store.ensure(root, { enabled: true, hasKey: true });
       expect(again.generation).not.toBe(first.generation);
       expect(again.generation).not.toBe(revoked.generation);
-      expect(Object.keys(state(root)).sort()).toEqual(["browserEnabled", "browserGeneration", "enabled", "generation", "hasKey", "schemaVersion"]);
+      expect(Object.keys(state(root)).sort()).toEqual(["browserEnabled", "browserGeneration", "computerEnabled", "computerGeneration", "computerUseEnabled", "enabled", "generation", "hasKey", "schemaVersion"]);
       expect(readdirSync(join(projectPiAgentDir(root), JEV_EXTENSION_ID))).toEqual(["runtime-state.json"]);
     } finally { closeSync(fd); }
   });

@@ -16,6 +16,22 @@ Runtime 线路契约见 [`computer-runtime-v1.md`](./computer-runtime-v1.md)；�
 真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由
 worktree 的 Node/TypeScript 测试代替。
 
+## Jev AX 小目标循环
+
+2026-09-22 源码新增独立的 `computer(action=goal)`，不增加第三个工具，也不能放入
+`actions[]`。主模型提供小目标及具名 `inputs`，Jev 在当前已绑定窗口内选择 AX 查找、
+分页、展开、真实容器滚动和操作；给定文字由宿主本地绑定，Jev 不生成输入原值或坐标。
+普通单动作/批处理不自动经过 Jev。
+
+它同时要求现有桌面总开关、desktop grant、系统权限、有效 Jev 凭据及默认关闭的
+`ext.jev-optimizer.computerEnabled` 项目外发许可。浏览器外发许可不能代替桌面许可。
+执行前检查授权代际及快照；输入时还检查最新焦点、区域和字段身份。取消中的未确认动作
+会返回 `outcome_unknown` / `doNotReplay`；`DONE` 只返回 `needs_verification`、
+`verified:false`，仍需独立验收。没有充分 AX 信息或需要创作文字时交回主模型。
+
+见[规格](jev-computer-use-v1.md)与[实现/验证记录](research/jev-computer-use-evaluation-2026-09-22.md)。
+本轮仅源码/工作区验证，未更新运行中的 App，真实净提速尚未证明。
+
 ## 架构
 
 ```text
@@ -29,10 +45,11 @@ cua-extension（主 Pi 会话进程内）
 
 扩展每次调用先经 loopback `host_capability_token` op 让宿主铸一枚一次性 token，
 broker 在分发前依次校验 hostApi 版本范围、manifest 声明权限（`native.exec`）、
-项目授权与 desktop grant，然后消费 token 才把 `params` 原样交给
-`CuaDriverHost.handle`。driver wire action 不变：
-`computer_runtime_capabilities` / `computer_open_application` /
-`computer_batch` / `computer_cancel`。
+项目授权与 desktop grant，然后消费 token 才把常规 `params` 原样交给
+`CuaDriverHost.handle`。goal 请求另外注入 broker 已授权的项目根，不能由调用方伪造。
+原有宿主操作是 `computer_runtime_capabilities` / `computer_open_application` /
+`computer_batch` / `computer_cancel`；goal 增加内部 `computer_goal_begin` / `computer_goal_end`
+目标租约，不增加新的 driver RPC。
 
 宿主在同一主进程内启动两个子进程（不经过 Launch Services）：
 

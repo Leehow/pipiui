@@ -238,7 +238,7 @@ import {
 import { handleExtEmit, handleExtState, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
-import { JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
+import { JEV_COMPUTER_ENABLED_KEY, JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
 import { JevCredentialStore, type ExtensionSecretCipher } from "./jev-credential-store.js";
 import {
   clearExtensionSecrets,
@@ -2193,6 +2193,7 @@ export class PiHostBackend implements HostBackend {
   private readonly extensions: ExtensionRegistry;
   private readonly extensionLoader: ExtensionLoader;
   private readonly jevRuntimeState = new JevRuntimeStateStore();
+  private computerUseDisablePending = 0;
   private readonly jevCredentials: JevCredentialStore;
   /** FIFO lane for project-bound scans whose result must survive awaited migrations. */
   private extensionScanLane: Promise<void> = Promise.resolve();
@@ -7200,10 +7201,22 @@ export class PiHostBackend implements HostBackend {
   }
   private async saveComputerUseEnabled(value: unknown): Promise<boolean> {
     if (typeof value !== "boolean") throw new Error("computerUseEnabled 必须是 boolean");
-    return this.updateSettings((settings) => {
-      settings.computerUseEnabled = value;
-      return value;
-    });
+    if (!value) this.computerUseDisablePending++;
+    try {
+      // Revoke before waiting for either settings I/O or a racing spawn snapshot.
+      if (!value) this.jevRuntimeState.setComputerUseEnabled(false);
+      return await this.jevRuntimeState.exclusive(async () => {
+        const saved = await this.updateSettings((settings) => {
+          settings.computerUseEnabled = value;
+          return value;
+        });
+        // Enable only after durable success, from the actual saved global setting.
+        this.jevRuntimeState.setComputerUseEnabled((await this.loadComputerUseEnabled()) && this.computerUseDisablePending === 0);
+        return saved;
+      });
+    } finally {
+      if (!value) this.computerUseDisablePending--;
+    }
   }
   private checkedSubagentModelChain(value: unknown, allowLegacyBare = true): SubagentModelSetting[] {
     if (!Array.isArray(value) || !value.every((entry) =>
@@ -8667,6 +8680,9 @@ export class PiHostBackend implements HostBackend {
       if (id === JEV_EXTENSION_ID && validated.values[JEV_CONTEXT_ENABLED_KEY] === false) {
         this.jevRuntimeState.revokeContext(root);
       }
+      if (id === JEV_EXTENSION_ID && validated.values[JEV_COMPUTER_ENABLED_KEY] === false) {
+        this.jevRuntimeState.revokeComputer(root);
+      }
       const namespace = this.extensionVaultNamespace(scope, root);
       // Durable projection first: paddleocr.json / Jev ciphertext are authoritative across restarts.
       await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
@@ -8703,13 +8719,18 @@ export class PiHostBackend implements HostBackend {
       && Object.prototype.hasOwnProperty.call(validated.values, JEV_BROWSER_ENABLED_KEY);
     const jevContextChanged = id === JEV_EXTENSION_ID
       && Object.prototype.hasOwnProperty.call(validated.values, JEV_CONTEXT_ENABLED_KEY);
-    const jevRoots = (jevKeyChanged || jevBrowserChanged || jevContextChanged) ? await this.openJevProjectRoots() : [];
+    const jevComputerChanged = id === JEV_EXTENSION_ID
+      && Object.prototype.hasOwnProperty.call(validated.values, JEV_COMPUTER_ENABLED_KEY);
+    const jevRoots = (jevKeyChanged || jevBrowserChanged || jevContextChanged || jevComputerChanged) ? await this.openJevProjectRoots() : [];
     if (jevKeyChanged) for (const root of jevRoots) this.jevRuntimeState.revoke(root);
     else if (validated.values[JEV_BROWSER_ENABLED_KEY] === false) {
       for (const root of jevRoots) this.jevRuntimeState.revokeBrowser(root);
     }
     if (validated.values[JEV_CONTEXT_ENABLED_KEY] === false) {
       for (const root of jevRoots) this.jevRuntimeState.revokeContext(root);
+    }
+    if (validated.values[JEV_COMPUTER_ENABLED_KEY] === false) {
+      for (const root of jevRoots) this.jevRuntimeState.revokeComputer(root);
     }
     if (Object.keys(validated.secrets).length > 0) {
       try {
@@ -8981,11 +9002,13 @@ export class PiHostBackend implements HostBackend {
     const enabled = Boolean(pkg?.enabled && pkg.extensionPath);
     let browserEnabled = false;
     let contextEnabled = false;
+    let computerEnabled = false;
     if (enabled) {
       try {
         const settings = await this.readExtensionSettingsSnapshot(JEV_EXTENSION_ID, projectRoot);
         browserEnabled = settings[JEV_BROWSER_ENABLED_KEY] === true;
         contextEnabled = settings[JEV_CONTEXT_ENABLED_KEY] === true;
+        computerEnabled = settings[JEV_COMPUTER_ENABLED_KEY] === true;
       } catch {
         browserEnabled = false;
       }
@@ -8995,6 +9018,8 @@ export class PiHostBackend implements HostBackend {
       hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()),
       browserEnabled,
       contextEnabled,
+      computerEnabled,
+      computerUseEnabled: (await this.loadComputerUseEnabled()) && this.computerUseDisablePending === 0,
     });
   }
   private async registeredExtensionsForSpawn(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
@@ -9006,7 +9031,8 @@ export class PiHostBackend implements HostBackend {
     const packages = this.extensionLoader.spawnPackages(overlay);
     const out: SpawnRegisteredExtension[] = [];
     if (!packages.some((pkg) => pkg.id === JEV_EXTENSION_ID) && this.jevRuntimeState.has(projectRoot)) {
-      this.jevRuntimeState.ensure(projectRoot, { enabled: false, hasKey: false });
+      this.jevRuntimeState.ensure(projectRoot, { enabled: false, hasKey: false,
+        computerUseEnabled: (await this.loadComputerUseEnabled()) && this.computerUseDisablePending === 0 });
     }
     for (const pkg of packages) {
       if (!pkg.enabled || !pkg.extensionPath) {
@@ -9044,6 +9070,8 @@ export class PiHostBackend implements HostBackend {
           hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()),
           browserEnabled: settings[JEV_BROWSER_ENABLED_KEY] === true,
           contextEnabled: settings[JEV_CONTEXT_ENABLED_KEY] === true,
+          computerEnabled: settings[JEV_COMPUTER_ENABLED_KEY] === true,
+          computerUseEnabled: (await this.loadComputerUseEnabled()) && this.computerUseDisablePending === 0,
         })
         : undefined;
       out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}), ...(jevRuntimeState ? { jevRuntimeState } : {}) });

@@ -49,6 +49,9 @@ export type JevHostState = {
   generation: string;
   browserEnabled?: boolean;
   browserGeneration?: string;
+  computerEnabled?: boolean;
+  computerUseEnabled?: boolean;
+  computerGeneration?: string;
   contextEnabled?: boolean;
 };
 

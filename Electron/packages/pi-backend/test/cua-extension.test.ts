@@ -305,12 +305,12 @@ describe("cua-extension schema honesty", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual(["computer", "open_application"]);
   });
 
-  it("computer action enums contain exactly the 13 host-supported types", () => {
+  it("computer supports the 13 driver actions plus standalone goal, never a batched goal", () => {
     const { byName } = mountModule(extensionEntry);
     const schema = JSON.parse(JSON.stringify(byName.get("computer")!.parameters));
     const single = enumConsts(schema.properties?.action);
     const batched = enumConsts(schema.properties?.actions?.items?.properties?.type);
-    expect(single.sort()).toEqual([...SUPPORTED_ACTIONS].sort());
+    expect(single.sort()).toEqual([...SUPPORTED_ACTIONS, "goal"].sort());
     expect(batched.sort()).toEqual([...SUPPORTED_ACTIONS].sort());
     for (const removed of REMOVED_ACTIONS) {
       expect(single).not.toContain(removed);

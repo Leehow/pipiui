@@ -590,6 +590,8 @@ export class CuaDriverHost {
     { scaleX: number; scaleY: number; width: number; height: number }
   >();
   private requestTail: Promise<void> = Promise.resolve();
+  // A goal releases the RPC lane while Jev decides, but keeps exclusive desktop ownership.
+  private goalLease?: { owner: string; id: string; pid: number; expiresAt: number; stateFile: string; generation: string };
   private requestGeneration = 0;
   private teardowns = new Set<Promise<void>>();
   private shutdownRequested = false;
@@ -675,6 +677,18 @@ export class CuaDriverHost {
   private async handleRequest(
     request: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    if (this.goalLease && this.goalLease.expiresAt <= Date.now()) this.goalLease = undefined;
+    const goalOwner = computerTaskOwnerKey(String(request.sessionKey ?? ""), request.taskId);
+    if (request.action === "computer_goal_end") {
+      if (this.goalLease?.owner === goalOwner && this.goalLease.id === request.goalLease) this.goalLease = undefined;
+      return { ok: true };
+    }
+    if (["computer_batch", "computer_open_application", "computer_goal_begin"].includes(String(request.action))) {
+      if (request.goalLease !== undefined && (!this.goalLease || this.goalLease.owner !== goalOwner || this.goalLease.id !== request.goalLease))
+        return this.failure("goal_lease_invalid", "Desktop goal lease expired or was revoked; do not replay its actions", false);
+      if (this.goalLease && (request.action !== "computer_batch" || this.goalLease.owner !== goalOwner || this.goalLease.id !== request.goalLease))
+        return this.failure("desktop_already_active", "A desktop goal is active; wait for it to finish or cancel it", true);
+    }
     if (!this.usable())
       return this.failure(
         "driver_unavailable",
@@ -691,6 +705,8 @@ export class CuaDriverHost {
           "computer_batch",
           "computer_open_application",
           "computer_cancel",
+          "computer_goal_begin",
+          "computer_goal_end",
         ],
         actions: [
           "screenshot",
@@ -719,6 +735,35 @@ export class CuaDriverHost {
         },
         permissions: permissions.structuredContent ?? {},
       };
+    }
+    if (request.action === "computer_goal_begin") {
+      const session = String(request.sessionKey ?? "");
+      if (!session) return this.failure("missing_session", "computer runtime requires a session key", false);
+      const pinned = this.rootTargets.get(goalOwner) ?? this.targets.get(goalOwner);
+      if (!pinned) return this.failure("target_unavailable", "Call open_application before computer goal", true);
+      const seconds = request.timeoutSecs;
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 1 || seconds > 60)
+        return this.failure("invalid_goal_budget", "Desktop goal timeout must be between 1 and 60 seconds", false);
+      if (typeof request.goalProjectRoot !== "string" || !request.goalProjectRoot || typeof request.goalGeneration !== "string" || !request.goalGeneration)
+        return this.failure("computer_authorization_revoked", "Desktop goals require project-bound Jev authorization", false);
+      const lease = { owner: goalOwner, id: randomUUID(), pid: pinned.pid, expiresAt: Date.now() + seconds * 1000,
+        stateFile: join(request.goalProjectRoot, ".pi", "agent", "jev-optimizer", "runtime-state.json"), generation: request.goalGeneration };
+      this.goalLease = lease;
+      try {
+        this.checkGoalAuthorization(lease.id);
+        const current = await this.observeSessionTarget(goalOwner);
+        if (current.target.pid !== pinned.pid) {
+          this.goalLease = undefined; this.targets.set(goalOwner, pinned); this.observations.delete(goalOwner);
+          return this.failure("target_handoff_untrusted", "A desktop goal cannot follow a different application", false);
+        }
+        this.observations.set(goalOwner, current);
+        return { ok: true, goalLease: lease.id, target: current.target, ...current.observation };
+      } catch (error) {
+        if (this.goalLease === lease) this.goalLease = undefined;
+        if (record(error) && error.code === "computer_authorization_revoked") return this.failure(error.code, "Desktop goal authorization is disabled or changed", false);
+        if (error instanceof CuaTargetHandoffError) return this.failure(error.code, "Desktop target handoff was not authoritative", false);
+        throw error;
+      }
     }
     if (request.action === "computer_open_application") {
       const session = String(request.sessionKey ?? "");
@@ -976,6 +1021,40 @@ export class CuaDriverHost {
             boundAction = { ...boundAction, delivery_mode: "foreground" };
           }
         }
+        if (request.goalLease && target && target.pid !== this.goalLease?.pid) {
+          const root = this.rootTargets.get(owner);
+          if (root) this.targets.set(owner, root);
+          this.observations.delete(owner);
+          return { ...this.failure("target_handoff_untrusted", "A desktop goal cannot follow a different application", false), completedActions, outcomes };
+        }
+        if (request.goalLease && record(boundAction.goalField)) {
+          const expected = boundAction.goalField;
+          const ax = record(observation?.accessibility) ? observation.accessibility : {};
+          const nodes = Array.isArray(ax.elements) ? ax.elements.filter(record) : [];
+          const focused = nodes.find((node: Record<string, unknown>) => (node.element_index ?? node.index
+            ?? Number(/:(\d+)$/.exec(String(node.element_token))?.[1])) === ax.focused_element_index);
+          const fieldName = (node: Record<string, unknown>) => [node.label, node.name, node.title, node.description].find(value => typeof value === "string" && value.trim());
+          const fieldRegion = (node: Record<string, unknown>) => {
+            const region = node.region ?? node.group;
+            if (typeof region === "string" && region.trim()) return region;
+            const parentId = node.parent_index ?? node.parent_id;
+            if (parentId === undefined) return undefined;
+            const parent = nodes.find((item: Record<string, unknown>) => (item.element_index ?? item.index) === parentId || item.element_token === parentId || item.id === parentId);
+            return parent ? fieldName(parent) : undefined;
+          };
+          const fieldMatches = (node: Record<string, unknown>) => String(node.role ?? "").replace(/^AX/i, "").toLowerCase() === expected.role
+            && fieldName(node) === expected.name && fieldRegion(node) === expected.region;
+          if (!Number.isInteger(expected.index) || ax.focused_element_index !== expected.index || !focused
+            || !fieldMatches(focused) || nodes.filter(fieldMatches).length !== 1
+            || focused.enabled === false || focused.secure === true || focused.is_secure === true || focused.sensitive === true) {
+            outcome.status = "failed"; outcome.error = "input_focus_unverified";
+            return { ...this.failure(outcome.error, "Input field focus changed or could not be verified; re-observe before typing", false), completedActions, outcomes };
+          }
+          // Rebind deterministic typing to the field in the fresh post-action
+          // snapshot, rather than forwarding the click's now-stale token.
+          boundAction = { ...boundAction, snapshot_id: snapshotID(observation),
+            ...(typeof focused.element_token === "string" ? { element_token: focused.element_token } : { element_index: expected.index }) };
+        }
         if (mutation && target) {
           // Model coordinates live in the delivered screenshot's pixel space;
           // bounds-check them, then map back to driver pixels via the latest scale.
@@ -993,7 +1072,7 @@ export class CuaDriverHost {
           boundAction = mapping.action;
         }
         try {
-          await this.perform(boundAction, target);
+          await this.perform(boundAction, target, request.goalLease ? () => this.checkGoalAuthorization(String(request.goalLease)) : undefined);
           if (mutation && target) {
             const freshState = await this.observeSessionTarget(owner, true);
             target = freshState.target;
@@ -1018,6 +1097,10 @@ export class CuaDriverHost {
             continue;
           }
         } catch (error) {
+          if (record(error) && error.code === "computer_authorization_revoked") {
+            outcome.status = "failed"; outcome.error = "computer_authorization_revoked";
+            return { ...this.failure(outcome.error, "Desktop goal authorization changed before submission", false), completedActions, outcomes };
+          }
           // A driver timeout/error after input may mean the mutation happened.
           // Observe once, return outcome-unknown, and never execute the tail.
           if (mutation && target) {
@@ -1059,6 +1142,7 @@ export class CuaDriverHost {
       return {
         ok: true,
         outcomes,
+        ...(request.goalLease && target ? { target } : {}),
         ...(target
           ? observation ?? (await this.observeSessionTarget(owner)).observation
           : await this.observeDesktop()),
@@ -1071,8 +1155,21 @@ export class CuaDriverHost {
     );
   }
 
+  private checkGoalAuthorization(id: string): void {
+    const lease = this.goalLease;
+    try {
+      if (!lease || lease.id !== id || lease.expiresAt <= Date.now() || statSync(lease.stateFile).size > 4096) throw new Error();
+      const state = JSON.parse(readFileSync(lease.stateFile, "utf8"));
+      if (state.schemaVersion !== 1 || state.enabled !== true || state.hasKey !== true || state.computerEnabled !== true || state.computerUseEnabled !== true
+        || state.computerGeneration !== lease.generation) throw new Error();
+    } catch {
+      throw Object.assign(new Error("Desktop goal authorization revoked"), { code: "computer_authorization_revoked" });
+    }
+  }
+
   cancel(): void {
     this.requestGeneration += 1;
+    this.goalLease = undefined;
     const error = new Error("computer request cancelled");
     for (const item of this.pending.values()) {
       clearTimeout(item.timer);
@@ -1536,11 +1633,12 @@ export class CuaDriverHost {
   private async call(
     name: string,
     args: Record<string, unknown>,
+    authorize?: () => void,
   ): Promise<any> {
     const generation = this.requestGeneration;
     await this.ensureStarted();
     try {
-      return await this.invokeWithActiveOperationJoin(name, args, generation);
+      return await this.invokeWithActiveOperationJoin(name, args, generation, authorize);
     } catch (error) {
       if (name === "start_session" || !isDriverSessionEndedError(error))
         throw error;
@@ -1556,7 +1654,7 @@ export class CuaDriverHost {
         (session.startsWith("pipiui-desktop-") ? "desktop" : "window");
       await this.invoke("start_session", { session, capture_scope: scope });
       this.sessionScopes.set(session, scope);
-      return await this.invokeWithActiveOperationJoin(name, args, generation);
+      return await this.invokeWithActiveOperationJoin(name, args, generation, authorize);
     }
   }
 
@@ -1564,11 +1662,13 @@ export class CuaDriverHost {
     name: string,
     args: Record<string, unknown>,
     generation: number,
+    authorize?: () => void,
   ): Promise<any> {
     const session = typeof args.session === "string" ? args.session : "";
     const startedAt = Date.now();
     for (let attempt = 0; ; attempt += 1) {
       try {
+        authorize?.(); // After startup/token/queue waits, immediately before each driver submission.
         return await this.invoke(name, args);
       } catch (error) {
         const delay = ACTIVE_OPERATION_RETRY_DELAYS_MS[attempt];
@@ -1644,6 +1744,7 @@ export class CuaDriverHost {
   private async perform(
     action: Record<string, unknown>,
     target?: CuaTarget,
+    authorize?: () => void,
   ): Promise<void> {
     const type = String(action.type ?? action.action ?? "");
     if (type === "wait") {
@@ -1658,7 +1759,7 @@ export class CuaDriverHost {
     if (type === "screenshot") return;
     if (!target) throw new Error("computer action requires an exact target");
     const call = buildActionCall(action, target);
-    if (call) await this.call(call.tool, call.arguments);
+    if (call) await this.call(call.tool, call.arguments, authorize);
   }
 
   /**

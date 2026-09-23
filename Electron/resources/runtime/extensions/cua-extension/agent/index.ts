@@ -27,6 +27,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { createNativeCuaClient, type NativeCuaClient } from "./host-capability-client.js";
+import { connectComputerChoice } from "./computer-choice.js";
+import { runComputerGoal } from "./computer-goal.js";
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const SESSION_CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
@@ -538,7 +540,7 @@ export function compactToolDetails(
   for (const key of [
     "openedApplication", "batchOK", "batchError", "focusDrift",
     "foregroundApp", "windowTitle", "displayID", "width", "height",
-    "target", "screenshotTarget", "outcomes",
+    "target", "screenshotTarget", "outcomes", "goal",
   ]) {
     if (metadata[key] !== undefined) details[key] = metadata[key];
   }
@@ -668,6 +670,9 @@ export default function (pi: ExtensionAPI) {
     || !Number.isInteger(DISPLAY_HEIGHT)
   ) return;
 
+  const computerChoice = connectComputerChoice(pi.events);
+  pi.on("session_shutdown", () => computerChoice.dispose());
+
   pi.on("tool_call", (event) => {
     const reason = lifecycleShellBlockReason(event.toolName, event.input);
     if (reason) return { block: true, reason };
@@ -754,7 +759,10 @@ export default function (pi: ExtensionAPI) {
       "open_application, put the URL on the clipboard via printf '%s' '<URL>' | pbcopy, then send one batch: " +
       "CMD+L, CMD+V, RETURN, wait — never open/osascript for navigation. " +
       "Use wait only to let the UI settle (duration at most 10s, duration_ms at most 10000); " +
-      "scroll_amount is 1-50, so scroll in small steps and re-observe.",
+      "scroll_amount is 1-50, so scroll in small steps and re-observe. " +
+      "For a bounded multi-step AX task, action=goal runs the optional Jev loop on the pinned window. " +
+      "Supply literal text as named inputs; Jev chooses actions, never invents text or coordinates. " +
+      "Goal must be standalone (not actions[]), requires separate desktop-cloud permission, and DONE requires independent verification.",
     // `action` plus single-action fields remain optional so Anthropic's official
     // schema can dispatch into the same executor after the provider-side replacement.
     parameters: Type.Object({
@@ -762,7 +770,15 @@ export default function (pi: ExtensionAPI) {
         description: "Ordered batch of desktop actions (preferred for custom providers).",
         maxItems: 64,
       })),
-      action: Type.Optional(ActionTypeSchema),
+      action: Type.Optional(Type.Union([...ActionTypeSchema.anyOf, Type.Literal("goal")])),
+      goal: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      inputs: Type.Optional(Type.Array(Type.Object({
+        id: Type.String({ pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" }),
+        label: Type.String({ minLength: 1, maxLength: 128 }),
+        value: Type.String({ description: "Literal text kept local; at most 8 KiB per input, 32 KiB total." }),
+      }, { additionalProperties: false }), { maxItems: 16 })),
+      max_steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+      timeoutSecs: Type.Optional(Type.Number({ minimum: 1, maximum: 60 })),
       coordinate: Type.Optional(CoordinateSchema),
       x: Type.Optional(Type.Number()),
       y: Type.Optional(Type.Number()),
@@ -780,7 +796,22 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("foreground"),
       ])),
     }),
-    async execute(_id, params, signal) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (params.action === "goal" || params.goal !== undefined || params.inputs !== undefined
+        || params.max_steps !== undefined || params.timeoutSecs !== undefined) {
+        const { observation, ...goal } = await runComputerGoal(params, {
+          projectRoot: ctx.cwd, connection: computerChoice, signal,
+          request: async (action, extra, requestSignal) => {
+            const runtime = await negotiateRuntime();
+            return nativeCua().call({ action, protocolVersion: RUNTIME_VERSION,
+              displayID: runtime.display.id, displayWidth: runtime.display.width,
+              displayHeight: runtime.display.height, ...extra }, requestSignal);
+          },
+        });
+        if (!observation) return { content: [{ type: "text" as const, text: JSON.stringify(goal) }], details: { goal } };
+        return screenshotToolResult(observation, { ...compactToolDetails(observation),
+          accessibility: compactAccessibility(observation.accessibility), goal });
+      }
       const actions = normalizeActions(params as any);
       if (actions.length === 0) {
         throw new Error("computer requires a non-empty actions batch or Anthropic action");
@@ -817,8 +848,11 @@ export default function (pi: ExtensionAPI) {
   }));
 
   pi.on("before_provider_request", (event, ctx) => {
+    // Anthropic's fixed native schema cannot express action=goal. Keep the
+    // ordinary function schema while the optional Jev provider is mounted.
     if (
-      !isAnthropicComputer20251124Model(ctx.model)
+      computerChoice.current()
+      || !isAnthropicComputer20251124Model(ctx.model)
       || !isRecord(event.payload)
     ) return;
     const payload = event.payload as Record<string, unknown>;
@@ -829,7 +863,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
-    if (!isAnthropicComputer20251124Model(ctx.model)) return;
+    if (computerChoice.current() || !isAnthropicComputer20251124Model(ctx.model)) return;
     const existingKey = Object.keys(event.headers).find(
       (key) => key.toLowerCase() === "anthropic-beta",
     );

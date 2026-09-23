@@ -284,7 +284,10 @@ export class HostCapabilityBroker {
       if (!driver || (driver.usable && !driver.usable())) {
         return this.deny("host_unavailable", "no usable native driver is bound");
       }
-      const result = await driver.handle(req.params);
+      // Goal authorization is bound to the broker-authorized project, never a
+      // caller-supplied filesystem path. Legacy direct actions keep their wire shape.
+      const goalRequest = req.params.action === "computer_goal_begin" || req.params.goalLease !== undefined;
+      const result = await driver.handle(goalRequest ? { ...req.params, goalProjectRoot: req.projectRoot } : req.params);
       return { schemaVersion: HOST_CAPABILITY_WIRE_VERSION, ok: true, result, hostApiVersion: this.hostApiVersion };
     } catch (error) {
       return this.deny("driver_error", error instanceof Error ? error.message : String(error));
