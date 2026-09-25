@@ -49,11 +49,11 @@ describe("Hermes review model spawn wiring", () => {
     return { spawnedEnvs, makeBackend };
   }
 
-  it("omits override for follow-main, emits an explicit provider/model, and omits again after clear", async () => {
+  it("sends a follow-main sentinel, emits an explicit provider/model, and sends it again after clear", async () => {
     const state = await fixture();
     const mainEnv = () => [...state.spawnedEnvs].reverse().find(env => env.PIPIUI_SESSION_KEY === "session-1");
     await backend!.handle("sendPrompt", ["session-1", "default"]);
-    expect(mainEnv()?.PIPIUI_MEMORY_REVIEW_MODEL).toBeUndefined();
+    expect(mainEnv()?.PIPIUI_MEMORY_REVIEW_MODEL).toBe("");
 
     await backend!.close();
     backend = state.makeBackend();
@@ -65,6 +65,6 @@ describe("Hermes review model spawn wiring", () => {
     backend = state.makeBackend();
     await backend!.handle("setMemoryReviewModel", [null]);
     await backend!.handle("sendPrompt", ["session-1", "follow again"]);
-    expect(mainEnv()?.PIPIUI_MEMORY_REVIEW_MODEL).toBeUndefined();
+    expect(mainEnv()?.PIPIUI_MEMORY_REVIEW_MODEL).toBe("");
   });
 });

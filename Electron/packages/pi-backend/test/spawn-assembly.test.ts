@@ -415,7 +415,7 @@ describe("main-only Hermes runtime ownership", () => {
     });
     expect(main.env.PIPIUI_MEMORY_REVIEW_MODEL).toBe("provider/model-family/reviewer");
     const absent = assemblePiSpawn({ cwd: "/repo", features: { memoryBroker: true }, paths, bridgePort: 1234 });
-    expect(absent.env.PIPIUI_MEMORY_REVIEW_MODEL).toBeUndefined();
+    expect(absent.env.PIPIUI_MEMORY_REVIEW_MODEL).toBe("");
   });
 
   it("resolves Hermes only from the exact-version managed runtime", async () => {

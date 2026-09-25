@@ -22,7 +22,7 @@ test("PipiUI review model override is provider-neutral and preserves upstream co
   }
 });
 
-test("invalid or absent host override fails soft without erasing an existing Hermes choice", async () => {
+test("invalid or absent host override preserves an existing Hermes choice, while follow-main clears it", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pipi-memory-review-"));
   try {
     const configPath = join(agentDir, "hermes-memory-config.json");
@@ -31,6 +31,8 @@ test("invalid or absent host override fails soft without erasing an existing Her
     assert.equal(invalid.config.llmModelOverride, "existing/model");
     const absent = await mergeHermesConfiguration({ PI_CODING_AGENT_DIR: agentDir });
     assert.equal(absent.config.llmModelOverride, "existing/model");
+    const followMain = await mergeHermesConfiguration({ PI_CODING_AGENT_DIR: agentDir, PIPIUI_MEMORY_REVIEW_MODEL: "" });
+    assert.equal(followMain.config.llmModelOverride, undefined);
   } finally {
     await rm(agentDir, { recursive: true, force: true });
   }

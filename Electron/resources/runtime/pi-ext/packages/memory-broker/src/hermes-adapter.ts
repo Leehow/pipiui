@@ -149,6 +149,12 @@ export async function mergeHermesConfiguration(
     flushOnCompact: false,
     ...(reviewModel ? { llmModelOverride: reviewModel } : {}),
   };
+  // PipiUI sends an exact empty value when its setting is explicitly "follow main".
+  // Treat only that sentinel as ownership of the override slot; malformed values
+  // still fail soft and preserve a manually managed Hermes choice.
+  if (env.PIPIUI_MEMORY_REVIEW_MODEL === "") {
+    delete config.llmModelOverride;
+  }
   const encoded = `${JSON.stringify(config, null, 2)}\n`;
   const directory = dirname(configPath);
   const temporary = join(directory, `.hermes-memory-config-${randomBytes(12).toString("hex")}.tmp`);
