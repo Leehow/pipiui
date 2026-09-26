@@ -160,6 +160,7 @@ function makeFakeDriver() {
         openedApplication: true,
         pid: 42,
         target: { pid: 42, window_id: 7, session: String(params.sessionKey ?? "") },
+        switchedFrom: { pid: 41, window_id: 6 },
         foregroundApp: "TextEdit",
         windowTitle: "Untitled",
         screenshotId: "shot-open",
@@ -529,6 +530,7 @@ describe("cua-extension driver transport and cleanup", () => {
     // Tool result shape: metadata text + opaque marker + inline image.
     const text = result.content[0]?.text ?? "";
     expect(text).toContain('"openedApplication": true');
+    expect(text).toContain('"switchedFrom"');
     expect(text).toContain("[PIPIUI_COMPUTER_SCREENSHOT:shot-open]");
     expect(result.content[1]).toMatchObject({ type: "image", data: PNG_BASE64, mimeType: "image/png" });
     expect((result.details as any).accessibility).toEqual({ elementCount: 1 });

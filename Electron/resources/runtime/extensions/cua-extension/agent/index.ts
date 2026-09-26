@@ -691,7 +691,9 @@ export default function (pi: ExtensionAPI) {
       "CMD+L, CMD+V, RETURN, wait. Do not use AppleScript/osascript or shell open for external-browser navigation. " +
       "Provide an exact bundle identifier when known, otherwise a human app name. " +
       "The successful result pins the returned pid and window id to the authenticated " +
-      "PipiUI session; later computer batches keep using that target even if PipiUI is frontmost.",
+      "PipiUI session; later computer batches keep using that target even if PipiUI is frontmost. " +
+      "To move to another app, call open_application again with that app: the new exact window replaces the pin " +
+      "(the result carries switchedFrom) and later batches target it. Re-observe before acting; old snapshot ids do not carry over.",
     parameters: Type.Object({
       bundle_identifier: Type.Optional(Type.String({
         description:
@@ -730,6 +732,7 @@ export default function (pi: ExtensionAPI) {
         width: result.width,
         height: result.height,
         target: result.target,
+        ...(result.switchedFrom ? { switchedFrom: result.switchedFrom } : {}),
         screenshotTarget: result.screenshotTarget,
         ...(result.screenshot ? { screenshot: result.screenshot } : {}),
         ...(result.outcomes ? { outcomes: result.outcomes } : {}),

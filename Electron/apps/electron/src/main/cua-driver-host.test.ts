@@ -12,6 +12,7 @@ import {
   CuaDriverHost,
   isDriverActiveOperationError,
   isDriverSessionEndedError,
+  registeredAppBundleId,
   selectLaunchWindow,
   sweepAbandonedEndpoints,
 } from "./cua-driver-host.js";
@@ -64,7 +65,7 @@ describe("CuaDriverHost", () => {
     expect(calls.filter((call) => call.name === "press_key" || call.name === "hotkey")).toHaveLength(1);
   });
 
-  it("keeps the first proven application identity and rejects later guessed aliases", async () => {
+  it("switches the pinned root to another application when open_application names it", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-root-identity-"));
     roots.push(root);
     const helper = join(root, "cua-driver");
@@ -74,18 +75,26 @@ describe("CuaDriverHost", () => {
     const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
     host.call = async (name: string, args: any) => {
       calls.push({ name, args });
-      if (name === "launch_app") return { structuredContent: { pid: 42, bundle_id: "org.example.app", name: "Example App", windows: [{ pid: 42, window_id: 77, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
-      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
-      if (name === "get_accessibility_tree" || name === "list_windows") return { structuredContent: { windows: [{ pid: 42, window_id: 77, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
+      if (name === "launch_app") {
+        const hydra = args.name === "Pipi Hydra";
+        const pid = hydra ? 84 : 42;
+        const window_id = hydra ? 88 : 77;
+        return { structuredContent: { pid, bundle_id: hydra ? "org.example.hydra" : "org.example.app", name: hydra ? "Pipi Hydra" : "Example App", windows: [{ pid, window_id, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
+      }
+      if (name === "get_window_state") return { structuredContent: { pid: args.pid, window_id: args.window_id, screenshot_png_b64: "PNG", elements: [] } };
       return { structuredContent: {} };
     };
     await expect(host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", bundle_identifier: "org.example.app" }))
       .resolves.toMatchObject({ ok: true, target: { pid: 42, window_id: 77 } });
-    const rootTarget = structuredClone(host.rootTargets.get("identity"));
-    await expect(host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", application_name: "guessed-alias" }))
-      .resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted", retryable: false } });
-    expect(calls.filter((call) => call.name === "launch_app")).toHaveLength(1);
-    expect(host.rootTargets.get("identity")).toEqual(rootTarget);
+    const switched = await host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", application_name: "Pipi Hydra" });
+    expect(switched).toMatchObject({ ok: true, target: { pid: 84, window_id: 88 }, switchedFrom: { pid: 42, window_id: 77 } });
+    expect(host.rootTargets.get("identity")).toMatchObject({ pid: 84, window_id: 88 });
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_batch", actions: [{ type: "click", element_index: 0 }] }))
+      .resolves.toMatchObject({ ok: true });
+    expect(calls.filter((call) => call.name === "click").at(-1)?.args).toMatchObject({ pid: 84, window_id: 88 });
+    const reopened = await host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", application_name: "Pipi Hydra" });
+    expect(reopened).toMatchObject({ ok: true, target: { pid: 84, window_id: 88 } });
+    expect(reopened).not.toHaveProperty("switchedFrom");
   });
 
   it("isolates pinned root applications by Computer Task within one main session", async () => {
@@ -128,13 +137,8 @@ describe("CuaDriverHost", () => {
       application_name: "Pi Keeper",
       bundle_identifier: "org.chatrpg.cockeyper",
     })).resolves.toMatchObject({ ok: true, target: { pid: 84, window_id: 88 } });
-    await expect(host.handle({
-      protocolVersion: 1,
-      sessionKey: "main-session",
-      taskId: "task-keeper",
-      action: "computer_open_application",
-      application_name: "unproven-alias",
-    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
+    expect(host.rootTargets.get(JSON.stringify(["main-session", "task-finder"]))).toMatchObject({ pid: 42, window_id: 77 });
+    expect(host.rootTargets.get(JSON.stringify(["main-session", "task-keeper"]))).toMatchObject({ pid: 84, window_id: 88 });
     expect(calls.filter((call) => call.name === "launch_app")).toHaveLength(2);
   });
 
@@ -1445,6 +1449,55 @@ if (process.argv[2] === "serve") {
       .toHaveLength(0);
   });
 
+  it("launches a registered app outside the standard folders by resolving its name through LaunchServices", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-registered-name-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    const asked: string[] = [];
+    host.resolveRegisteredApp = async (name: string) => {
+      asked.push(name);
+      return name === "Pipi Hydra" ? "com.leehow.pipi-hydra" : undefined;
+    };
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app" && args.name) throw new Error(`No installed macOS app found for name '${args.name}'.`);
+      if (name === "list_apps") return { structuredContent: { apps: [{ name: "PipiUI", bundle_id: "com.leehow.pipiui-electron", pid: 1, running: true }] } };
+      if (name === "launch_app" && args.bundle_id === "com.leehow.pipi-hydra") {
+        return { structuredContent: { pid: 69149, windows: [{ pid: 69149, window_id: 22213, bounds: { width: 1280, height: 800 }, is_on_screen: true, on_current_space: true }] } };
+      }
+      if (name === "get_window_state") return { structuredContent: { pid: args.pid, window_id: args.window_id, screenshot_png_b64: "PNG", elements: [] } };
+      return { structuredContent: {} };
+    };
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "registered", action: "computer_open_application", application_name: "Pipi Hydra" }))
+      .resolves.toMatchObject({ ok: true, target: { pid: 69149, window_id: 22213 } });
+    expect(asked).toEqual(["Pipi Hydra"]);
+    expect(calls.filter((call) => call.name === "launch_app").map((call) => call.args)).toEqual([
+      { name: "Pipi Hydra" },
+      { bundle_id: "com.leehow.pipi-hydra" },
+    ]);
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "unknown", action: "computer_open_application", application_name: "Nowhere App" }))
+      .rejects.toThrow("No installed macOS app found for name 'Nowhere App'");
+  });
+
+  it("asks LaunchServices for a name through argv, never through a shell string", async () => {
+    const seen: Array<{ file: string; args: string[] }> = [];
+    const run = async (file: string, args: string[]) => {
+      seen.push({ file, args });
+      return { stdout: args.at(-1) === "Pipi Hydra" ? "com.leehow.pipi-hydra\n" : "\n" };
+    };
+    await expect(registeredAppBundleId("Pipi Hydra", run)).resolves.toBe(process.platform === "darwin" ? "com.leehow.pipi-hydra" : undefined);
+    await expect(registeredAppBundleId("'); do shell script \"x\" --", run)).resolves.toBeUndefined();
+    await expect(registeredAppBundleId("Anything", async () => { throw new Error("osascript failed"); })).resolves.toBeUndefined();
+    if (process.platform === "darwin") {
+      expect(seen[0]).toMatchObject({ file: "/usr/bin/osascript" });
+      expect(seen[1].args.at(-1)).toBe("'); do shell script \"x\" --");
+    }
+  });
+
   it("activates a running uninstalled app by resolving its name through list_apps", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-running-name-"));
     roots.push(root);
@@ -1516,12 +1569,6 @@ if (process.argv[2] === "serve") {
       action: "computer_open_application",
       bundle_identifier: "org.chatrpg.cockeyper",
     })).resolves.toMatchObject({ ok: true, target: { pid: 91368, window_id: 349047 } });
-    await expect(host.handle({
-      protocolVersion: 1,
-      sessionKey: "coc-running",
-      action: "computer_open_application",
-      application_name: "unproven-third-party-alias",
-    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
     expect(calls.filter((call) => call.name === "launch_app").map((call) => call.args)).toEqual([
       { name: "COC Keeper" },
       { bundle_id: "org.chatrpg.cockeyper" },
@@ -2528,6 +2575,7 @@ if (process.argv[2] === "serve") {
     await chmod(helper, 0o755);
     const calls: Array<{ name: string; args: any }> = [];
     const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.launchWindowPolls = 4;
     host.call = async (name: string, args: any) => {
       calls.push({ name, args });
       if (name === "launch_app") return { structuredContent: { pid: 42, bundle_id: "org.example.app", name: "Example App", windows: [] } };

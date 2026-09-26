@@ -463,6 +463,33 @@ export function resolveRunningAppBundleId(
   return (matches.find((app) => app.running) ?? matches[0])?.bundle;
 }
 
+/**
+ * The driver's name lookup only sees standard install folders, and the running-app
+ * fallback misses an app that is not open yet. LaunchServices also knows apps
+ * registered from anywhere else (build outputs, sibling checkouts), so ask it by
+ * name. `fullPathForApplication` resolves without launching anything.
+ */
+export async function registeredAppBundleId(
+  applicationName: string,
+  run: (file: string, args: string[]) => Promise<{ stdout: string }> = (file, args) =>
+    execFileAsync(file, args, { timeout: 5_000 }),
+): Promise<string | undefined> {
+  const name = applicationName.trim();
+  if (!name || process.platform !== "darwin") return undefined;
+  const script =
+    'function run(argv){ObjC.import("AppKit");' +
+    "var path=$.NSWorkspace.sharedWorkspace.fullPathForApplication(argv[0]);" +
+    'if(path.isNil())return "";' +
+    "var id=$.NSBundle.bundleWithPath(path).bundleIdentifier;" +
+    'return id.isNil()?"":ObjC.unwrap(id)}';
+  try {
+    const { stdout } = await run("/usr/bin/osascript", ["-l", "JavaScript", "-e", script, name]);
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Argument construction mirrors the pinned 0.20.0 `describe` schemas. */
 export function buildActionCall(
   action: Record<string, unknown>,
@@ -583,7 +610,6 @@ export class CuaDriverHost {
   private targets = new Map<string, CuaTarget>();
   private rootTargets = new Map<string, CuaTarget>();
   private observations = new Map<string, { target: CuaTarget; observation: Record<string, unknown> }>();
-  private applicationIdentities = new Map<string, Set<string>>();
   private sessionScopes = new Map<string, "window" | "desktop">();
   private scales = new Map<
     string,
@@ -601,6 +627,9 @@ export class CuaDriverHost {
   private lastGenerationPids: number[] = [];
   private leftoverSettleMs = 3_000;
   private listExactLaunchPathPids = pidsWithExactLaunchPath;
+  private resolveRegisteredApp = registeredAppBundleId;
+  // Electron apps routinely need several seconds for their first window on a cold launch.
+  private launchWindowPolls = 16;
   private readParentPids = parentPidsOf;
 
   constructor(
@@ -774,22 +803,15 @@ export class CuaDriverHost {
           false,
         );
       const owner = computerTaskOwnerKey(session, request.taskId);
-      const identityKeys = [
-        typeof request.bundle_identifier === "string" && request.bundle_identifier.trim() ? `bundle:${request.bundle_identifier.trim().toLowerCase()}` : "",
-        typeof request.application_name === "string" && request.application_name.trim() ? `name:${request.application_name.trim().toLowerCase()}` : "",
-      ].filter(Boolean);
-      const established = this.applicationIdentities.get(owner);
-      if (this.rootTargets.has(owner) && established && identityKeys.some((key) => !established.has(key)))
-        return this.failure(
-          "target_handoff_untrusted",
-          "This Computer Task already has an exact root application; an unproven alias cannot replace it",
-          false,
-        );
-      const launch = await this.launchApplication({
+      // open_application is the explicit way to select or switch the target.
+      // The driver's launch result (exact pid + window) is what proves the new
+      // target, so a different app re-pins the root instead of being refused.
+      // Mid-goal switches are already refused by the goal-lease check above.
+      const previousRoot = this.rootTargets.get(owner);
+      const launched = await this.launchApplication({
         bundle_identifier: request.bundle_identifier,
         application_name: request.application_name,
       });
-      const launched = launch.result;
       const structured = record(launched.structuredContent)
         ? launched.structuredContent
         : {};
@@ -803,7 +825,7 @@ export class CuaDriverHost {
       let windowID = Number(selectLaunchWindow(windows, pid)?.window_id);
       for (
         let attempt = 0;
-        Number.isInteger(pid) && pid > 0 && !(Number.isInteger(windowID) && windowID > 0) && attempt < 4;
+        Number.isInteger(pid) && pid > 0 && !(Number.isInteger(windowID) && windowID > 0) && attempt < this.launchWindowPolls;
         attempt += 1
       ) {
         await sleep(500);
@@ -834,15 +856,15 @@ export class CuaDriverHost {
         );
       }
       const target = { pid, window_id: windowID, session };
+      const switched = previousRoot !== undefined && previousRoot.pid !== pid;
       this.rootTargets.set(owner, target);
       this.targets.set(owner, target);
-      const proven = new Set(identityKeys);
-      for (const key of launch.provenIdentityKeys) proven.add(key);
-      for (const [kind, value] of [
-        ["bundle", structured.bundle_id ?? structured.bundle_identifier],
-        ["name", structured.name ?? structured.application_name],
-      ] as const) if (typeof value === "string" && value.trim()) proven.add(`${kind}:${value.trim().toLowerCase()}`);
-      this.applicationIdentities.set(owner, proven);
+      if (switched) {
+        // The old app's snapshot ids and screenshot scale must not bind actions
+        // aimed at the new window.
+        this.observations.delete(owner);
+        this.scales.delete(owner);
+      }
       await this.call("bring_to_front", {
         pid: target.pid,
         window_id: target.window_id,
@@ -860,6 +882,7 @@ export class CuaDriverHost {
         ok: true,
         ...structured,
         target: current.target,
+        ...(switched ? { switchedFrom: { pid: previousRoot.pid, window_id: previousRoot.window_id } } : {}),
         ...current.observation,
       };
     }
@@ -922,7 +945,7 @@ export class CuaDriverHost {
         return {
           ...this.failure(
             "target_handoff_untrusted",
-            "App-switcher shortcuts cannot be used after an exact application window is pinned; observe the pinned target instead",
+            "App-switcher shortcuts cannot be used after an exact application window is pinned; call open_application to switch to another app",
             false,
           ),
           completedActions: 0,
@@ -1191,7 +1214,6 @@ export class CuaDriverHost {
     this.targets.clear();
     this.rootTargets.clear();
     this.observations.clear();
-    this.applicationIdentities.clear();
     this.sessionScopes.clear();
     this.scales.clear();
     const teardown = this.terminateGeneration(proxy, daemon, socket, channels);
@@ -1717,7 +1739,7 @@ export class CuaDriverHost {
   private async launchApplication(target: {
     bundle_identifier?: unknown;
     application_name?: unknown;
-  }): Promise<{ result: any; provenIdentityKeys: string[] }> {
+  }): Promise<any> {
     const bundle = typeof target.bundle_identifier === "string"
       ? target.bundle_identifier.trim()
       : "";
@@ -1725,19 +1747,18 @@ export class CuaDriverHost {
       ? target.application_name.trim()
       : "";
     try {
-      const result = await this.call(
+      return await this.call(
         "launch_app",
         bundle ? { bundle_id: bundle } : { name },
       );
-      return { result, provenIdentityKeys: [bundle ? `bundle:${bundle.toLowerCase()}` : `name:${name.toLowerCase()}`] };
     } catch (error) {
       if (bundle || !name || !isMissingInstalledAppError(error)) throw error;
       const listed = await this.call("list_apps", {});
       const structured = record(listed.structuredContent) ? listed.structuredContent : {};
-      const resolved = resolveRunningAppBundleId(structured.apps, name);
+      const resolved = resolveRunningAppBundleId(structured.apps, name)
+        ?? await this.resolveRegisteredApp(name);
       if (!resolved) throw error;
-      const result = await this.call("launch_app", { bundle_id: resolved });
-      return { result, provenIdentityKeys: [`name:${name.toLowerCase()}`, `bundle:${resolved.toLowerCase()}`] };
+      return await this.call("launch_app", { bundle_id: resolved });
     }
   }
 
