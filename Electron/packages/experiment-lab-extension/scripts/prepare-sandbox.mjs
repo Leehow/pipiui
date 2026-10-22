@@ -22,7 +22,12 @@ const installed = () => {
   } catch { return false; }
 };
 if (!installed()) {
-  const result = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["ci", "--omit=dev", "--ignore-scripts", "--bin-links=false", "--maxsockets=3", "--workspaces=false"], { cwd: root, stdio: "inherit" });
+  const result = spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["ci", "--omit=dev", "--ignore-scripts", "--bin-links=false", "--maxsockets=3", "--workspaces=false"], {
+    cwd: root,
+    stdio: "inherit",
+    // Node refuses to spawn a .cmd without a shell (CVE-2024-27980): EINVAL on Windows.
+    shell: process.platform === "win32",
+  });
   if (result.status !== 0) throw new Error(`Sandbox dependency preparation failed: ${result.error?.message ?? result.status}`);
   writeFileSync(stamp, digest);
   console.log("experiment-lab: prepared pinned sandbox-runtime 0.0.77");
