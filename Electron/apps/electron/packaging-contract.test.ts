@@ -194,7 +194,7 @@ describe('macOS packaging contract', () => {
     }))
     expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
     expect(embedded?.filter).toBeUndefined()
-    expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.8')
+    expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.11.0')
     expect(runtimePreparer).toContain("const hermesPackageName = 'pi-hermes-memory'")
     // Native modules must be built for the ABI that will actually load them. 4875076d
     // split this by platform: macOS runs the embedded runtime as standalone Node, while

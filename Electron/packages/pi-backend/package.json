@@ -20,8 +20,8 @@
     "@earendil-works/pi-coding-agent": "1.0.0",
     "@pipi/account-usage-core": "file:../account-usage-core",
     "@pipi/host-api": "file:../host-api",
-    "pi-mcp-extension": "1.5.0",
-    "pi-web-access": "0.28.0",
+    "pi-mcp-extension": "1.16.2",
+    "pi-web-access": "0.48.0",
     "yauzl": "^3.4.0",
     "yazl": "^3.3.1"
   },

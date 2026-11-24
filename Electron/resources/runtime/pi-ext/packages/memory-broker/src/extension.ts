@@ -36,7 +36,7 @@ import type {
 const MAX_QUERY_TOOL_TEXT = 6_000;
 
 export type MemoryBrokerExtensionOptions = {
-  /** Test/host override. Default main mode composes pi-hermes-memory@0.9.8. */
+  /** Test/host override. Default main mode composes pi-hermes-memory@0.11.0. */
   backendFactory?: () => MemoryBrokerBackend | undefined | Promise<MemoryBrokerBackend | undefined>;
   /** Test seam for a start/bind failure without changing the real listener. */
   serverFactory?: (options: MemoryBrokerServerOptions) => MemoryBrokerServer;

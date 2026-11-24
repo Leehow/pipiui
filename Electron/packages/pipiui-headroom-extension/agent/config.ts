@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import type { HeadroomConfig } from "./types.js";
 
-export const HEADROOM_UPSTREAM_VERSION = "0.37.0";
+export const HEADROOM_UPSTREAM_VERSION = "0.45.0";
 export const HEADROOM_SETTINGS_ENV = "PIPIUI_EXT_SETTINGS_PIPIUI_HEADROOM";
 
 const PROTECTED_TOOLS = Object.freeze([

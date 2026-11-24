@@ -3,7 +3,7 @@
 // The loopback memory broker package (`resources/runtime/pi-ext/packages/
 // memory-broker`) stays the single implementation and the worker identity
 // root: children remount the broker's own fail-closed package identity, and
-// the Hermes adapter (pi-hermes-memory 0.9.8) remains an internal
+// the Hermes adapter (pi-hermes-memory 0.11.0) remains an internal
 // compatibility layer behind it — not an extension API contract. This
 // manifest extension is the distribution wrapper that makes the memory
 // system a standalone, discoverable extension package. The Electron host

@@ -48,7 +48,7 @@
     {
       "id": "officecli",
       "name": "OfficeCLI",
-      "version": "1.0.147",
+      "version": "1.0.163",
       "source": {
         "type": "githubReleases",
         "owner": "iOfficeAI",

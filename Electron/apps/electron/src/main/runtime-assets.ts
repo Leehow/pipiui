@@ -64,10 +64,10 @@ export function materializeDetachedDarwinHost(source: string, destDir: string | 
 export const EMBEDDED_NODE_VERSION = '24.19.0'
 export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   '@earendil-works/pi-coding-agent': backendPackage.dependencies['@earendil-works/pi-coding-agent'],
-  'pi-web-access': '0.28.0',
-  'pi-mcp-extension': '1.5.0',
-  'pi-hermes-memory': '0.9.8',
-  'better-sqlite3': '12.11.1'
+  'pi-web-access': '0.48.0',
+  'pi-mcp-extension': '1.16.2',
+  'pi-hermes-memory': '0.11.0',
+  'better-sqlite3': '13.2.0'
 } as const
 /** User-facing Pi packages with meaningful independent upstream release channels. */
 export const UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS = {

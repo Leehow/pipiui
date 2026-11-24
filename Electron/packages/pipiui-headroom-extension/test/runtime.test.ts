@@ -72,8 +72,8 @@ describe("Headroom primary lease and sticky fallback", () => {
       managedStateReader: async () => {
         reads += 1;
         return reads < 2
-          ? { state: "installing", baseUrl: DEFAULT_CONFIG.baseUrl, engineVersion: "0.37.0" }
-          : { state: "ready", baseUrl: DEFAULT_CONFIG.baseUrl, engineVersion: "0.37.0" };
+          ? { state: "installing", baseUrl: DEFAULT_CONFIG.baseUrl, engineVersion: "0.45.0" }
+          : { state: "ready", baseUrl: DEFAULT_CONFIG.baseUrl, engineVersion: "0.45.0" };
       },
     });
 
@@ -150,7 +150,7 @@ describe("Headroom primary lease and sticky fallback", () => {
       managedStateReader: async () => ({
         state: "failed",
         baseUrl: DEFAULT_CONFIG.baseUrl,
-        engineVersion: "0.37.0",
+        engineVersion: "0.45.0",
         error: "install failed",
       }),
     });

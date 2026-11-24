@@ -37,7 +37,7 @@ describe("autoresearch manifest and vendored upstream", () => {
       {
         id: "pi-autoresearch",
         name: "pi-autoresearch",
-        version: "1.8.1",
+        version: "1.9.0",
         source: { type: "npm", packageName: "pi-autoresearch" },
         upstream: "https://github.com/davebcn87/pi-autoresearch",
         license: "MIT",
@@ -67,7 +67,7 @@ describe("autoresearch manifest and vendored upstream", () => {
         id: "autoresearch:pi-autoresearch",
         name: "pi-autoresearch",
         category: "extension",
-        currentVersion: "1.8.1",
+        currentVersion: "1.9.0",
         source: { type: "npm", packageName: "pi-autoresearch" },
         ownerExtensionId: "autoresearch",
         ownerExtensionName: "自动研究",

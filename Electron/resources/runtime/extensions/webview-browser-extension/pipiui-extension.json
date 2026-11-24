@@ -31,7 +31,7 @@
     {
       "id": "browser-use-jev",
       "name": "Browser Use Jev",
-      "version": "1231850a0bf1a0c0341fe408ef1668dbbfdfac46",
+      "version": "cf3c406f0fc4becff8986ed4d4d37b7b9f102e45",
       "source": {
         "type": "githubCommits",
         "owner": "browser-use",

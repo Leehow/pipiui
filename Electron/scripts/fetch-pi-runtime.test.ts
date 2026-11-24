@@ -38,8 +38,8 @@ describe('persistent embedded Pi runtime CLI', () => {
         return header
       })()),
       writeFile(piCli, '// cli\n'),
-      writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.8' })),
-      writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ name: 'better-sqlite3', version: '12.11.1' })),
+      writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.11.0' })),
+      writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ name: 'better-sqlite3', version: '13.2.0' })),
       // Thin Mach-O header with the requested CPU type. inspectRuntime only
       // needs the header to reject a closure prepared for the other target.
       writeFile(sqliteNative, (() => {
@@ -52,7 +52,7 @@ describe('persistent embedded Pi runtime CLI', () => {
       writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '1.0.0' }))
     ])
     await Promise.all([chmod(node, 0o755), chmod(launcher, 0o755)])
-    for (const [name, version] of [['pi-web-access', '0.28.0'], ['pi-mcp-extension', '1.5.0']]) {
+    for (const [name, version] of [['pi-web-access', '0.48.0'], ['pi-mcp-extension', '1.16.2']]) {
       const packageRoot = join(nodeModules, name)
       await mkdir(join(packageRoot, 'dist'), { recursive: true })
       await writeFile(join(packageRoot, 'dist', 'index.js'), '// extension\n')
@@ -69,10 +69,10 @@ describe('persistent embedded Pi runtime CLI', () => {
       nodeModules: 'pi/lib/node_modules',
       packages: {
         '@earendil-works/pi-coding-agent': '1.0.0',
-        'pi-web-access': '0.28.0',
-        'pi-mcp-extension': '1.5.0',
-        'pi-hermes-memory': '0.9.8',
-        'better-sqlite3': '12.11.1'
+        'pi-web-access': '0.48.0',
+        'pi-mcp-extension': '1.16.2',
+        'pi-hermes-memory': '0.11.0',
+        'better-sqlite3': '13.2.0'
       }
     }))
     return target
@@ -217,10 +217,10 @@ describe('persistent embedded Pi runtime CLI', () => {
     await rm(join(nodeModules, 'pi-hermes-memory'), { recursive: true, force: true })
     const missing = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
     expect(missing.status).toBe(1)
-    expect(missing.stderr).toContain('pi-hermes-memory installed version is missing, expected 0.9.8')
+    expect(missing.stderr).toContain('pi-hermes-memory installed version is missing, expected 0.11.0')
 
     await mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true })
-    await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.8' }))
+    await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.11.0' }))
     const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
     const wrongHeader = Buffer.alloc(32)
     wrongHeader.writeUInt32LE(0xfeedfacf, 0)

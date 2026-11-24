@@ -29,7 +29,7 @@
     {
       "id": "firecrawl-pdf-inspector",
       "name": "@firecrawl/pdf-inspector",
-      "version": "1.17.0",
+      "version": "1.27.0",
       "source": { "type": "npm", "packageName": "@firecrawl/pdf-inspector" },
       "upstream": "https://github.com/firecrawl/pdf-inspector",
       "license": "MIT"

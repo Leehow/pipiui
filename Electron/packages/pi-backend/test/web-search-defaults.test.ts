@@ -7,6 +7,7 @@ import {
   DEFAULT_SEARCH_ROUTING,
   DEFAULT_SSRF,
   DEFAULT_WEB_SEARCH_WORKFLOW,
+  DEFAULT_WEB_TOOL_ACTIVATION,
   WEB_SEARCH_DEFAULTS_MARKER,
   applyWebSearchDefaults,
   ensureWebSearchDefaults,
@@ -14,6 +15,7 @@ import {
 
 const previousManaged = {
   workflow: DEFAULT_WEB_SEARCH_WORKFLOW,
+  toolActivation: DEFAULT_WEB_TOOL_ACTIVATION,
   searchRouting: DEFAULT_SEARCH_ROUTING,
   ssrf: DEFAULT_SSRF,
 };
@@ -43,9 +45,9 @@ describe("applyWebSearchDefaults", () => {
       firecrawlBaseUrl: "https://crawl.example.com",
     };
     const { next, managed } = applyWebSearchDefaults(current, undefined);
-    expect(next).toEqual({ ...current, ssrf: DEFAULT_SSRF });
+    expect(next).toEqual({ ...current, ssrf: DEFAULT_SSRF, toolActivation: "eager" });
     expect(next.searchRouting).toBeUndefined();
-    expect(managed).toEqual({ ssrf: DEFAULT_SSRF });
+    expect(managed).toEqual({ ssrf: DEFAULT_SSRF, toolActivation: "eager" });
   });
 
   it("removes a still-managed searchRouting after the user pins a provider", () => {
@@ -90,6 +92,25 @@ describe("applyWebSearchDefaults", () => {
   });
 });
 
+describe("web tool activation", () => {
+  it("keeps pi-web-access tools eager so the host sees them from the first request", () => {
+    expect(applyWebSearchDefaults(undefined, undefined).next.toolActivation).toBe("eager");
+  });
+
+  it("leaves a user-chosen activation alone", () => {
+    const { next, managed } = applyWebSearchDefaults({ toolActivation: "dynamic" }, previousManaged);
+    expect(next.toolActivation).toBe("dynamic");
+    expect(managed).not.toHaveProperty("toolActivation");
+  });
+
+  it("does not force eager onto deferred tool exposure, which requires dynamic activation", () => {
+    const fresh = applyWebSearchDefaults({ toolExposure: "deferred" }, undefined);
+    expect(fresh.next).not.toHaveProperty("toolActivation");
+    const switched = applyWebSearchDefaults({ toolExposure: "deferred", toolActivation: "eager" }, previousManaged);
+    expect(switched.next).not.toHaveProperty("toolActivation");
+  });
+});
+
 describe("ensureWebSearchDefaults", () => {
   const dirs: string[] = [];
 
@@ -110,6 +131,7 @@ describe("ensureWebSearchDefaults", () => {
     const config = JSON.parse(await readFile(join(agentDir, "web-search.json"), "utf8"));
     expect(config).toEqual({
       workflow: "none",
+      toolActivation: "eager",
       searchRouting: DEFAULT_SEARCH_ROUTING,
       ssrf: DEFAULT_SSRF,
     });

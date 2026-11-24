@@ -1,10 +1,10 @@
 # Vendored pi-autoresearch provenance
 
 - Upstream: `davebcn87/pi-autoresearch`
-- Version: `1.8.1`
-- Registry tarball: `https://registry.npmjs.org/pi-autoresearch/-/pi-autoresearch-1.8.1.tgz`
-  - sha256 `fb5586c303c748a6c7d9bf2e4256c8ab28dd350da48b575688f108bbebde55bb`
-  - published gitHead `703a8f12ce80259d65bec41029c8136ce60686ff`
+- Version: `1.9.0`
+- Registry tarball: `https://registry.npmjs.org/pi-autoresearch/-/pi-autoresearch-1.9.0.tgz`
+  - sha256 `ade1b290c3f067413bd2cb826f3a9a1149b0e9df857822de5fe81a596f65ca9e`
+  - published gitHead `04b8a50dac7efe80ffc91648bd00ed9b022e24c2`
 - License: MIT; the upstream license is preserved in `vendor/pi-autoresearch/LICENSE`.
 
 `vendor/pi-autoresearch/` is that tarball's `package/` payload, byte for byte: every file's sha256

@@ -800,14 +800,14 @@ export type ManagedPackage={name:string;version:string};
  * let the mounted extension change between launches — and declared once so the installer and the
  * mount lookup can never drift onto different versions.
  */
-export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.28.0"},{name:"pi-mcp-extension",version:"1.5.0"}];
-export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.9.8"};
+export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.48.0"},{name:"pi-mcp-extension",version:"1.16.2"}];
+export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.11.0"};
 /**
  * The memory system ships as the standalone `memory-extension` manifest package
  * (frozen tools: memory_query / memory_status; frozen id in the shared core
  * capability contract). Its agent half wraps the loopback memory broker package
  * in place, so the broker stays the worker identity root and the Hermes adapter
- * (pi-hermes-memory 0.9.8) remains an internal compatibility layer.
+ * (pi-hermes-memory 0.11.0) remains an internal compatibility layer.
  */
 export const MEMORY_EXTENSION_ID="memory-extension";
 /**

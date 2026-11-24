@@ -126,28 +126,28 @@ describe('OfficeCLI native binary fetch', () => {
     return root
   }
 
-  it('pins immutable GitHub v1.0.147 URLs, checksums, and supported targets', async () => {
+  it('pins immutable GitHub v1.0.163 URLs, checksums, and supported targets', async () => {
     const metadata = await loadMetadata()
-    expect(metadata.version).toBe('1.0.147')
-    expect(metadata.tag).toBe('v1.0.147')
+    expect(metadata.version).toBe('1.0.163')
+    expect(metadata.tag).toBe('v1.0.163')
     expect(metadata.repository).toBe('https://github.com/iOfficeAI/OfficeCLI')
     expect(metadata.license).toBe('Apache-2.0')
-    expect(metadata.baseUrl).toBe('https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.147')
+    expect(metadata.baseUrl).toBe('https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.163')
     expect(metadata.baseUrl).not.toContain('latest')
     expect(metadata.baseUrl).not.toContain('d.officecli.ai')
     expect(Object.keys(metadata.assets).sort()).toEqual([
       'darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64'
     ])
-    // Re-fetched official SHA256SUMS via curl from the immutable v1.0.147 GitHub
-    // release (file sha256 ceacbbe94fc42a77c66c2cde2c3a8accef9757741f4dd260f0249cc4230cbb40).
+    // Re-fetched official SHA256SUMS via curl from the immutable v1.0.163 GitHub
+    // release (file sha256 6c3fa68aba6f0fccfee8cc0be1053040132f2b45b3d107e17b7d9761fa6d50f5).
     // Not persisted. Every checked-in asset hash must match that manifest.
     const officialSha256sums: Record<string, string> = {
-      'officecli-linux-arm64': 'f90c734722fd2f41ae76e72878329f033ed36c132aa741ec44dc3827066c55b9',
-      'officecli-linux-x64': 'e8bfe04f670139f526fe4e81f11acc1bc8629e421a20c5ba7a6e25f7a54a31f7',
-      'officecli-mac-arm64': '55569d8a7430c1d8d7872c1661ff8cfea2eeef03ffc4fa8dbee437a4c91ee1ed',
-      'officecli-mac-x64': '9f957b9439b922916360189bedfb780defc471b95ab8670f2a5a9630e7c9c253',
-      'officecli-win-arm64.exe': '7ff0195c32405bac9cf6a32589d984fa7a863adfabbc6e42dfef47a7839264cf',
-      'officecli-win-x64.exe': '724056e5ff079c3585df79c8afc386f08ef7d5f956cf4e2723534e129aab6e80'
+      'officecli-linux-arm64': '94dd4e1e5db095d2eec691a74c6fd508bf4b651432aade07d41a217cf997ff83',
+      'officecli-linux-x64': 'ba4d75d293aefee222659793074d569a3f94a34a28e2894bfe6d018015cffa95',
+      'officecli-mac-arm64': '12bbe7c322a4114533bcc115e8ff6255917a35de0432c85111be534c82a9cbe1',
+      'officecli-mac-x64': 'd9737acd91771bcdbc33850423a7edc4a805cc8dd4053a910cd88401baba630c',
+      'officecli-win-arm64.exe': '0ef9eff51e2df2ee7cdbfa35e3b5660914412bd288960ce0323c43720856f7f9',
+      'officecli-win-x64.exe': '8c351bff88728b538f2754bbfd3a09ea2cf6199c78a9e4feeca717d0135a9f56'
     }
     for (const asset of Object.values(metadata.assets) as Array<{ asset: string, sha256: string }>) {
       expect(asset.sha256).toBe(officialSha256sums[asset.asset])
@@ -155,9 +155,9 @@ describe('OfficeCLI native binary fetch', () => {
     const arm = resolveAsset(metadata, 'darwin', 'arm64')
     expect(arm.asset.asset).toBe('officecli-mac-arm64')
     expect(arm.asset.sha256).toBe(officialSha256sums['officecli-mac-arm64'])
-    expect(arm.asset.bytes).toBe(33793648)
+    expect(arm.asset.bytes).toBe(33961904)
     expect(assetUrl(metadata, arm.asset)).toBe(
-      'https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.147/officecli-mac-arm64'
+      'https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.163/officecli-mac-arm64'
     )
     const win = resolveAsset(metadata, 'win32', 'x64')
     expect(win.asset.asset).toBe('officecli-win-x64.exe')

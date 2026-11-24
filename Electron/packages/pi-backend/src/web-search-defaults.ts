@@ -17,6 +17,14 @@ import { join } from "node:path";
  * to the last value this host wrote.
  */
 export const DEFAULT_WEB_SEARCH_WORKFLOW = "none";
+/**
+ * pi-web-access ≥0.40 defaults to `toolActivation: "auto"`, which may start a
+ * session with only the `web_enable` loader. The host's tool ownership and
+ * hosted-search de-duplication expect the four web tools from the first
+ * request, so keep them eager unless the user chose otherwise (or chose
+ * `toolExposure: "deferred"`, which requires dynamic activation).
+ */
+export const DEFAULT_WEB_TOOL_ACTIVATION = "eager";
 export const WEB_SEARCH_DEFAULTS_MARKER = ".pipiui-web-search-defaults-v1.json";
 export const DEFAULT_SSRF = Object.freeze({
   allowRanges: Object.freeze(["198.18.0.0/15"]),
@@ -88,6 +96,12 @@ export function applyWebSearchDefaults(
   };
 
   take("workflow", DEFAULT_WEB_SEARCH_WORKFLOW);
+  // `toolExposure: "deferred"` cannot be combined with eager activation.
+  if (next.toolExposure === "deferred") {
+    if (equalJson(next.toolActivation, previous.toolActivation)) delete next.toolActivation;
+  } else {
+    take("toolActivation", DEFAULT_WEB_TOOL_ACTIVATION);
+  }
   take("ssrf", cloneSsrf());
   if (equalJson(next.firecrawlBaseUrl, previous.firecrawlBaseUrl)) delete next.firecrawlBaseUrl;
 

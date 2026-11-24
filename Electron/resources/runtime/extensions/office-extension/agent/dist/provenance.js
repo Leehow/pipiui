@@ -6,7 +6,7 @@ export const OFFICECLI_PROVENANCE = {
     upstreamRepository: "https://github.com/iOfficeAI/OfficeCLI",
     upstreamMaintainer: "goworm",
     upstreamLicense: "Apache-2.0",
-    cliVersion: "1.0.147",
+    cliVersion: "1.0.163",
     binaryLayout: "bin/<platform>-<arch>/officecli",
     binaryCacheLayout: "Electron/.officecli/<platform>-<arch>/extensions/office-extension/bin/<platform>-<arch>/officecli",
     binaryReceipt: "receipt.json",

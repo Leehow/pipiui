@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "dependencies": {
-    "@firecrawl/pdf-inspector": "1.17.0",
-    "@firecrawl/pdf-inspector-wasm": "1.17.0"
+    "@firecrawl/pdf-inspector": "1.27.0",
+    "@firecrawl/pdf-inspector-wasm": "1.27.0"
   }
 }

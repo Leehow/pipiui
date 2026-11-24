@@ -28,7 +28,7 @@ describe('resolveRuntimeAssets', () => {
       'pi-hermes-memory'
     ])
     expect(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS).not.toHaveProperty('better-sqlite3')
-    expect(MANAGED_RUNTIME_PACKAGE_VERSIONS).toHaveProperty('better-sqlite3', '12.11.1')
+    expect(MANAGED_RUNTIME_PACKAGE_VERSIONS).toHaveProperty('better-sqlite3', '13.2.0')
   })
   afterEach(async () => {
     if (root) await rm(root, { recursive: true, force: true })
@@ -51,11 +51,11 @@ describe('resolveRuntimeAssets', () => {
       writeFile(launcher, ''),
       writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: preparedPiVersion })),
       mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
-        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.8' }))),
+        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.11.0' }))),
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
-        writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '12.11.1' })))
+        writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '13.2.0' })))
     ])
-    for (const [name, version] of [['pi-web-access', '0.28.0'], ['pi-mcp-extension', '1.5.0']]) {
+    for (const [name, version] of [['pi-web-access', '0.48.0'], ['pi-mcp-extension', '1.16.2']]) {
       const packageRoot = join(nodeModules, name)
       await mkdir(join(packageRoot, 'dist'), { recursive: true })
       await writeFile(join(packageRoot, 'dist', 'index.js'), '// extension\n')
@@ -73,10 +73,10 @@ describe('resolveRuntimeAssets', () => {
       nodeModules: 'pi/lib/node_modules',
       packages: {
         '@earendil-works/pi-coding-agent': preparedPiVersion,
-        'pi-web-access': '0.28.0',
-        'pi-mcp-extension': '1.5.0',
-        'pi-hermes-memory': '0.9.8',
-        'better-sqlite3': '12.11.1'
+        'pi-web-access': '0.48.0',
+        'pi-mcp-extension': '1.16.2',
+        'pi-hermes-memory': '0.11.0',
+        'better-sqlite3': '13.2.0'
       }
     }))
   }
@@ -155,7 +155,7 @@ describe('resolveRuntimeAssets', () => {
       }
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
-    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.8')
+    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.11.0')
   })
 
   it('spawns the Electron host, never the unspawnable Windows .cmd shim', async () => {

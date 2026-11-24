@@ -10,7 +10,7 @@ import { projectPiAgentDir } from "./project-pi-home.js";
 import { withElectronRunAsNode } from "./spawn-assembly.js";
 
 export const HEADROOM_EXTENSION_ID = "pipiui-headroom";
-export const HEADROOM_ENGINE_VERSION = "0.37.0";
+export const HEADROOM_ENGINE_VERSION = "0.45.0";
 export const HEADROOM_UV_VERSION = "0.12.5";
 export const HEADROOM_MANAGED_SETTINGS = {
   baseUrl: "ext.pipiui-headroom.baseUrl",

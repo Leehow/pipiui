@@ -11,7 +11,7 @@ behavior.
 - `agent/index.ts` — tool contract: source validation (absolute path / `file://`
   / http(s)), 50 MB limit, `%PDF-` magic check, `auto`/`fast`/`ocr` routing,
   temp-file cleanup for URL downloads, secret redaction on surfaced errors.
-- `agent/pdf-inspector-local.ts` — vendored `@firecrawl/pdf-inspector` 1.15.0
+- `agent/pdf-inspector-local.ts` — vendored `@firecrawl/pdf-inspector` 1.27.0
   native/WASM adapter under `vendor/pdf-inspector/node_modules`, resolved
   relative to this package only; there is no host env-root override.
 - `agent/paddleocr-mcp-client.ts` — newline-delimited JSON-RPC stdio client for

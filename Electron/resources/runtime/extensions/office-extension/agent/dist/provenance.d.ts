@@ -6,7 +6,7 @@ export declare const OFFICECLI_PROVENANCE: {
     readonly upstreamRepository: "https://github.com/iOfficeAI/OfficeCLI";
     readonly upstreamMaintainer: "goworm";
     readonly upstreamLicense: "Apache-2.0";
-    readonly cliVersion: "1.0.147";
+    readonly cliVersion: "1.0.163";
     readonly binaryLayout: "bin/<platform>-<arch>/officecli";
     readonly binaryCacheLayout: "Electron/.officecli/<platform>-<arch>/extensions/office-extension/bin/<platform>-<arch>/officecli";
     readonly binaryReceipt: "receipt.json";

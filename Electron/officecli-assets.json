@@ -1,45 +1,45 @@
 {
-  "version": "1.0.147",
-  "tag": "v1.0.147",
+  "version": "1.0.163",
+  "tag": "v1.0.163",
   "repository": "https://github.com/iOfficeAI/OfficeCLI",
   "license": "Apache-2.0",
   "upstreamMaintainer": "goworm",
-  "baseUrl": "https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.147",
+  "baseUrl": "https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.163",
   "sha256sums": {
     "asset": "SHA256SUMS",
     "bytes": 710,
-    "sha256": "ceacbbe94fc42a77c66c2cde2c3a8accef9757741f4dd260f0249cc4230cbb40"
+    "sha256": "6c3fa68aba6f0fccfee8cc0be1053040132f2b45b3d107e17b7d9761fa6d50f5"
   },
   "assets": {
     "darwin-arm64": {
       "asset": "officecli-mac-arm64",
-      "sha256": "55569d8a7430c1d8d7872c1661ff8cfea2eeef03ffc4fa8dbee437a4c91ee1ed",
-      "bytes": 33793648
+      "sha256": "12bbe7c322a4114533bcc115e8ff6255917a35de0432c85111be534c82a9cbe1",
+      "bytes": 33961904
     },
     "darwin-x64": {
       "asset": "officecli-mac-x64",
-      "sha256": "9f957b9439b922916360189bedfb780defc471b95ab8670f2a5a9630e7c9c253",
-      "bytes": 34739072
+      "sha256": "d9737acd91771bcdbc33850423a7edc4a805cc8dd4053a910cd88401baba630c",
+      "bytes": 34938656
     },
     "linux-arm64": {
       "asset": "officecli-linux-arm64",
-      "sha256": "f90c734722fd2f41ae76e72878329f033ed36c132aa741ec44dc3827066c55b9",
-      "bytes": 34766343
+      "sha256": "94dd4e1e5db095d2eec691a74c6fd508bf4b651432aade07d41a217cf997ff83",
+      "bytes": 34939443
     },
     "linux-x64": {
       "asset": "officecli-linux-x64",
-      "sha256": "e8bfe04f670139f526fe4e81f11acc1bc8629e421a20c5ba7a6e25f7a54a31f7",
-      "bytes": 35349925
+      "sha256": "ba4d75d293aefee222659793074d569a3f94a34a28e2894bfe6d018015cffa95",
+      "bytes": 35549841
     },
     "win32-arm64": {
       "asset": "officecli-win-arm64.exe",
-      "sha256": "7ff0195c32405bac9cf6a32589d984fa7a863adfabbc6e42dfef47a7839264cf",
-      "bytes": 33857460
+      "sha256": "0ef9eff51e2df2ee7cdbfa35e3b5660914412bd288960ce0323c43720856f7f9",
+      "bytes": 34021300
     },
     "win32-x64": {
       "asset": "officecli-win-x64.exe",
-      "sha256": "724056e5ff079c3585df79c8afc386f08ef7d5f956cf4e2723534e129aab6e80",
-      "bytes": 33419176
+      "sha256": "8c351bff88728b538f2754bbfd3a09ea2cf6199c78a9e4feeca717d0135a9f56",
+      "bytes": 33583016
     }
   }
 }
