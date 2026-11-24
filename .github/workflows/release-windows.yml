@@ -1,8 +1,8 @@
 # Windows release installer on GitHub-hosted runners (the repo is public, so
 # Actions minutes are free). Used when the LAN Windows box is unavailable.
 #
-# Triggered by pushing a `release-win-*` tag; it packages exactly the tagged
-# commit with the same steps as a local `package:win` (no test gate — the
+# Triggered by pushing a `release-win-<x.y.z>` tag; it packages exactly the tagged
+# commit as app version <x.y.z> with the same steps as a local `package:win` (no test gate — the
 # test-bearing pipeline is electron.yml). Download the installer from the run's
 # `pipiui-windows-x64` artifact.
 name: release-windows
@@ -48,9 +48,13 @@ jobs:
         env:
           CUA_TARGET_PLATFORM: win32
           CUA_TARGET_ARCH: x64
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
         run: |
+          version="${RELEASE_TAG#release-win-}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must be release-win-<x.y.z>, got $RELEASE_TAG" >&2; exit 1; }
           node scripts/fetch-cua-driver.mjs
-          node scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64
+          node scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64 --config.extraMetadata.version="$version"
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
