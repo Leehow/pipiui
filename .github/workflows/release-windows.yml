@@ -55,6 +55,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
+          # Build scripts call `tar` on D:\ paths; Git Bash's GNU tar reads the
+          # drive colon as a remote host. Use Windows' bsdtar, as on a local build.
+          export PATH="/c/Windows/System32:$PATH"
           version="${RELEASE_TAG#release-win-}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must be release-win-<x.y.z>, got $RELEASE_TAG" >&2; exit 1; }
           node scripts/fetch-cua-driver.mjs
