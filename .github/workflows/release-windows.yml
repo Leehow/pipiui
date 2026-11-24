@@ -39,8 +39,12 @@ jobs:
         working-directory: Electron
         run: npm run build
 
+      # fetch-pi-runtime extracts the Node zip with Windows PowerShell's
+      # Expand-Archive. Under the default pwsh shell the child inherits PS7's
+      # PSModulePath and loads the wrong Archive module, so run it from cmd.
       - name: Prepare Windows embedded runtime
         working-directory: Electron
+        shell: cmd
         run: npm run runtime:prepare:win
 
       - name: Package Windows x64
