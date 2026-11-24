@@ -71,7 +71,7 @@ describe('update center version discovery', () => {
     expect(UPDATE_CENTER_FRAMEWORK_VERSIONS).toEqual({
       electron: lock.packages['node_modules/electron'].version,
       vite: (lock.packages['apps/electron/node_modules/vite'] ?? lock.packages['node_modules/vite']).version,
-      'electron-vite': lock.packages['apps/electron/node_modules/electron-vite'].version
+      'electron-vite': (lock.packages['apps/electron/node_modules/electron-vite'] ?? lock.packages['node_modules/electron-vite']).version
     })
   })
 

@@ -218,7 +218,8 @@ describe('macOS packaging contract', () => {
    */
   const createRequireSpecifiers = (source: string): string[] => {
     const specifiers: string[] = []
-    const opener = /\bcreateRequire\(/g
+    // Rolldown emits the indirect-call form `(0, node_module.createRequire)(...)`.
+    const opener = /\bcreateRequire\)?\(/g
     for (let match = opener.exec(source); match; match = opener.exec(source)) {
       let depth = 1
       let i = match.index + match[0].length
