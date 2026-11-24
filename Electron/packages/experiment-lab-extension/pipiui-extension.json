@@ -6,15 +6,15 @@
   "category": "coding",
   "defaultEnabled": false,
   "capabilities": ["bridge.emit", "invoke.agent", "data.read"],
-  "agent": { "extension": "agent/dist/index.js" },
+  "agent": { "extension": "agent/dist/index.js", "skills": ["skills"] },
   "app": {
     "data": { "read": [".pi/agent/experiments"] },
     "ui": {
       "panels": [{ "slot": "toolPanel", "id": "experiment-lab", "title": "实验台", "entry": "app/dist/panel.js" }],
-      "slashCommands": [{ "name": "experiment-lab", "description": "创建、查看或冻结项目实验" }]
+      "slashCommands": [{ "name": "experiment-lab", "description": "查看实验；在主聊天描述要验证的原型或方案" }]
     }
   },
-  "runtimeAssets": ["vendor/sandbox-runtime"],
+  "runtimeAssets": ["vendor/sandbox-runtime", "skills"],
   "settingsVersion": 1,
   "migrations": []
 }

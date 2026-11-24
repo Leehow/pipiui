@@ -4,6 +4,7 @@ import { readdir, rmdir } from "node:fs/promises";
 import * as path from "node:path";
 
 import type { WorktreeFinalizationInputV1 } from "./schema.ts";
+import { readWorktreeMergePolicyV1 } from "./merge-policy.ts";
 import type {
 	GitWorktreeAdapter,
 	GitWorktreeInspectionV1,
@@ -263,6 +264,13 @@ async function sweepRegisteredWorktree(input: {
 		message,
 	});
 
+	try {
+		if (readWorktreeMergePolicyV1(mainCwd, agentId) === "never") {
+			return item("kept-blocked", "mergePolicy=never retains the worktree and branch");
+		}
+	} catch {
+		return item("kept-blocked", "worktree merge policy could not be read safely");
+	}
 	if (matchesActiveAgent(agentId, canonical, row.branch, active)) {
 		return item("kept-active", "worktree belongs to a running or known-active job");
 	}

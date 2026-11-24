@@ -4,79 +4,53 @@ import { JEV_EXTENSION_ID } from "./jev-runtime-state.js";
 import { projectPiAgentDir } from "./project-pi-home.js";
 import { atomicWriteFile } from "./secret-vault.js";
 
-/** Host-injected OS encryption. Production wraps Electron `safeStorage`; tests inject a fake. */
-export type ExtensionSecretCipher = {
-  encrypt(plaintext: string): Buffer;
-  decrypt(ciphertext: Buffer): string;
-};
+export const JEV_CREDENTIAL_READ_FAILED = "无法读取 Jev 凭据，请在扩展设置中重新保存密钥";
+export const JEV_CREDENTIAL_FILE = "credential.json";
 
-export const EXTENSION_SECRET_ENCRYPTION_UNAVAILABLE = "系统加密不可用，无法持久保存扩展凭据";
-export const JEV_CREDENTIAL_DECRYPT_FAILED = "无法解密已保存的 Jev 扩展凭据";
-export const JEV_CREDENTIAL_FILE = "credential.enc";
-
-function canonicalProjectRoot(projectRoot: string): string {
-  const lexical = resolve(projectRoot);
-  try {
-    return realpathSync(lexical);
-  } catch {
-    return lexical;
-  }
+export function jevCredentialPath(projectRoot: string): string {
+  let root = resolve(projectRoot);
+  try { root = realpathSync(root); } catch { /* project may not exist yet */ }
+  return join(projectPiAgentDir(root), JEV_EXTENSION_ID, JEV_CREDENTIAL_FILE);
 }
 
-/** Independent ciphertext blob under the project's `.pi/agent` — never the runtime-state file. */
-export function jevCredentialCipherPath(projectRoot: string): string {
-  return join(projectPiAgentDir(canonicalProjectRoot(projectRoot)), JEV_EXTENSION_ID, JEV_CREDENTIAL_FILE);
-}
-
-/**
- * Durable store for the Jev extension API key only. The in-memory extension vault remains
- * the process cache; this file is the OS-encrypted projection that survives restart.
- * The global tool vault is untouched and still RAM-only.
+/** Local credentials, like the OCR store: atomic writes, POSIX 0600, inherited Windows ACLs.
+ * Legacy credential.enc is deliberately never decrypted on startup or spawn. Users
+ * re-enter the key once; the old ciphertext cannot resurrect after replace or clear.
+ * The global tool vault remains RAM-only.
  */
 export class JevCredentialStore {
-  constructor(private readonly cipher?: ExtensionSecretCipher) {}
-
   async read(projectRoot: string): Promise<string | undefined> {
-    let bytes: Buffer;
+    let text: string;
     try {
-      bytes = readFileSync(jevCredentialCipherPath(projectRoot));
+      text = readFileSync(jevCredentialPath(projectRoot), "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw error;
-    }
-    if (!this.cipher) {
-      throw new Error(JEV_CREDENTIAL_DECRYPT_FAILED);
+      throw new Error(JEV_CREDENTIAL_READ_FAILED);
     }
     try {
-      const value = this.cipher.decrypt(bytes);
-      if (typeof value !== 'string' || value.length < 8 || !value.trim()) throw new Error(JEV_CREDENTIAL_DECRYPT_FAILED);
-      return value;
+      const value: unknown = JSON.parse(text);
+      if (!value || typeof value !== "object" || !("apiKey" in value)
+        || typeof value.apiKey !== "string" || value.apiKey.length < 8 || !value.apiKey.trim()) {
+        throw new Error(JEV_CREDENTIAL_READ_FAILED);
+      }
+      return value.apiKey;
     } catch {
-      // Cipher errors are not trusted to omit plaintext; never forward their text/cause.
-      throw new Error(JEV_CREDENTIAL_DECRYPT_FAILED);
+      // Never propagate parser errors containing credential text.
+      throw new Error(JEV_CREDENTIAL_READ_FAILED);
     }
   }
 
   async write(projectRoot: string, plaintext: string): Promise<void> {
-    if (!this.cipher) {
-      throw new Error(EXTENSION_SECRET_ENCRYPTION_UNAVAILABLE);
+    if (typeof plaintext !== "string" || plaintext.length < 8 || !plaintext.trim()) {
+      throw new Error("Jev 密钥至少需要 8 个字符");
     }
-    let ciphertext: Buffer;
-    try {
-      const encrypted = this.cipher.encrypt(plaintext);
-      ciphertext = Buffer.isBuffer(encrypted) ? encrypted : Buffer.from(encrypted);
-    } catch {
-      throw new Error(EXTENSION_SECRET_ENCRYPTION_UNAVAILABLE);
-    }
-    atomicWriteFile(jevCredentialCipherPath(projectRoot), ciphertext);
+    atomicWriteFile(jevCredentialPath(projectRoot), `${JSON.stringify({ apiKey: plaintext })}\n`);
   }
 
   async clear(projectRoot: string): Promise<void> {
-    try {
-      unlinkSync(jevCredentialCipherPath(projectRoot));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
+    try { unlinkSync(jevCredentialPath(projectRoot)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
 }

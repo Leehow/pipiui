@@ -1,11 +1,12 @@
 import * as ReactRuntime from 'react'
 import { createElement, type ComponentType } from 'react'
-import { createExtensionHostAPI, type ExtensionHostAPI, type HeaderActionProps } from '@pipiui/extension-api'
+import { createExtensionHostAPI, type ExtensionHostAPI, type HeaderActionProps, type ComposerActionProps } from '@pipiui/extension-api'
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { Disposer } from './contribution-registry'
 import { registerDocumentRenderer, registerPanel, registerSettingsSection, registerToolRenderer } from './ui-registries'
 import { registerWorkbenchContainer, registerWorkbenchView } from './workbench/workbench-contributions'
 import { registerHeaderAction } from './workbench/header-actions'
+import { registerComposerAction } from './workbench/composer-actions'
 
 const EXTENSION_PANEL_ICON = {
   src: `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="#000" stroke-width="1.6"/></svg>')}`,
@@ -50,6 +51,7 @@ export type LoadableExtensionDescriptor = {
     viewContainers?: readonly ControlledUiViewContainer[]
     views?: readonly ControlledUiView[]
     headerActions?: readonly ControlledUiHeaderAction[]
+    composerActions?: readonly ControlledUiHeaderAction[]
   }
   contributions?: {
     panels?: readonly ControlledUiPanel[]
@@ -58,6 +60,7 @@ export type LoadableExtensionDescriptor = {
     viewContainers?: readonly ControlledUiViewContainer[]
     views?: readonly ControlledUiView[]
     headerActions?: readonly ControlledUiHeaderAction[]
+    composerActions?: readonly ControlledUiHeaderAction[]
   }
 }
 
@@ -205,10 +208,11 @@ export function svgRatio(source: string): number {
 async function loadHeaderActionComponent(
   entry: string,
   loadEntryModule: EntryModuleLoader,
+  factoryName = "createHeaderAction",
 ): Promise<ComponentType<Record<string, unknown>>> {
   const mod = await loadEntryModule(entry)
   if (mod && typeof mod === 'object') {
-    const factory = (mod as Record<string, unknown>).createHeaderAction
+    const factory = (mod as Record<string, unknown>)[factoryName]
     if (typeof factory === 'function') {
       const component = (factory as (react: typeof ReactRuntime) => unknown)(ReactRuntime)
       if (typeof component === 'function') return component as ComponentType<Record<string, unknown>>
@@ -303,6 +307,20 @@ export async function loadControlledContributions(
     } catch {
       // A broken optional header contribution must not take down the App.
     }
+  }
+
+  for (const action of [...(ui?.composerActions ?? []), ...(contrib?.composerActions ?? [])]) {
+    const entry = action.entry?.trim();
+    if (!entry || !action.id) continue;
+    try {
+      const Component = await loadHeaderActionComponent(entry, loadControlledEntryModule, 'createComposerAction');
+      disposers.push(registerComposerAction(descriptor.id, {
+        id: action.id, order: action.order,
+        render: context => createElement(Component, {
+          api, sessionId: context.sessionId, model: context.model, disabled: context.disabled,
+        } satisfies ComposerActionProps),
+      }));
+    } catch { /* An optional contribution cannot take down the composer. */ }
   }
 
   for (const container of containers) {
@@ -418,8 +436,8 @@ export function hasControlledEntry(descriptor: LoadableExtensionDescriptor): boo
   const contrib = descriptor.contributions
   const has = (items: ReadonlyArray<{ entry?: string }> | undefined) =>
     (items ?? []).some(item => Boolean(item.entry?.trim()))
-  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections) || has(ui?.views) || has(ui?.headerActions)
-    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections) || has(contrib?.views) || has(contrib?.headerActions)
+  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections) || has(ui?.views) || has(ui?.headerActions) || has(ui?.composerActions)
+    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections) || has(contrib?.views) || has(contrib?.headerActions) || has(contrib?.composerActions)
 }
 
 export function settingsSectionHasEntry(section: unknown): boolean {

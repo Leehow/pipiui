@@ -116,6 +116,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return;
   }
   if (command.type === "prompt") {
+    if (command.message === "__handled__") {
+      logPrompt(command.message);
+      return ok({ disposition: "handled" });
+    }
     if (compacting) {
       return response(command.type, command.id, false, undefined, "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.");
     }
@@ -133,6 +137,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       return response(command.type, command.id, false, undefined, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
     }
     if (heldTurn && command.streamingBehavior === "steer") {
+      if (command.message === "__race_steer_handled__") return ok({ disposition: "handled" });
       // Stale host-idle fallback: acknowledge only, like Pi's steering queue.
       if (command.message === "__race_steer_fail__") return response(command.type, command.id, false, undefined, "steer rejected");
       if (command.message.startsWith("__race_steer_echo__")) {
@@ -369,6 +374,19 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         },
       });
       send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__bash_details__") {
+      ok();
+      send({ type: "agent_start" });
+      const args = { command: "printf '" + "ARG".repeat(2000) + "'" };
+      send({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: { id: "bash-detail", name: "bash", arguments: args } } });
+      send({ type: "tool_execution_start", toolCallId: "bash-detail", toolName: "bash", args });
+      send({ type: "tool_execution_update", toolCallId: "bash-detail", toolName: "bash", partialResult: { content: [{ type: "text", text: "PRIVATE_LIVE_BODY" }] } });
+      setTimeout(() => {
+        send({ type: "tool_execution_end", toolCallId: "bash-detail", result: { content: [{ type: "text", text: "PRIVATE_FINAL_BODY" }] }, isError: false });
+        send({ type: "agent_settled" });
+      }, 800);
       return;
     }
     if (command.message === "__tool_update__") {

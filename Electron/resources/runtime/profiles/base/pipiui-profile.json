@@ -9,7 +9,8 @@
       { "id": "built-in-skills", "version": "^1.0.0" }
     ],
     "recommended": [
-      { "id": "vision-routing", "version": "^0.1.0" }
+      { "id": "vision-routing", "version": "^0.1.0" },
+      { "id": "openai-fast", "version": "^0.1.0" }
     ]
   },
   "layout": {

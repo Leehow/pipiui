@@ -12,7 +12,7 @@ import { parseSubagentNotice } from './subagent-notice'
 import { parseInternalUserSignal } from './subagent-signal'
 import { TruncatedText } from './TruncatedText'
 import { visibleTranscriptMessages, type ChatMessage } from './transcript-model'
-import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PIN_MAX_ATTEMPTS, transcriptDataIndex, transcriptMessageIdentity } from './transcript-scroll'
+import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PIN_MAX_ATTEMPTS, TRANSCRIPT_TAIL_SLACK_PX, transcriptDataIndex, transcriptMessageIdentity } from './transcript-scroll'
 
 export type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
 type DocumentOpenProps = { documentBasePath?: string; onOpenDocument?: (path: string) => void }
@@ -95,13 +95,32 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
   const virtuosoRef = useRef<VirtuosoHandle | null>(null)
   activeRef.current = active
 
+  const prompts = useMemo(() => buildRailPrompts(messages), [messages])
+  const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom)
+  /** Measured distance from the transcript tail. `null` means the real scroller
+   *  is not mounted (unit-test double), so only the explicit follow flag decides. */
+  const tailDistance = useCallback(() => {
+    const scroller = containerRef.current?.querySelector<HTMLElement>('[data-testid="virtuoso-scroller"]')
+    if (!scroller) return null
+    return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight
+  }, [containerRef])
+  /** Follow while the user follows, and while the newest row is still on
+   *  screen: a nudge inside that band is not a decision to leave the tail, and
+   *  letting it stick would freeze the transcript with the just-sent message at
+   *  the bottom edge while the assistant's answer streams off-screen. */
+  const shouldFollowTail = useCallback(() => {
+    if (followIntentRef.current) return true
+    const distance = tailDistance()
+    return distance !== null && distance <= TRANSCRIPT_TAIL_SLACK_PX
+  }, [tailDistance])
+
   const clearPinFrame = useCallback(() => {
     if (pinFrameRef.current !== null) cancelAnimationFrame(pinFrameRef.current)
     pinFrameRef.current = null
     pinAttemptsRef.current = 0
   }, [])
   const requestPin = useCallback(() => {
-    if (!activeRef.current || !followIntentRef.current) return
+    if (!activeRef.current || !shouldFollowTail()) return
     pinGenerationRef.current += 1
     pinIssuedGenerationRef.current = -1
     pendingPinRef.current = true
@@ -109,7 +128,7 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
     if (pinFrameRef.current !== null) return
     const attempt = () => {
       pinFrameRef.current = null
-      if (!activeRef.current || !followIntentRef.current || !pendingPinRef.current) return
+      if (!activeRef.current || !shouldFollowTail() || !pendingPinRef.current) return
       const generation = pinGenerationRef.current
       const handle = virtuosoRef.current
       if (handle) {
@@ -124,7 +143,7 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
       }
     }
     pinFrameRef.current = requestAnimationFrame(attempt)
-  }, [])
+  }, [shouldFollowTail])
   const cancelFollow = useCallback(() => {
     if (!activeRef.current) return
     followIntentRef.current = false
@@ -142,8 +161,6 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
     else if (transcriptRef.current === previous) assignVirtuosoRef(transcriptRef, null)
   }, [transcriptRef])
 
-  const prompts = useMemo(() => buildRailPrompts(messages), [messages])
-  const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom)
   const activeId = seekingId ?? viewportActiveId
   useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom])
   useLayoutEffect(() => {
@@ -159,8 +176,24 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
     requestPin()
   }, [active, clearPinFrame, requestPin])
   useLayoutEffect(() => {
-    if (active && followIntentRef.current) requestPin()
-  }, [active, messages, requestPin])
+    if (active && shouldFollowTail()) requestPin()
+  }, [active, messages, requestPin, shouldFollowTail])
+  /** A newly appended human prompt re-anchors the tail: the answer to the
+   *  message just sent must never stream below the fold. Keyed on the NEWEST
+   *  prompt id, so paging older history (which prepends prompts and leaves the
+   *  newest one untouched) never yanks a reader back to the bottom. */
+  const tailPromptId = prompts.length > 0 ? prompts[prompts.length - 1].id : null
+  const tailPromptIdRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    const previous = tailPromptIdRef.current
+    tailPromptIdRef.current = tailPromptId
+    if (!active || !tailPromptId || tailPromptId === previous) return
+    followIntentRef.current = true
+    userDetachedRef.current = false
+    userDetachedSawAwayRef.current = false
+    setSeekingId(null)
+    requestPin()
+  }, [active, tailPromptId, requestPin])
   useLayoutEffect(() => {
     if (!active || !transcriptRef) return
     const handle = virtuosoRef.current
@@ -237,7 +270,7 @@ export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, 
   }
   return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef} onWheelCapture={handleWheel} onTouchStartCapture={handleTouchStart} onTouchMoveCapture={handleTouchMove}>
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />
-    <MessageList ref={setVirtuosoHandle} stateKey={stateKey} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} onLoadOlder={onLoadOlder} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} onJump={jump} />
+    <MessageList ref={setVirtuosoHandle} stateKey={stateKey} messages={messages} active={active} shouldFollow={shouldFollowTail} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} onLoadOlder={onLoadOlder} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} onJump={jump} />
     {waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}
     {active && !atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>

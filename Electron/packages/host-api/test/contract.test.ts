@@ -687,6 +687,37 @@ function transportBackend(handle?: HostBackend['handle']): HostBackend & { close
 }
 
 describe('Host API v2 transport contract', () => {
+  it('queues a startup burst below the relay cap without losing reads', async () => {
+    const [client, server] = pairedSockets()
+    const finish: Array<() => void> = []
+    let active = 0, peak = 0
+    bindHostBackend(transportBackend(async () => {
+      active += 1; peak = Math.max(peak, active)
+      await new Promise<void>(resolve => finish.push(() => { active -= 1; resolve() }))
+      return []
+    }), server)
+    const host = createWsHost(client)
+    const reads = Array.from({ length: 100 }, () => host.listProjects())
+    expect(client.sent).toHaveLength(8)
+    for (let i = 0; i < reads.length; i++) { finish.shift()!(); await reads[i] }
+    expect(client.sent).toHaveLength(100)
+    expect(peak).toBe(8)
+  })
+
+  it('rejects queued mutations on disconnect without sending them later', async () => {
+    const [client, server] = pairedSockets()
+    bindHostBackend(transportBackend(async () => new Promise(() => {})), server)
+    const controller = new AbortController()
+    const host = createWsHost(client, { signal: controller.signal })
+    const reads = Array.from({ length: 8 }, () => host.listProjects())
+    const mutation = host.sendPrompt('session', 'must remain unsent')
+    controller.abort()
+    const settled = await Promise.allSettled([...reads, mutation])
+    expect(settled.every(result => result.status === 'rejected')).toBe(true)
+    expect(client.sent).toHaveLength(8)
+    expect(client.sent.some(raw => JSON.parse(raw).method === 'sendPrompt')).toBe(false)
+  })
+
   it('parses request/response/event and rejects bad version or shape', () => {
     expect(parseHostWireFrame({ protocolVersion: 2, id: '1', type: 'request', method: 'listProjects', params: [] })).toEqual({
       ok: true,
@@ -786,6 +817,20 @@ describe('Host API v2 transport contract', () => {
     const pending = host.listProjects()
     client.emit('error', {})
     await expect(pending).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+  })
+
+  it('retires pending mutations when the owner aborts a half-open socket without replay', async () => {
+    const [client, server] = pairedSockets()
+    let calls = 0
+    bindHostBackend(transportBackend(async () => { calls += 1; return new Promise(() => {}) }), server)
+    const controller = new AbortController()
+    const host = createWsHost(client, { signal: controller.signal })
+    const pending = host.sendPrompt('session-1', 'send once')
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+    expect(client.readyState).toBe(1)
+    await expect(host.listProjects()).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+    expect(calls).toBe(1)
   })
 
   it('rejects a hanging WebSocket RPC after requestTimeoutMs and forgets the pending id', async () => {

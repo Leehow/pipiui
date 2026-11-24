@@ -13,6 +13,7 @@ import type { DocumentRendererProps } from '@pipiui/extension-api'
 import { disposeWorkbenchContributions } from './workbench/workbench-contributions'
 import { useActiveProductExtensions } from './workbench/workbench-runtime'
 import { disposeHeaderActions } from './workbench/header-actions'
+import { disposeComposerActions } from './workbench/composer-actions'
 
 export { BUILTIN_EXTENSION_ID }
 export type { Disposer }
@@ -394,4 +395,5 @@ export function disposeUiContributions(extId: string): void {
   disposeStatusBarItems(extId)
   disposeWorkbenchContributions(extId)
   disposeHeaderActions(extId)
+  disposeComposerActions(extId)
 }

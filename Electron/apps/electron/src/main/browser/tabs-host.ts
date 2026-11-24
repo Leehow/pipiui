@@ -38,6 +38,7 @@ import { buildBrowserDebugEnvelope } from './debug-envelope.js'
 import { awaitLoadURL, awaitPageEvaluate, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_PAGE_EVALUATE_STRIKES, BROWSER_PAGE_EVALUATE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, BrowserPageDiscardedError, BrowserPageUnresponsiveError, NavigationSettle } from './navigation-settle.js'
 import { nativeViewUsable, traceBrowserAction, traceBrowserNative } from './native-view.js'
 import { sanitizeWithController } from './redaction.js'
+import { JevBrowserAdapter } from './jev-adapter.js'
 import type {
   BrowserCertificateErrorAppLike,
   BrowserCertificateErrorListener,
@@ -89,6 +90,7 @@ import {
  * creates a view per tab.
  */
 export class BrowserTabsHost {
+  private jevRun?: { adapter: JevBrowserAdapter; target: BrowserViewportKind }
   private readonly tabs: BrowserTabRecord[] = []
   private readonly listeners = new Set<(event: BrowserSpaceEvent) => void>()
   private readonly revealWaiters = new Set<() => void>()
@@ -351,6 +353,31 @@ export class BrowserTabsHost {
       if (options.reveal !== false) await this.revealForTool()
       const resolved = this.resolveToolTargets(request)
       if ('error' in resolved) return { ok: false, error: resolved.error }
+      if (request.action.startsWith('jev_')) {
+        if (resolved.kinds.length !== 1) return { ok: false, code: 'jev-single-viewport-required' }
+        const kind = resolved.kinds[0]
+        if (request.action === 'jev_begin') {
+          if (this.jevRun) return { ok: false, code: 'jev-browser-busy' }
+          if (request.url) await this.loadURLForTool(request.url)
+          const pane = await this.ensureToolPage(kind)
+          if (!pane.view || !this.active) return { ok: false, code: 'jev-page-unavailable' }
+          const contents = pane.view.webContents
+          const tabId = this.active.id
+          const adapter = new JevBrowserAdapter(contents, () => this.active?.id === tabId && pane.view?.webContents === contents && pane.shownTabId === tabId)
+          this.jevRun = { adapter, target: kind }
+          return { ok: true, lease: adapter.lease, viewportTarget: kind }
+        }
+        const run = this.jevRun
+        if (!run || run.adapter.lease !== request.jev_lease || run.target !== kind) return { ok: false, code: 'jev-lease-expired' }
+        try {
+          if (request.action === 'jev_end') { run.adapter.close(); this.jevRun = undefined; return { ok: true } }
+          if (request.action === 'jev_sanitize') return { ok: true, result: await run.adapter.sanitize(request.cdp_params) }
+          if (request.action === 'jev_cdp') return { ok: true, result: await run.adapter.command(request.cdp_method ?? '', request.cdp_params ?? {}) }
+          return { ok: false, code: 'jev-command-denied' }
+        } catch (error) {
+          return { ok: false, code: error instanceof Error && /^jev-[a-z-]+$/.test(error.message) ? error.message : 'jev-browser-failed' }
+        }
+      }
       // A tool action that would dispatch into the page must not race an
       // in-flight main-frame commit (tool/UI navigation, sibling-pane sync, or an
       // organic link click): the evaluate would land on the outgoing document
@@ -539,6 +566,8 @@ export class BrowserTabsHost {
       ok: true,
       target: 'both',
       images: shots.map(shot => ({
+        url: shot.url,
+        tabId: shot.tabId,
         viewport: shot.viewport as BrowserViewportKind,
         base64: String(shot.base64),
         mimeType: String(shot.mimeType ?? 'image/png'),
@@ -556,8 +585,13 @@ export class BrowserTabsHost {
     const wasVisible = view?.getVisible?.() ?? this.isPresented(kind)
     if (wakeHiddenMobile) view?.setVisible?.(true)
     try {
-      const view = pane.view
-      const image = await view?.webContents.capturePage?.(undefined, {
+      const started = this.pageContext(kind)
+      const epoch = this.documentEpoch
+      const contents = started.contents
+      const url = contents?.getURL?.()
+      if (!url) return { ok: false, error: `browser screenshot URL is unavailable for ${kind}` }
+      const drifted = () => this.contextDrift(started) || this.documentEpoch !== epoch || contents?.getURL?.() !== url
+      const image = await contents?.capturePage?.(undefined, {
         stayHidden: kind === 'mobile' ? false : !this.isPresented('desktop')
       })
       if (!image) return { ok: false, error: `browser screenshot is unavailable for ${kind}` }
@@ -565,7 +599,12 @@ export class BrowserTabsHost {
       if (!png) return { ok: false, error: `browser screenshot is empty for ${kind}` }
       const bytes = Buffer.from(png)
       if (bytes.length === 0) return { ok: false, error: `browser screenshot is empty for ${kind}` }
-      return { ok: true, base64: bytes.toString('base64'), mimeType: 'image/png', viewport: kind, width: preset.width, height: preset.height }
+      if (drifted()) return { ok: false, code: 'navigation_interrupted', error: 'browser page changed during screenshot capture' }
+      // Sanitize only provenance, never the PNG, using the existing page redactor.
+      const metadata = await sanitizeWithController(pane, kind, { ok: true, url, tabId: started.tabId })
+      if (drifted()) return { ok: false, code: 'navigation_interrupted', error: 'browser page changed during screenshot capture' }
+      if (!metadata.ok) return metadata
+      return { ok: true, base64: bytes.toString('base64'), mimeType: 'image/png', url: metadata.url, tabId: metadata.tabId, viewport: kind, width: preset.width, height: preset.height }
     } finally {
       if (wakeHiddenMobile) view?.setVisible?.(wasVisible)
     }
@@ -1109,6 +1148,8 @@ export class BrowserTabsHost {
 
   /** Session deletion is terminal: destroy its page and erase that partition's browsing data. */
   async dispose(clearStorage = false): Promise<void> {
+    this.jevRun?.adapter.close()
+    this.jevRun = undefined
     this.certificateErrorApp?.off?.('certificate-error', this.handleAppCertificateError)
     this.bounds = hiddenBounds
     this.revealWaiters.forEach(resolve => resolve())

@@ -1,0 +1,12 @@
+plugins { id 'com.android.application' version '8.8.0' }
+android {
+    namespace 'cn.deepwood.pipiui'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'cn.deepwood.pipiui'
+        minSdk 26
+        targetSdk 35
+        versionCode 2
+        versionName '0.1.1'
+    }
+}

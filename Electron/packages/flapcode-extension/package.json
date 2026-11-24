@@ -1,6 +1,6 @@
 {
   "name": "@pipiui/flapcode-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Flapcode (Codex relay) Responses provider — API key lives in the extension secret vault, never in settings JSON / models.json",
@@ -17,7 +17,7 @@
     "clean": "rm -rf agent/dist"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@pipiui/extension-api": "*",
     "typescript": "^5.6.3"
   },

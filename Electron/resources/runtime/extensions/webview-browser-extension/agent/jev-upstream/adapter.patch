@@ -1,0 +1,172 @@
+--- a/jev_ultrafast/agent.py
++++ b/jev_ultrafast/agent.py
+@@ -10,13 +10,15 @@
+ 
+ 
+ class Agent:
+-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
++    def __init__(self, url, goals, *, record_dir=None, screenshots=False, browser=None, choose_fn=None, text_fn=None):
+         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
+         if not task:
+             raise ValueError("Supply a task")
+         plan = [task]
+         self.pending_text = None
+-        self.browser = Browser(url)
++        self.browser = browser if browser is not None else Browser(url)
++        self.choose = choose_fn or choose
++        self.text = text_fn or field_text
+         self.record_dir = Path(record_dir) if record_dir else None
+         self.screenshots = screenshots or bool(record_dir)
+         try:
+@@ -74,7 +76,7 @@
+                 raise ValueError("This run has stopped. Start a fresh demo.")
+             if len(state["decisions"]) >= MAX_STEPS * 2:
+                 raise ValueError("Reached the demo's model-call budget")
+-            state["decision"] = choose(state["page"], state["goal"], state["history"])
++            state["decision"] = self.choose(state["page"], state["goal"], state["history"])
+             state["decisions"].append(
+                 {
+                     **state["decision"],
+@@ -110,7 +112,7 @@
+                 if self.pending_text and self.pending_text[0] == context:
+                     _, text, helper = self.pending_text
+                 else:
+-                    text, helper = field_text(context)
++                    text, helper = self.text(context)
+                     self.pending_text = (context, text, helper)
+                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+             # Browser.act checks freshness immediately before input, including after text generation.
+--- a/jev_ultrafast/browser.py
++++ b/jev_ultrafast/browser.py
+@@ -6,19 +6,28 @@
+ import time
+ from pathlib import Path
+ 
+-from browser_harness.admin import ensure_daemon
+-from browser_harness.helpers import cdp
+ 
+ # Atomically read visible content and controls, preserving actual DOM node identity.
+ READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+ MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+ 
++def cdp(method, **params):
++    from browser_harness.helpers import cdp as harness_cdp
++    return harness_cdp(method, **params)
++
++
+ class StalePage(ValueError):
+     """A decision no longer refers to the observed page."""
+ 
+ 
+ class Browser:
+-    def __init__(self, url):
++    def __init__(self, url, *, transport=None):
++        self.transport = transport
++        if transport is not None:
++            self.target = None
++            self.session = None
++            return
++        from browser_harness.admin import ensure_daemon
+         ensure_daemon()
+         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+@@ -33,7 +42,7 @@
+             time.sleep(0.02)
+ 
+     def call(self, method, **params):
+-        return cdp(method, session_id=self.session, **params)
++        return self.transport(method, params) if self.transport is not None else cdp(method, session_id=self.session, **params)
+ 
+     def evaluate(self, expression):
+         response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+@@ -77,7 +86,7 @@
+         for attempt in range(10):
+             try:
+                 return browser_operation(
+-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
++                    {"operation": "observe", "session": self.session, "screenshot": screenshot}, self.call
+                 )
+             except StalePage:
+                 if attempt == 9:
+@@ -102,7 +111,7 @@
+             raise StalePage("Page changed since this decision. Observe again.")
+         if action["kind"] == "wait":
+             time.sleep(0.1)
+-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
++        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text}, self.call)
+         self.after_input = action if action["kind"] != "wait" else None
+         return result
+ 
+@@ -117,12 +126,12 @@
+     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+ 
+ 
+-def browser_operation(request):
++def browser_operation(request, transport=None):
+     operation = request["operation"]
+     session = request["session"]
+ 
+     def call(method, **params):
+-        return cdp(method, session_id=session, **params)
++        return transport(method, **params) if transport is not None else cdp(method, session_id=session, **params)
+ 
+     def evaluate(expression):
+         result = call("Runtime.evaluate", expression=expression, returnByValue=True)
+--- a/jev_ultrafast/model.py
++++ b/jev_ultrafast/model.py
+@@ -5,14 +5,17 @@
+ import os
+ import time
+ 
+-import httpx
+ 
+ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+ 
+-CLIENT = httpx.Client(http2=True, timeout=25)
++CLIENT = None
+ 
+ 
+ def post_json(url, key, body):
++    import httpx
++    global CLIENT
++    if CLIENT is None:
++        CLIENT = httpx.Client(http2=True, timeout=25)
+     for attempt in range(3):
+         try:
+             response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+@@ -78,7 +81,7 @@
+     return elements, targets, controls
+ 
+ 
+-def choose(state, goal, history):
++def choose(state, goal, history, *, request=post_json):
+     elements, targets, controls = action_space(state["actions"])
+     labels = {
+         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
+@@ -116,7 +119,7 @@
+         "questions": questions,
+     }
+     started = time.perf_counter()
+-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
++    result = request("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
+     operation = operation_answer["choice"]
+     target = None
+@@ -157,7 +160,7 @@
+     }
+ 
+ 
+-def field_text(context):
++def field_text(context, *, request=post_json):
+     key = os.environ.get("TEXT_MODEL_API_KEY")
+     if not key:
+         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
+@@ -167,7 +170,7 @@
+     if os.environ.get("TEXT_MODEL_REASONING") == "none":
+         reasoning = {"reasoning": {"enabled": False}}
+     started = time.perf_counter()
+-    result = post_json(
++    result = request(
+         base + "/chat/completions",
+         key,
+         {

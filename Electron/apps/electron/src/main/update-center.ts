@@ -12,7 +12,7 @@ export type UpdateCatalogItem = {
   name: string
   category: UpdateCenterItemCategory
   currentVersion: string
-  source: { type: 'npm'; packageName: string } | { type: 'pypi'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' } | { type: 'githubReleases'; owner: string; repo: string }
+  source: { type: 'npm'; packageName: string } | { type: 'pypi'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' } | { type: 'githubReleases'; owner: string; repo: string } | { type: 'githubCommits'; owner: string; repo: string; ref: string }
   /** Owning bundled extension when this item was discovered from a manifest `updateComponents` declaration. */
   ownerExtensionId?: string
   ownerExtensionName?: string
@@ -157,7 +157,7 @@ export function latestNodeVersion(payload: unknown): string | undefined {
 
 /** Wire fields every outcome must carry, so category/ownership/source survive check failures. */
 function itemBase(item: UpdateCatalogItem): Omit<UpdateCenterItem, 'status' | 'latestVersion' | 'error'> {
-  const sourceLabel = item.source.type === 'githubReleases' ? `${item.source.owner}/${item.source.repo}` : item.sourceLabel
+  const sourceLabel = item.source.type === 'githubReleases' || item.source.type === 'githubCommits' ? `${item.source.owner}/${item.source.repo}` : item.sourceLabel
   return {
     id: item.id,
     name: item.name,
@@ -167,7 +167,11 @@ function itemBase(item: UpdateCatalogItem): Omit<UpdateCenterItem, 'status' | 'l
     ...(item.ownerExtensionId ? { ownerExtensionId: item.ownerExtensionId } : {}),
     ...(item.ownerExtensionName ? { ownerExtensionName: item.ownerExtensionName } : {}),
     ...(item.transactional ? { transactional: true } : {}),
-    currentVersion: item.currentVersion
+    currentVersion: item.currentVersion,
+    ...(item.source.type === 'githubCommits' ? {
+      gitSource: { owner: item.source.owner, repo: item.source.repo, ref: item.source.ref },
+      upstreamUrl: `https://github.com/${item.source.owner}/${item.source.repo}`,
+    } : {})
   }
 }
 
@@ -206,10 +210,29 @@ export function createUpdateCenterService(options: {
   return async () => {
     const catalog = typeof options.catalog === 'function' ? await options.catalog() : options.catalog
     const items = await Promise.all(catalog.map(async item => {
-      if (!parseSemver(item.currentVersion)) return checkedItem(item, '')
+      if (item.source.type !== 'githubCommits' && !parseSemver(item.currentVersion)) return checkedItem(item, '')
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
+        if (item.source.type === 'githubCommits') {
+          const { owner, repo, ref } = item.source
+          if (!/^[0-9a-f]{40}$/.test(item.currentVersion)) return { ...itemBase(item), status: 'notCheckable' as const, error: '本机提交标识无效' }
+          const api = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+          const request = async (url: string) => {
+            const response = await fetcher(url, { signal: controller.signal, headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } })
+            if (!response.ok) throw new Error(`版本服务返回 HTTP ${response.status}`)
+            return await response.json() as any
+          }
+          const head = await request(`${api}/commits/${encodeURIComponent(ref)}`)
+          const latestVersion = head?.sha
+          if (typeof latestVersion !== 'string' || !/^[0-9a-f]{40}$/.test(latestVersion)) throw new Error('上游返回了无效提交标识')
+          if (latestVersion === item.currentVersion) return { ...itemBase(item), latestVersion, status: 'upToDate' as const }
+          const comparison = await request(`${api}/compare/${item.currentVersion}...${latestVersion}`)
+          const base = { ...itemBase(item), latestVersion, compareUrl: `https://github.com/${owner}/${repo}/compare/${item.currentVersion}...${latestVersion}` }
+          if (comparison?.status === 'ahead' && comparison?.ahead_by > 0) return { ...base, status: 'updateAvailable' as const }
+          if (comparison?.status === 'identical') return { ...base, status: 'upToDate' as const }
+          return { ...base, status: 'notCheckable' as const, error: '上游分支发生回退或分叉，请先查看变更' }
+        }
         const url = item.source.type === 'npm'
           ? `https://registry.npmjs.org/${encodeURIComponent(item.source.packageName)}`
           : item.source.type === 'pypi'
@@ -252,10 +275,15 @@ export function createUpdateCenterService(options: {
 export function withUpdateCenter(
   backend: HostBackend,
   checkForUpdates: () => Promise<UpdateCenterSnapshot>,
-  updateExtensionComponent?: (extensionId: string, componentId?: string) => Promise<ExtensionComponentUpdateResult>
+  updateExtensionComponent?: (extensionId: string, componentId?: string) => Promise<ExtensionComponentUpdateResult>,
+  applyOfficialUpdate?: (action: unknown, id: unknown, version: unknown) => Promise<void>
 ): HostBackend {
   return {
     handle: (method, params) => {
+      if (method === 'applyOfficialUpdate') {
+        if (!applyOfficialUpdate || params.length !== 3) return Promise.reject(new Error('invalid official update request'))
+        return applyOfficialUpdate(params[0], params[1], params[2])
+      }
       if (method === 'checkForUpdates') {
         return params.length ? Promise.reject(new Error('checkForUpdates takes no parameters')) : checkForUpdates()
       }

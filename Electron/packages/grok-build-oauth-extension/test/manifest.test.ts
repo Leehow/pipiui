@@ -31,9 +31,7 @@ describe("grok-build-oauth manifest (generic auth contribution)", () => {
     expect(result.manifest.name).toBe("Grok Build");
     expect(result.manifest.auth?.provider.id).toBe("grok-build");
     expect(result.manifest.auth?.provider.oauth).toBe(true);
-    expect(result.manifest.auth?.provider.models.map((model) => model.id)).toEqual([
-      ...GROK_BUILD_CONVERSATION_MODEL_IDS,
-    ]);
+    expect(result.manifest.auth?.provider.models).toEqual([]);
     expect(result.manifest.capabilities).toEqual(
       expect.arrayContaining(["bridge.emit", "invoke.agent", "stream.render"]),
     );

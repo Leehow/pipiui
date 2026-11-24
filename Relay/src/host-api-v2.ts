@@ -21,9 +21,13 @@ export const DEFAULT_V2_LIMITS = {
   maxRooms: 4_096,
   maxClients: 8_192,
   maxRequestBytes: 8 * 1_024 * 1_024,
-  maxResponseBytes: 8 * 1_024 * 1_024,
+  // A real all-session listAgents snapshot is already ~12 MB. The host's
+  // whole-message API needs more room than browser commands: the old 8 MiB
+  // limit closed the host at 1009 and stranded unrelated startup requests.
+  maxResponseBytes: 32 * 1_024 * 1_024,
   maxInflight: 32,
-  maxQueuedBytes: 8 * 1_024 * 1_024,
+  // The forwarding queue must also admit one supported host response.
+  maxQueuedBytes: 32 * 1_024 * 1_024,
   helloTimeoutMs: 5_000,
   claimWindowMs: 60_000,
   maxClaimAttemptsPerIP: 30,

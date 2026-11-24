@@ -25,6 +25,7 @@
       { "id": "grok-build-oauth", "version": "^0.2.0" },
       { "id": "memory-extension", "version": "^0.1.0" },
       { "id": "office-extension", "version": "^0.1.0" },
+      { "id": "openai-fast", "version": "^0.1.0" },
       { "id": "pdf-extension", "version": "^0.1.0" },
       { "id": "pi-ext", "version": "^1.0.0" },
       { "id": "pi-goal", "version": "^1.0.0" },

@@ -3,6 +3,7 @@ import { createWsHost, type PipiHostAPI, type WebSocketLike } from '@pipi/host-a
 export type BrowserSocket = WebSocketLike & {
   close(): void
   addEventListener(type: string, listener: (event?: any) => void, options?: { once?: boolean }): void
+  removeEventListener(type: string, listener: (event?: any) => void): void
 }
 
 export type BrowserHostOptions = {

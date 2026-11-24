@@ -41,6 +41,7 @@ import {
 	sharedPerMainRepoSerialQueueV1,
 } from "./queue.ts";
 import { evaluateAutoMergeReadinessV1 } from "./policy.ts";
+import { retainWorktreeMergePolicyV1 } from "./merge-policy.ts";
 import {
 	sweepLeftoverWorktreesV1,
 	type LeftoverWorktreeLeaseHooksV1,
@@ -381,6 +382,8 @@ export class WorktreeFinalizationServiceV1 {
 			throw new TypeError(`invalid worktree finalization input: ${decoded.diagnostics.map((entry) => `${entry.path}: ${entry.message}`).join("; ")}`);
 		}
 		const input = decoded.value;
+		input.worktree.ownership.mergePolicy = retainWorktreeMergePolicyV1(input.mainCwd, input.agentId,
+			previous?.input.worktree.ownership.mergePolicy === "never" ? "never" : input.worktree.ownership.mergePolicy);
 		let repositoryKey: string;
 		try {
 			repositoryKey = await this.adapter.repositoryKey(input.mainCwd);
@@ -400,6 +403,10 @@ export class WorktreeFinalizationServiceV1 {
 			throw new TypeError(`invalid worktree finalization state: ${decoded.diagnostics.map((entry) => `${entry.path}: ${entry.message}`).join("; ")}`);
 		}
 		const previous = decoded.value;
+		previous.input.worktree.ownership.mergePolicy = retainWorktreeMergePolicyV1(
+			previous.input.mainCwd, previous.input.agentId, previous.input.worktree.ownership.mergePolicy,
+		);
+		if (previous.input.worktree.ownership.mergePolicy === "never") return this.finalize(previous.input, previous);
 		if (previous.result.merge === "merged" || previous.result.merge === "already-integrated") {
 			let repositoryKey: string;
 			try {
@@ -573,6 +580,9 @@ export class WorktreeFinalizationServiceV1 {
 				updatedAt: iso(this.clock),
 			});
 		}
+		// Re-read at the serialized boundary: a queued older auto request cannot undo
+		// a never declaration made while it was waiting for the repository lock.
+		input.worktree.ownership.mergePolicy = retainWorktreeMergePolicyV1(input.mainCwd, input.agentId, input.worktree.ownership.mergePolicy);
 		const readiness = evaluateAutoMergeReadinessV1(input, inspection);
 		result.disposition = readiness.disposition;
 		result.ownership = readiness.ownership;

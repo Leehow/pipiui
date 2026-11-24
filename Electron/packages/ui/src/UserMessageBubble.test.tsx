@@ -83,3 +83,14 @@ describe('UserMessageBubble', () => {
     expect(screen.queryByText(/UNIQUE_FULL_TEXT_MARKER/)).toBeNull()
   })
 })
+
+describe('UserMessageBubble long-token layout contract', () => {
+  it('breaks unbreakable tokens so a pasted key stays inside the bubble', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const css = readFileSync(join(import.meta.dirname, 'message-actions.css'), 'utf8')
+    // Mirrors the assistant side's overflow-wrap:anywhere (app.css): without a
+    // break opportunity a pasted secret paints past the bubble and is clipped.
+    expect(css).toMatch(/\.user-message-content\s*\{[^}]*white-space:\s*pre-wrap[^}]*overflow-wrap:\s*anywhere/)
+  })
+})

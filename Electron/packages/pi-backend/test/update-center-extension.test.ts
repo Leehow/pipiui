@@ -32,6 +32,20 @@ function intent(overrides: Partial<PipiuiUpdateEvaluationIntentFields> = {}): st
 }
 
 describe("pipiui update center extension seam", () => {
+  it('accepts a commit evaluation intent and preserves the reviewed-source workflow', async () => {
+    const { handler } = await loadInputHandler();
+    const fields: PipiuiUpdateEvaluationIntentFields = { id: 'webview-browser-extension:browser-use-jev', name: 'Browser Use Jev',
+      currentVersion: 'a'.repeat(40), latestVersion: 'b'.repeat(40), gitSource: { owner: 'browser-use', repo: 'jev-ultrafast', ref: 'main' } };
+    const result: any = await handler({ type: 'input', source: 'rpc', text: encodePipiuiUpdateEvaluationIntent(fields) });
+    expect(result.text).toContain('现在只做第一阶段调查，不要实施更新');
+    expect(result.text).toContain('sync-jev-upstream.mjs --check');
+    expect(result.text).toContain('批准实施后');
+    expect(result.text).toContain(`/compare/${fields.currentVersion}...${fields.latestVersion}`);
+    for (const gitSource of [{ owner: 'browser-use', repo: 'jev-ultrafast', ref: '../escape' }, { owner: 'evil\ncommand', repo: 'repo', ref: 'main' }]) {
+      const denied: any = await handler({ type: 'input', source: 'rpc', text: encodePipiuiUpdateEvaluationIntent({ ...fields, gitSource }) });
+      expect(denied.text).toContain('intent 无效');
+    }
+  });
   it("expands host-api intents for runtime, platform, toolchain, and extension components with the full two-stage policy", async () => {
     const { handler, on } = await loadInputHandler();
     expect(on).toHaveBeenCalledTimes(1);

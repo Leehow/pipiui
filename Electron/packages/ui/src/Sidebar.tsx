@@ -172,8 +172,10 @@ export interface SidebarProps {
   onViewOriginalSession?: (sessionId: string) => void
   onUnarchiveSession?: (sessionId: string) => void
   /** Opens the app's settings surface (Swift sidebar footer gear parity). */
+  onShowUpdates?: () => void
   onOpenSettings?: () => void
   onOpenComputerUse?: () => void
+  onOpenMobile?: () => void
   onOpenRemote?: () => void
   onOpenSubagentModels?: () => void
   /** Current resolved mode for the manual theme toggle (drives label + glyph). */
@@ -625,8 +627,10 @@ export function Sidebar(props: SidebarProps) {
     onViewOriginalSession,
     onUnarchiveSession,
     onOpenSettings,
+    onShowUpdates,
     onOpenComputerUse,
     onOpenRemote,
+    onOpenMobile,
     onOpenSubagentModels,
     theme,
     onToggleTheme
@@ -846,10 +850,12 @@ export function Sidebar(props: SidebarProps) {
           </div>
         )}
       </div>
-      {(onOpenSettings || onOpenComputerUse || onOpenRemote || onOpenSubagentModels || onToggleTheme) && (
+      {(onOpenMobile || onOpenSettings || onOpenComputerUse || onOpenRemote || onOpenSubagentModels || onToggleTheme) && (
         <footer className="sb-footer" data-testid="sidebar-footer">
+          {onShowUpdates && <button type="button" className="update-center-update" onClick={onShowUpdates}>有更新</button>}
           {onOpenSettings && <button type="button" className="sb-footer-btn" aria-label="设置" title="设置" onClick={onOpenSettings}><FooterIcon src={gearIcon} label="设置" ratio={55 / 56} /></button>}
           {onOpenComputerUse && <button type="button" className="sb-footer-btn" aria-label="桌面控制" title="桌面控制" onClick={onOpenComputerUse}><FooterIcon src={desktopIcon} label="桌面控制" ratio={61 / 53} /></button>}
+          {onOpenMobile && <button type="button" className="sb-footer-btn" aria-label="手机支持" title="手机支持" onClick={onOpenMobile}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/></svg></button>}
           {onOpenRemote && <button type="button" className="sb-footer-btn" aria-label="远程控制" title="远程控制" onClick={onOpenRemote}><FooterIcon src={qrcodeIcon} label="远程控制" ratio={49 / 49} /></button>}
           {onOpenSubagentModels && <button type="button" className="sb-footer-btn" aria-label="Subagent 模型" title="Subagent 模型" onClick={onOpenSubagentModels}><FooterIcon src={personGroupIcon} label="Subagent 模型" ratio={70 / 49} /></button>}
           {onToggleTheme && <button type="button" className="sb-footer-btn" data-testid="sidebar-theme-toggle" aria-label={themeLabel} title={themeLabel} onClick={onToggleTheme}>{theme === 'dark' ? <SfIconSun /> : <SfIconMoon />}</button>}

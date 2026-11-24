@@ -576,7 +576,10 @@ describe("session model recovery after the child catalog goes stale", () => {
 
     await expect(
       fixture.backend.handle("setModel", ["session-1", "relay", "never-configured"]),
-    ).rejects.toThrow(/Model not found: relay\/never-configured/);
+    ).rejects.toMatchObject({
+      message: "Model not found: relay/never-configured",
+      details: { stage: "select_model", provider: "relay", modelId: "never-configured" },
+    });
     expect(fixture.spawnCount()).toBe(1);
   });
 });

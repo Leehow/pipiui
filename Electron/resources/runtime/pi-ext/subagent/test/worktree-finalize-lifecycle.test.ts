@@ -7,6 +7,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { decodeWorktreeFinalizationInputV1, decodeWorktreeFinalizationStateV1 } from "../../../extensions/git-capability/host/worktree/schema.ts";
+import { retainWorktreeMergePolicyV1 } from "../../../extensions/git-capability/host/worktree/merge-policy.ts";
+import { mergeSessionWorktree } from "../../../extensions/git-capability/host/session-merge.ts";
 import { evaluateAutoMergeReadinessV1 } from "../../../extensions/git-capability/host/worktree/policy.ts";
 import { NodeGitWorktreeAdapter } from "../../../extensions/git-capability/host/worktree/adapter.ts";
 import { WorktreeFinalizationServiceV1 } from "../../../extensions/git-capability/host/worktree/service.ts";
@@ -404,6 +407,91 @@ test("acquire during cleanup critical section cannot steal ownership", async (t)
 	assert.equal(result.result.cleanup, "cleaned");
 	assert.ok(racedProblem, "racer must fail exclusive create while cleanup holds the lease");
 	assert.match(racedProblem, /already running/);
+});
+
+test("never retains successful unique commits across accept, serialized retry, and a new run", async (t) => {
+	const root = makeRepo();
+	const old = process.env.PIPIUI_WORKTREE_FINALIZER;
+	process.env.PIPIUI_WORKTREE_FINALIZER = "pi";
+	resetRememberedFinalizationsForTests();
+	t.after(() => {
+		resetRememberedFinalizationsForTests();
+		rmSync(root, { recursive: true, force: true });
+		if (old === undefined) delete process.env.PIPIUI_WORKTREE_FINALIZER;
+		else process.env.PIPIUI_WORKTREE_FINALIZER = old;
+	});
+	const worker = addWorker(root, "never-prototype");
+	const head = () => spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+	const mainHead = head();
+	writeFileSync(join(worker.path, "prototype.txt"), "unique prototype\n");
+	git(worker.path, ["add", "prototype.txt"]);
+	git(worker.path, ["commit", "-m", "prototype"]);
+	const request = {
+		agentId: "never-prototype", runId: "prototype-run", mainCwd: root,
+		worktreePath: worker.path, worktreeBranch: worker.branch, role: "worker" as const,
+		terminalState: "ok" as const, mergePolicy: "never" as const,
+		verify: { command: "true", exitCode: 0 },
+	};
+	const first = await finalizeWorktreeIfOwned(request);
+	assert.ok(first);
+	const assertRetained = (state: WorktreeFinalizationStateV1 | undefined) => {
+		assert.ok(state);
+		assert.equal(state.input.worktree.ownership.mergePolicy, "never");
+		assert.equal(state.result.terminal, "ok");
+		assert.equal(state.result.verify.terminal, "passed");
+		assert.equal(state.result.verify.exitCode, 0);
+		assert.equal(state.result.disposition, "retained");
+		assert.equal(state.result.merge, "not-attempted");
+		assert.equal(state.result.cleanup, "not-attempted");
+		assert.equal(state.result.recovery.retryable, false);
+		assert.equal(head(), mainHead);
+		assert.equal(existsSync(worker.path), true);
+		git(root, ["show-ref", "--verify", `refs/heads/${worker.branch}`]);
+	};
+	assertRetained(first);
+	assertRetained(await reenterFinalizeOnBossAccept({ agentId: request.agentId, runId: request.runId, mergePolicy: "auto" }));
+	const decoded = decodeWorktreeFinalizationStateV1(JSON.parse(JSON.stringify(first)));
+	assert.equal(decoded.ok, true);
+	resetRememberedFinalizationsForTests();
+	assertRetained(await new WorktreeFinalizationServiceV1().retry(JSON.parse(JSON.stringify(first))));
+	assertRetained(await reenterFinalizeOnBossAccept({ ...request, mergePolicy: "auto" }));
+	assertRetained(await finalizeWorktreeIfOwned({ ...request, runId: "resumed-run", mergePolicy: undefined }));
+	assert.equal(retainWorktreeMergePolicyV1(root, request.agentId, "auto"), "never");
+});
+
+test("never blocks sweep and session merge too; explicit auto and legacy input still merge", async (t) => {
+	const root = makeRepo();
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const worker = addWorker(root, "session-prototype");
+	retainWorktreeMergePolicyV1(root, "session-prototype", "never");
+	const swept = await sweepLeftoverWorktreesV1({ mainCwd: root, lease: realLeaseHooks(root) });
+	assert.equal(swept.items.find((item) => item.agentId === "session-prototype")?.disposition, "kept-blocked");
+	assert.equal(existsSync(worker.path), true, "even an already-integrated never tree is retained");
+	writeFileSync(join(worker.path, "prototype.txt"), "unique\n");
+	git(worker.path, ["add", "prototype.txt"]);
+	git(worker.path, ["commit", "-m", "prototype"]);
+	const session = await mergeSessionWorktree({ canonicalRoot: root, sessionBranch: worker.branch, worktreePath: worker.path });
+	assert.equal(session.result.disposition, "retained");
+	assert.equal(session.result.merge, "not-attempted");
+	assert.equal(existsSync(join(root, "prototype.txt")), false);
+	for (const mergePolicy of [undefined, "auto"] as const) {
+		const id = mergePolicy ?? "legacy";
+		const ordinary = addWorker(root, id);
+		writeFileSync(join(ordinary.path, `${id}.txt`), "land\n");
+		git(ordinary.path, ["add", `${id}.txt`]);
+		git(ordinary.path, ["commit", "-m", id]);
+		const input = inputFor(root, id, ordinary);
+		input.worktree.ownership.mergePolicy = mergePolicy;
+		const decoded = decodeWorktreeFinalizationInputV1(JSON.parse(JSON.stringify(input)));
+		assert.ok(decoded.ok);
+		assert.equal(decoded.value.worktree.ownership.mergePolicy, mergePolicy);
+		const result = await new WorktreeFinalizationServiceV1().finalize(input);
+		assert.equal(result.result.merge, "merged");
+		assert.equal(existsSync(ordinary.path), false);
+	}
+	const invalid = inputFor(root, "session-prototype", worker);
+	(invalid.worktree.ownership as any).mergePolicy = "sometimes";
+	assert.equal(decodeWorktreeFinalizationInputV1(invalid).ok, false);
 });
 
 test("subagent index.ts parses as TypeScript", () => {

@@ -1,0 +1,11 @@
+{
+  "id": "mobile-support",
+  "name": "手机支持",
+  "version": "0.1.0",
+  "hostApi": ">=1.0.0 <2.0.0",
+  "description": "启用后点击左下角的手机图标，将这台电脑绑定到 PipiUI 安卓账号。",
+  "defaultEnabled": false,
+  "capabilities": [],
+  "app": {"ui": {"panels":[],"settingsSections":[],"slashCommands":[],"themes":[],"statusBar":[]}},
+  "settingsVersion": 1
+}

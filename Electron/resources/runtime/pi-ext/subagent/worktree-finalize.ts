@@ -20,6 +20,7 @@
 import type {
 	WorktreeFinalizationStateV1,
 	WorktreeOwnerRoleV1,
+	WorktreeMergePolicyV1,
 	WorktreeTerminalStateV1,
 } from "../../extensions/git-capability/host/worktree/schema.ts";
 import type {
@@ -85,6 +86,7 @@ export interface FinalizeWorktreeRequest {
 	worktreeBranch: string | undefined;
 	/** `secretary` runs in the main checkout and is never merged; the policy layer enforces that. */
 	role: WorktreeOwnerRoleV1;
+	mergePolicy?: WorktreeMergePolicyV1;
 	terminalState: WorktreeTerminalStateV1;
 	/** The worker's attested verify, kept for audit. `argv` is the only form the runner executes. */
 	verify?: { command?: string; argv?: string[]; exitCode?: number };
@@ -140,6 +142,8 @@ export async function finalizeWorktreeIfOwned(
 	if (!piOwnsWorktreeFinalization(env)) return undefined;
 	const { mainCwd, worktreePath, worktreeBranch } = request;
 	if (!mainCwd || !worktreePath || !worktreeBranch) return undefined;
+	const { retainWorktreeMergePolicyV1 } = await import("../../extensions/git-capability/host/worktree/merge-policy.ts");
+	request = { ...request, mergePolicy: retainWorktreeMergePolicyV1(mainCwd, request.agentId, request.mergePolicy) };
 	rememberFinalization(request);
 
 	// Lazy: finalization asks the mounted Git provider; a disabled provider must not
@@ -203,6 +207,7 @@ export async function finalizeWorktreeIfOwned(
 				ownership: {
 					mode: "isolated",
 					role: request.role,
+					mergePolicy: request.mergePolicy,
 					agentId: request.agentId,
 					runId: request.runId,
 				},
@@ -228,6 +233,7 @@ export async function reenterFinalizeOnBossAccept(input: {
 	worktreePath?: string;
 	worktreeBranch?: string;
 	role?: WorktreeOwnerRoleV1;
+	mergePolicy?: WorktreeMergePolicyV1;
 	terminalState?: WorktreeTerminalStateV1;
 	verify?: FinalizeWorktreeRequest["verify"];
 }): Promise<WorktreeFinalizationStateV1 | undefined> {
@@ -239,6 +245,7 @@ export async function reenterFinalizeOnBossAccept(input: {
 		worktreePath: input.worktreePath ?? remembered?.worktreePath,
 		worktreeBranch: input.worktreeBranch ?? remembered?.worktreeBranch,
 		role: input.role ?? remembered?.role ?? "worker",
+		mergePolicy: remembered?.mergePolicy === "never" ? "never" : input.mergePolicy ?? remembered?.mergePolicy,
 		terminalState: input.terminalState ?? remembered?.terminalState ?? "ok",
 		...(input.verify ?? remembered?.verify ? { verify: input.verify ?? remembered?.verify } : {}),
 		acceptance: { source: "boss" },

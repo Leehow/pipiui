@@ -1,3 +1,4 @@
+import { createMobileAccounts } from "./mobile-accounts.js";
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -270,14 +271,14 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       ? { v: 2, type: "end" }
       : reason === "expired"
         ? { v: 2, type: "expired" }
-        : { v: 2, type: "replaced" };
+        : { v: 2, type: "error", reason: "server_restarting" };
     if (room.host) {
       sendControl(room.host, frame);
-      closePeer(room.host, 1000, reason === "end" ? "host ended" : "link expired");
+      closePeer(room.host, reason === "server_stopped" ? 1012 : 1000, reason === "server_stopped" ? "server restarting" : reason === "end" ? "host ended" : "link expired");
     }
     if (room.browser) {
       sendControl(room.browser, frame);
-      closePeer(room.browser, 1000, reason === "end" ? "host ended" : "link expired");
+      closePeer(room.browser, reason === "server_stopped" ? 1012 : 1000, reason === "server_stopped" ? "server restarting" : reason === "end" ? "host ended" : "link expired");
     }
   };
 
@@ -292,9 +293,11 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     return room;
   };
 
+  const accounts = process.env.PIPIUI_MOBILE_DB ? createMobileAccounts(process.env.PIPIUI_MOBILE_DB, options.publicOrigin, liveRoom) : undefined;
   const authorize = (cookieHeader: string | undefined): Room | undefined => {
     const token = cookieValue(cookieHeader, PAIR_COOKIE);
-    if (!token || !GRANT_TOKEN_RE.test(token)) return undefined;
+    if (!token) return liveRoom(accounts?.selected(cookieHeader) ?? null);
+    if (!GRANT_TOKEN_RE.test(token)) return undefined;
     const digest = sha256utf8(token);
     const room = grants.get(digest.toString("hex"));
     if (!room || !room.grantHash || !exactBuffer(digest, room.grantHash)) {
@@ -620,6 +623,12 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
         room.inflight.clear();
       } else if (room.host === peer) {
         room.host = null;
+        if (room.browser) {
+          // Fail pending reads immediately; the browser must rebuild its Host
+          // API binding after reconnect, not keep an OPEN but useless socket.
+          sendControl(room.browser, { v: 2, type: "error", reason: "host_offline" });
+          closePeer(room.browser, 1012, "host reconnecting");
+        }
         // Expiry is an offline lease: a disconnect starts a fresh full TTL
         // instead of inheriting the remainder of the last attached interval.
         armExpiry(room);
@@ -661,6 +670,10 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     };
     track(peer);
     if (!peers.has(peer)) return;
+    if (accounts && !cookieValue(req.headers.cookie, PAIR_COOKIE)) {
+      const unwatch = accounts.watch(req.headers.cookie, () => socket.close(4001, "account signed out"));
+      socket.once("close", unwatch);
+    }
     attachBrowser(peer, room);
   });
 
@@ -700,8 +713,9 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
   const serveStatic = async (
     res: ServerResponse,
     pathname: string,
+    staticRoot = uiRoot,
   ): Promise<void> => {
-    if (!uiRoot || !existsSync(join(uiRoot, "index.html"))) {
+    if (!staticRoot || !existsSync(join(staticRoot, "index.html"))) {
       if (pathname === "/" || pathname === "/index.html") {
         serveFallback(res);
         return;
@@ -710,7 +724,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       return;
     }
     const requested = pathname === "/" ? "/index.html" : pathname;
-    const filePath = safeStaticPath(uiRoot, requested);
+    const filePath = safeStaticPath(staticRoot, requested);
     if (!filePath) {
       json(res, 404, { error: "not found" });
       return;
@@ -731,7 +745,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     if (await sendFile(filePath)) return;
     const last = requested.split("/").pop() ?? "";
     if (!last.includes(".")) {
-      const index = join(uiRoot, "index.html");
+      const index = join(staticRoot, "index.html");
       if (await sendFile(index)) return;
     }
     json(res, 404, { error: "not found" });
@@ -797,6 +811,10 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       res: ServerResponse,
       url: URL,
     ): boolean {
+      if (accounts && url.pathname.startsWith("/mobile/")) {
+        void accounts.handle(req, res, url.pathname);
+        return true;
+      }
       const claim = PAIR_CLAIM_PATH_RE.exec(url.pathname);
       if (claim) {
         void handleClaim(req, res, claim[1].toLowerCase());
@@ -817,7 +835,8 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       const room = authorize(req.headers.cookie);
       if (!room) return false;
       if (req.method !== "GET" && req.method !== "HEAD") return false;
-      void serveStatic(res, url.pathname);
+      const mobileUI = !cookieValue(req.headers.cookie, PAIR_COOKIE) ? process.env.PIPIUI_MOBILE_UI_DIR : undefined;
+      void serveStatic(res, url.pathname, mobileUI);
       return true;
     },
     handleUpgrade(
@@ -844,7 +863,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
         return true;
       }
       if (url.pathname === BROWSER_WS_PATH) {
-        if (!authorize(req.headers.cookie)) {
+        if ((!cookieValue(req.headers.cookie, PAIR_COOKIE) && req.headers.origin !== options.publicOrigin) || !authorize(req.headers.cookie)) {
           rejectUpgrade(socket, "401 Unauthorized");
           return true;
         }
@@ -861,6 +880,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     },
     async close(): Promise<void> {
       clearInterval(heartbeat);
+      accounts?.close();
       for (const room of [...rooms.values()]) {
         expireRoom(room, "server_stopped", false);
       }

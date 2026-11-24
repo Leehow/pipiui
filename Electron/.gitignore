@@ -36,4 +36,6 @@ dist/
 !resources/runtime/extensions/pdf-extension/vendor/pdf-inspector/node_modules/**
 resources/runtime/extensions/pdf-extension/vendor/pdf-inspector/node_modules/.bin/
 out/
+.jev-python/
+**/__pycache__/
 packages/pi-backend/src/runtime-agents.bundle.mjs

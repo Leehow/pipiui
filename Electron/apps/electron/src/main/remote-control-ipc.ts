@@ -20,6 +20,7 @@ export type RemoteLinkCheck = {
 }
 
 export type RemoteControlState = {
+  mobileLoginUrl?: string
   enabled: boolean
   status: RemoteControlStatus
   pairUrl: string | null
@@ -37,6 +38,7 @@ export type RemoteControlState = {
 
 export type RemoteControlCommand =
   | { type: 'getState' }
+  | { type: 'mobileLogin' }
   | { type: 'start'; relayOrigin?: string }
   | { type: 'stop' }
   | { type: 'reset'; relayOrigin?: string }

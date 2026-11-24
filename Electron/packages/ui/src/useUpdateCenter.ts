@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PipiHostAPI, UpdateCenterSnapshot } from '@pipi/host-api'
+import type { PipiHostAPI, UpdateCenterItem, UpdateCenterSnapshot } from '@pipi/host-api'
 
 export interface UpdateCenterController {
   available: boolean
@@ -8,6 +8,7 @@ export interface UpdateCenterController {
   error: string | null
   /** Extension id currently running a one-click update, if any. */
   updatingExtensionId: string | null
+  officialAction?: (item: UpdateCenterItem) => Promise<void>
   refresh(): Promise<void>
   updateComponent(extensionId: string): Promise<void>
   dismissError(): void
@@ -54,6 +55,27 @@ export function useUpdateCenter(host: PipiHostAPI): UpdateCenterController {
     void refresh()
   }, [refresh])
 
+  useEffect(() => {
+    if (!available) return
+    const timer = window.setInterval(() => { void refresh() }, 4 * 60 * 60 * 1000)
+    return () => window.clearInterval(timer)
+  }, [available, refresh])
+
+  const officialAction = async (item: UpdateCenterItem) => {
+    if (!host.applyOfficialUpdate || !item.latestVersion || updatingExtensionId) return
+    const plugin = item.officialUpdate === 'extension'
+    const action = plugin ? 'extension' : item.downloaded ? 'restart' : 'download'
+    setUpdatingExtensionId(item.id)
+    setError(null)
+    try {
+      await host.applyOfficialUpdate(action, plugin ? item.ownerExtensionId! : item.id, item.latestVersion)
+      if (action !== 'restart') await refresh()
+    } catch (reason) {
+      setError(`更新失败：${reason instanceof Error ? reason.message : String(reason)}`)
+    } finally {
+      setUpdatingExtensionId(null)
+    }
+  }
   const dismissError = useCallback(() => setError(null), [])
 
   const updateComponent = useCallback(async (extensionId: string) => {
@@ -72,5 +94,5 @@ export function useUpdateCenter(host: PipiHostAPI): UpdateCenterController {
     }
   }, [updateComponentMethod, refresh, updatingExtensionId])
 
-  return { available, snapshot, loading, error, updatingExtensionId, refresh, updateComponent, dismissError }
+  return { available, snapshot, loading, error, updatingExtensionId, refresh, updateComponent, dismissError, officialAction: host.applyOfficialUpdate ? officialAction : undefined }
 }

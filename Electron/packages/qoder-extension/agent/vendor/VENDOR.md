@@ -6,6 +6,9 @@ License: MIT — see `ThirdPartyNotices/QoderProvider-LICENSE.txt`.
 
 PipiUI patches (do not drop on the next vendor bump unless upstream fixed them):
 
+- `stream.ts`: Pi 0.86+ provider contexts carry system instructions and tool
+  declarations in transcript messages. Collapse and replay those messages with
+  Pi's transcript helpers before constructing the Qoder request.
 - `models.ts`: `getCachedModelConfig` returns the raw cache entry (no
   `withMaxContextAsDefault`). `getCachedModels` / `updateQoderModelsCache`
   set `contextWindow` from the API `is_default` tier (else `max_input_tokens`).

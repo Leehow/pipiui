@@ -374,3 +374,49 @@
   color: var(--mq-accent) !important;
   font-weight: 600;
 }
+
+.message-queue__item[data-status='failed'] { flex-wrap: wrap; }
+.message-queue__failure {
+  box-sizing: border-box;
+  flex: 0 0 100%;
+  min-width: 0;
+  padding-left: 24px;
+}
+.message-queue__failure summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.message-queue__failure summary::-webkit-details-marker { display: none; }
+.message-queue__failure .message-queue__error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-queue__more, .message-queue__less { flex: none; color: var(--mq-accent); }
+.message-queue__less, .message-queue__failure[open] .message-queue__more { display: none; }
+.message-queue__failure[open] .message-queue__less { display: inline; }
+.message-queue__failure pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  max-height: min(52vh, 28em);
+  overflow-y: auto;
+  margin: 6px 0;
+  padding: 8px;
+  background: var(--mq-input-bg);
+  border-radius: 5px;
+  font: inherit;
+}
+.message-queue__failure button {
+  cursor: pointer;
+  font: inherit;
+  color: var(--mq-accent);
+  background: transparent;
+  border: 1px solid var(--mq-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin-right: 6px;
+}

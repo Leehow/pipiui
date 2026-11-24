@@ -238,6 +238,7 @@ verify_embedded_node_signing() {
 finalize_mac_bundle() {
   local app="$1"
   local embedded_node="$app/Contents/Resources/pipiui-embedded/node/bin/node"
+  local embedded_python="$app/Contents/Resources/pipiui-runtime/extensions/webview-browser-extension/runtime/python/bin/python3.12"
   expected_mac_bundle_is_complete "$app" || {
     echo "ERROR: refusing to sign incomplete Electron bundle: $app" >&2
     return 1
@@ -258,9 +259,17 @@ finalize_mac_bundle() {
   # executables), then containing frameworks/XPCs/helper Apps deepest-first,
   # and only then seal the root App.
   while IFS= read -r nested; do
+    # Keep the vendor-signed OfficeCLI byte-identical to its pinned receipt.
+    if [[ "$nested" == "$app/Contents/Resources/pipiui-runtime/extensions/office-extension/bin/"*/officecli ]]; then
+      codesign --verify --strict --verbose=2 "$nested" || return 1
+      continue
+    fi
     if [[ "$nested" == "$embedded_node" ]]; then
       codesign --sign "$CSC_NAME" --force --timestamp --options runtime \
         --entitlements "$MAC_ENTITLEMENTS" "$nested"
+    elif [[ "$nested" == "$embedded_python" ]]; then
+      codesign --sign "$CSC_NAME" --force --timestamp --options runtime \
+        --entitlements "Electron/apps/electron/entitlements.python.plist" "$nested"
     else
       codesign --sign "$CSC_NAME" --force --timestamp --options runtime "$nested"
     fi
@@ -294,6 +303,12 @@ finalize_mac_bundle() {
   # JIT check is only meaningful after that binary carries the final entitlement.
   # Standalone embedded Node binaries remain fully verified here as well.
   verify_embedded_node_signing "$embedded_node" "$app"
+  if [[ -x "$embedded_python" ]]; then
+    codesign --verify --strict "$embedded_python"
+    if [[ "$(lipo -archs "$embedded_python")" == "$(uname -m)" ]]; then
+      "$embedded_python" -I -B -c 'import sys, json, hashlib, ssl; assert sys.version_info >= (3, 12); print("Embedded Jev Python startup verified")' || return 1
+    fi
+  fi
   codesign --verify --deep --strict --verbose=2 "$app"
 }
 
@@ -343,7 +358,7 @@ package_mac_arch() {
     cd Electron/apps/electron
     CUA_TARGET_PLATFORM=darwin node ../../scripts/fetch-cua-driver.mjs \
       && PIPIUI_EMBEDDED_RUNTIMES_ROOT="$ROOT/Electron/.embedded-runtimes" node ../../scripts/fetch-pi-runtime.mjs --platform darwin --arch "$arch" --check \
-      && PIPIUI_EMBEDDED_RUNTIME_TARGET="darwin-$arch" ../../node_modules/.bin/electron-builder --mac --"$arch" \
+      && node ../../scripts/package-electron-target.mjs --platform darwin --arch "$arch" -- --mac --"$arch" \
            --config.directories.output="$out_dir" ${version_args[@]+"${version_args[@]}"}
   ) 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
@@ -756,7 +771,16 @@ case "$PLATFORM" in
       # and its receipt are published as one atomic container swap to
       # build/PipiUI.release-staged/. The canonical App — running or
       # not — is never touched, moved, or quit, and nothing is installed.
-      publish_release_staged "$run_root"
+      if [[ "${PIPIUI_EDITION:-full}" == "base" ]]; then
+        # Base releases only publish installers; keep the Coding App and its
+        # OfficeCLI-bound installation receipt intact.
+        base_app="$run_root/arm64/mac-arm64/PipiUI.app"
+        base_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$base_app/Contents/Info.plist")"
+        publish_release_artifacts "$ROOT" "$run_root" "$base_version" >/dev/null
+        echo "Published base release artifacts: $base_version (x64+arm64 dmg+zip)"
+      else
+        publish_release_staged "$run_root"
+      fi
     else
     # Canonical single artifact: build/PipiUI.app
     APP_SRC="$run_root/arm64/mac-arm64/PipiUI.app"

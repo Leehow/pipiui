@@ -323,6 +323,74 @@ test("transparent request-response-event forwarding preserves business JSON", as
   }
 });
 
+test("default relay forwards a 12 MiB agent snapshot and keeps subsequent requests alive", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture();
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  const granted = await claim(relay.origin, roomID, secretA);
+  const browser = await connect(relay.browserURL, cookieHeader(granted.headers.get("set-cookie")));
+  await nextFrame(host);
+  try {
+    for (const [id, method, result] of [
+      ["agents", "listAgents", [{ finalResult: "x".repeat(12 * 1_024 * 1_024) }]],
+      ["projects", "listProjects", [{ id: "project" }]],
+    ] as const) {
+      const forwarded = nextFrame(host);
+      browser.send(JSON.stringify({ protocolVersion: 2, type: "request", id, method, params: [] }));
+      assert.equal((await forwarded).id, id);
+      const response = JSON.stringify({ protocolVersion: 2, type: "response", id, ok: true, result });
+      const received = nextRaw(browser);
+      host.send(response);
+      // A host close otherwise leaves the browser waiting without a response.
+      await Promise.race([
+        received.then(raw => assert.equal(raw, response)),
+        once(host, "close").then(([code]) => { throw new Error(`host closed: ${code}`); }),
+      ]);
+    }
+  } finally {
+    browser.close();
+    host.close();
+    await relay.close();
+  }
+});
+
+test("host loss immediately retires the browser with a recoverable close", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture();
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  const granted = await claim(relay.origin, roomID, secretA);
+  const browser = await connect(relay.browserURL, cookieHeader(granted.headers.get("set-cookie")));
+  await nextFrame(host);
+  try {
+    const closed = once(browser, "close");
+    host.close();
+    assert.deepEqual(await nextFrame(browser), { v: 2, type: "error", reason: "host_offline" });
+    assert.equal((await closed)[0], 1012);
+    const rejoined = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+    const replacement = await connect(relay.browserURL, cookieHeader(granted.headers.get("set-cookie")));
+    await nextFrame(rejoined);
+    const request = nextFrame(rejoined);
+    replacement.send(JSON.stringify({ protocolVersion: 2, type: "request", id: "after-rejoin", method: "listProjects", params: [] }));
+    assert.equal((await request).id, "after-rejoin");
+    replacement.close();
+    rejoined.close();
+  } finally { browser.close(); host.close(); await relay.close(); }
+});
+
+test("server shutdown is recoverable and does not masquerade as another browser takeover", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture();
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  const granted = await claim(relay.origin, roomID, secretA);
+  const browser = await connect(relay.browserURL, cookieHeader(granted.headers.get("set-cookie")));
+  await nextFrame(host);
+  const closed = once(browser, "close");
+  const shutdown = relay.close();
+  assert.deepEqual(await nextFrame(browser), { v: 2, type: "error", reason: "server_restarting" });
+  assert.equal((await closed)[0], 1012);
+  await shutdown;
+});
+
 test("second browser claim replaces the first socket and cookie", async () => {
   const roomID = randomUUID();
   const relay = await fixture();

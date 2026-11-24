@@ -50,6 +50,8 @@ export type BrowserChoiceOffer = {
   instanceId: string;
   availability(projectRoot: string, signal?: AbortSignal): Promise<{ ready: boolean; reason?: string }>;
   choose(input: BrowserChoiceInput): Promise<BrowserChoiceOutcome>;
+  /** Host-sanitized request from the pinned upstream policy; same project authority. */
+  evaluate?(input: { projectRoot: string; body: unknown; signal?: AbortSignal }): Promise<{ status: string; reason?: string; response?: unknown }>;
 };
 
 const TARGET_OPS = ["CLICK", "TYPE_TEXT", "SELECT"] as const;
@@ -424,4 +426,31 @@ export async function executeBrowserChoice(
     (payload, built, key) => parseChoice(payload, built, key),
     gate,
   );
+}
+
+export async function evaluateUpstreamChoice(
+  input: { projectRoot: string; body: unknown; signal?: AbortSignal }, deps: JevDeps, gate?: RerankGate,
+): Promise<{ status: string; reason?: string; response?: unknown }> {
+  let generation: string | undefined;
+  return executeDecision(input, { ...deps, deadlineMs: Math.min(deps.deadlineMs ?? 25_000, 25_000) }, key => {
+    if (!isRecord(input.body) || !isRecord(input.body.questions) || !isRecord(input.body.state)) return skip('invalid-upstream-request');
+    const questions = Object.entries(input.body.questions);
+    if (!questions.length || questions.length > 8 || questions.some(([id, q]) =>
+      !['operation', 'click_target', 'type_text_target', 'select_target'].includes(id) || !isRecord(q)
+      || q.type !== 'choice' || !isRecord(q.criteria) || !Object.keys(q.criteria).length || Object.keys(q.criteria).length > 255)) return skip('invalid-upstream-request');
+    const json = redactKnownSecret(JSON.stringify({ model: JEV_MODEL, state: input.body.state, questions: input.body.questions }), key);
+    if (utf8Bytes(json) > JEV_MAX_JSON_BYTES) return skip('budget');
+    return { status: 'ok' as const, json, ids: questions.map(([id]) => id) };
+  }, async signal => {
+    const ready = await checkBrowserAvailability(deps, signal);
+    if (!ready.ready) return ready;
+    if (!boundToProject(input.projectRoot, deps)) return { ready: false, reason: 'project-mismatch' };
+    if (generation && generation !== ready.browserGeneration) return { ready: false, reason: 'browser-generation-mismatch' };
+    generation = ready.browserGeneration;
+    return ready;
+  }, (response, _built, key) => {
+    if (!isRecord(response) || !isRecord(response.answers)) return { status: 'fallback', reason: 'invalid-response' };
+    // The original policy validates selected heads, probability bounds and rounding.
+    return { status: 'applied', response: JSON.parse(redactKnownSecret(JSON.stringify(response), key)) };
+  }, gate);
 }

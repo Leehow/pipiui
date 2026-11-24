@@ -35,6 +35,7 @@ export function UpdateCenter({ updates, onRequestUpdate }: { updates: UpdateCent
       ...(item.ownerExtensionName === undefined ? {} : { ownerExtensionName: item.ownerExtensionName }),
       currentVersion: item.currentVersion,
       latestVersion: item.latestVersion,
+      ...(item.gitSource ? { gitSource: item.gitSource } : {}),
     }))
   }
   if (!updates.available) return <div className="model-modal-state" data-testid="update-center-unsupported">当前连接不支持更新检查。</div>
@@ -45,10 +46,12 @@ export function UpdateCenter({ updates, onRequestUpdate }: { updates: UpdateCent
       {groupedItems(updates.snapshot.items).map(({ category, items }) => <section className="update-center-group" key={category} data-testid={`update-group-${category}`}>
         <header className="update-center-group-header"><div><h3>{CATEGORY_COPY[category].title}</h3><p>{CATEGORY_COPY[category].description}</p></div><span>{items.length} 项</span></header>
         <div className="update-center-group-items">{items.map(item => <div className="update-center-row" key={item.id} data-testid={`update-item-${item.id}`}>
-          <div className="update-center-name"><strong>{item.name}</strong>{item.packageName && item.name !== item.packageName && <span>{item.packageName}</span>}{!item.packageName && item.sourceLabel && <span>{item.sourceLabel}</span>}{item.ownerExtensionName && <span>来自扩展 {item.ownerExtensionName}</span>}</div>
-          <div className="update-center-versions"><span><em>本机</em>{item.currentVersion}</span><span><em>最新</em>{item.latestVersion ?? '—'}</span></div>
+          <div className="update-center-name"><strong>{item.name}</strong>{item.packageName && item.name !== item.packageName && <span>{item.packageName}</span>}{!item.packageName && item.sourceLabel && <span>{item.sourceLabel}</span>}{item.ownerExtensionName && !item.officialUpdate && <span>来自扩展 {item.ownerExtensionName}</span>}{item.gitSource && <span>跟踪上游 {item.gitSource.ref} · 保留 PipiUI 适配</span>}{item.upstreamUrl && <a href={item.upstreamUrl} target="_blank" rel="noreferrer">上游项目</a>}{item.compareUrl && <a href={item.compareUrl} target="_blank" rel="noreferrer">查看变更</a>}</div>
+          <div className="update-center-versions"><span title={item.currentVersion}><em>本机</em>{item.gitSource ? item.currentVersion.slice(0, 12) : item.currentVersion}</span><span title={item.latestVersion}><em>最新</em>{item.gitSource ? item.latestVersion?.slice(0, 12) ?? '—' : item.latestVersion ?? '—'}</span></div>
           <span className={`update-center-status ${item.status}`} title={item.error}>{STATUS_LABEL[item.status]}</span>
-          {item.status === 'updateAvailable' && item.latestVersion && (item.transactional && item.ownerExtensionId
+          {item.status === 'updateAvailable' && item.latestVersion && (item.officialUpdate
+            ? <button type="button" className="update-center-update" disabled={!updates.officialAction || updates.updatingExtensionId !== null} onClick={() => void updates.officialAction?.(item)}>{updates.updatingExtensionId === item.id ? (item.officialUpdate === 'desktop' && !item.downloaded ? '下载中…' : '更新中…') : item.officialUpdate === 'extension' ? '更新插件' : item.downloaded ? '重启并安装' : '下载软件更新'}</button>
+            : item.transactional && item.ownerExtensionId
             ? <button type="button" className="update-center-update" disabled={updates.updatingExtensionId !== null} onClick={() => void updates.updateComponent(item.ownerExtensionId!)}>{updates.updatingExtensionId === item.ownerExtensionId ? '更新中…' : '一键更新'}</button>
             : <button type="button" className="update-center-update" onClick={() => requestUpdate(item)}>评估更新</button>)}
         </div>)}</div>

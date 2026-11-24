@@ -378,6 +378,16 @@ export class ExtensionRegistry {
     return snapshot(entry);
   }
 
+  /** A signed shared-store release or its bundled fallback replaced the same builtin package. */
+  replaceBuiltinPackage(descriptor: ExtensionDescriptor): ExtensionRecord {
+    if (descriptor.origin !== "builtin" || this.entries.get(descriptor.id)?.origin !== "builtin") {
+      throw new ExtensionLifecycleError("expected a replacement for an installed builtin");
+    }
+    this.disposeAll(descriptor.id);
+    this.entries.delete(descriptor.id);
+    return this.ingest(descriptor);
+  }
+
   get(id: string): ExtensionRecord | undefined {
     const entry = this.entries.get(id);
     if (!entry || entry.state === "unloaded") return undefined;

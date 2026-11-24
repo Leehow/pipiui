@@ -17,7 +17,7 @@
     "clean": "rm -rf agent/dist app/dist"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@pipiui/extension-api": "*",
     "typescript": "^5.6.3"
   },

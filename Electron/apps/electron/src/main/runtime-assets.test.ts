@@ -7,9 +7,18 @@ import { CUA_DRIVER_HELPER_APP, MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveCuaDriv
 
 /** The path the built main bundle actually runs from; the dev branch walks up from here. */
 const builtMainDir = fileURLToPath(new URL('../../out/main', import.meta.url))
+const backendPackage = JSON.parse(await readFile(new URL('../../../../packages/pi-backend/package.json', import.meta.url), 'utf8'))
+const preparedPiVersion = backendPackage.dependencies['@earendil-works/pi-coding-agent']
 
 describe('resolveRuntimeAssets', () => {
   let root = ''
+
+  it('keeps the host admission and update catalog on the runtime preparer Pi pin', async () => {
+    const backend = JSON.parse(await readFile(new URL('../../../../packages/pi-backend/package.json', import.meta.url), 'utf8'))
+    const version = backend.dependencies['@earendil-works/pi-coding-agent']
+    expect(MANAGED_RUNTIME_PACKAGE_VERSIONS['@earendil-works/pi-coding-agent']).toBe(version)
+    expect(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS['@earendil-works/pi-coding-agent']).toBe(version)
+  })
 
   it('keeps native integrity dependencies out of the user-facing update catalog', () => {
     expect(Object.keys(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS)).toEqual([
@@ -40,7 +49,7 @@ describe('resolveRuntimeAssets', () => {
       writeFile(node, ''),
       writeFile(piCli, '// pi cli\n'),
       writeFile(launcher, ''),
-      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' })),
+      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: preparedPiVersion })),
       mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
         writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.8' }))),
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
@@ -63,7 +72,7 @@ describe('resolveRuntimeAssets', () => {
       piLauncher: platform === 'win32' ? 'pi/bin/pi.cmd' : 'pi/bin/pi',
       nodeModules: 'pi/lib/node_modules',
       packages: {
-        '@earendil-works/pi-coding-agent': '0.84.2',
+        '@earendil-works/pi-coding-agent': preparedPiVersion,
         'pi-web-access': '0.28.0',
         'pi-mcp-extension': '1.5.0',
         'pi-hermes-memory': '0.9.8',
@@ -74,7 +83,7 @@ describe('resolveRuntimeAssets', () => {
 
   async function seedPackagedRuntime(platform: NodeJS.Platform = 'darwin', arch = 'arm64'): Promise<{ resourcesPath: string; embedded: string }> {
     root = await mkdtemp(join(tmpdir(), 'pipiui-embedded-assets-'))
-    const embedded = join(root, 'pipiui-embedded')
+    const embedded = join(root, platform === 'win32' ? 'pi' : 'pipiui-embedded')
     await mkdir(join(root, 'pipiui-runtime'), { recursive: true })
     await seedEmbeddedRuntime(embedded, platform, arch)
     return { resourcesPath: root, embedded }
@@ -157,7 +166,8 @@ describe('resolveRuntimeAssets', () => {
     expect(assets.piCommand?.executable).toBe(process.execPath)
     expect(assets.piCommand?.env?.PIPIUI_NODE_PATH).toBe(process.execPath)
     // The shim still ships and stays first on PATH for cmd.exe consumers.
-    expect(assets.piCommand?.env?.PATH.split(delimiter)[0]).toBe(join(resourcesPath, 'pipiui-embedded/node/bin'))
+    expect(assets.piCommand?.env?.PATH.split(delimiter)[0]).toBe(join(resourcesPath, 'pi/node/bin'))
+    expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pi/pi/lib/node_modules'))
   })
 
   it('fails closed when a packaged runtime is absent or for another architecture', async () => {

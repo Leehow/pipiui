@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 
+import { parseQueueFailure, safeQueueError } from "@pipi/host-api";
 import type { QueuedAttachment, QueuedMessage } from "./message-queue.js";
 
 /** Injectable persistence boundary for the host-owned product queue. */
@@ -43,7 +44,8 @@ function restoreItem(value: unknown, sessionId: string): QueuedMessage | undefin
     attachments: attachments as QueuedAttachment[],
     createdAt: value.createdAt,
     state,
-    error: failed && typeof value.error === "string" ? value.error : undefined,
+    error: failed && typeof value.error === "string" ? safeQueueError(value.error) : undefined,
+    failureDetails: failed ? parseQueueFailure(value.failureDetails) : undefined,
   };
 }
 

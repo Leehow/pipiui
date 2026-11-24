@@ -14,7 +14,8 @@ function queueItem(message: QueuedMessage): MessageQueueItem {
     // attachment count/name without rehydrating base64 image payloads.
     images: message.attachments.map(attachment => ({ name: attachment.name })),
     status: message.state,
-    error: message.error
+    error: message.error,
+    failureDetails: message.failureDetails
   }
 }
 

@@ -1,7 +1,7 @@
 import { CHANNEL_DISCOVER, CHANNEL_PROVIDE, CHANNEL_WITHDRAW, JEV_PROVIDER } from "./protocol.js";
 import { BROWSER_DISCOVER, BROWSER_PROVIDE, BROWSER_WITHDRAW, executeBrowserAvailability, executeBrowserRerank, type BrowserRerankOffer } from "./browser-rerank.js";
 export { executeBrowserRerank } from "./browser-rerank.js";
-import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, executeBrowserChoiceAvailability, executeBrowserChoice, type BrowserChoiceOffer } from "./browser-choice.js";
+import { BROWSER_CHOICE_DISCOVER, BROWSER_CHOICE_PROVIDE, BROWSER_CHOICE_WITHDRAW, executeBrowserChoiceAvailability, executeBrowserChoice, evaluateUpstreamChoice, type BrowserChoiceOffer } from "./browser-choice.js";
 export * from "./browser-choice.js";
 import { COMPUTER_CHOICE_DISCOVER, COMPUTER_CHOICE_PROVIDE, COMPUTER_CHOICE_WITHDRAW, executeComputerChoiceAvailability, executeComputerChoice, type ComputerChoiceOffer } from "./computer-choice.js";
 export * from "./computer-choice.js";
@@ -81,6 +81,7 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
       version: 1, provider: JEV_PROVIDER, instanceId,
       availability: (root, signal) => executeBrowserChoiceAvailability(root, deps, gate, signal),
       choose: (input) => executeBrowserChoice(input, deps, gate),
+      evaluate: (input) => evaluateUpstreamChoice(input, deps, gate),
     };
     pi.events?.emit(BROWSER_CHOICE_PROVIDE, choice);
   };

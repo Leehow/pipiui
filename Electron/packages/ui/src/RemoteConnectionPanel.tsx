@@ -21,6 +21,7 @@ export type RemoteLinkCheck = {
 }
 
 export type RemoteControlState = {
+  mobileLoginUrl?: string
   enabled: boolean
   status: RemoteControlStatus
   pairUrl: string | null

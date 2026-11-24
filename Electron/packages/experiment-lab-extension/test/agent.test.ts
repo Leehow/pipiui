@@ -1,5 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerExperimentLab, experimentParameters } from "../agent/index.js";
@@ -9,6 +11,8 @@ type Pi = Parameters<typeof registerExperimentLab>[0];
 type Tool = Parameters<Pi["registerTool"]>[0];
 type Command = Parameters<Pi["registerCommand"]>[1];
 const roots: string[] = [];
+const actualFetch = globalThis.fetch;
+const exec = promisify(execFile);
 afterEach(async () => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 async function fixture() {
@@ -45,6 +49,33 @@ it("拒绝未信任项目和已取消调用，结束会话后不再写入", asyn
   f.events.get("session_shutdown")?.();
   await expect(f.tools[0].execute("ended", input, undefined, undefined, f.ctx)).rejects.toMatchObject({ code: "session-ended" });
   expect(await new ExperimentService(f.root).list()).toEqual([]);
+});
+
+it("预览走真实HTTP实例，只有runtime浏览器事件能写证据，会话结束释放实例", async () => {
+  const f = await fixture();
+  const git = async (...args: string[]) => exec("git", ["-C", f.root, ...args]);
+  await git("init");
+  await git("config", "user.name", "Preview fixture");
+  await git("config", "user.email", "fixture@example.invalid");
+  await writeFile(join(f.root, "index.html"), "<!doctype html><title>Preview fixture</title><button>Test</button>");
+  await git("add", "index.html");
+  await git("commit", "-m", "preview fixture");
+  const tool = f.tools[0];
+  const call = async (input: Parameters<Tool["execute"]>[1]) => (await tool.execute("fixture-call", input, undefined, undefined, f.ctx)).details as any;
+  await call({ action: "create", experimentId: "preview-route", question: "真实预览控制路径", kind: "browser" });
+  await call({ action: "freeze", experimentId: "preview-route" });
+  const started = await call({ action: "preview_start", experimentId: "preview-route", previewId: "first-page", variantId: "baseline" });
+  const url = started.preview.url;
+  try {
+    expect((await actualFetch(url)).status).toBe(200);
+    expect(experimentParameters.properties.action.enum).not.toContain("preview_submit_evidence");
+    await f.events.get("tool_result")!({ type: "tool_result", toolName: "browser", toolCallId: "trusted-browser-call", input: { action: "observe", target: "desktop" }, content: [{ type: "text", text: "真实事件夹具" }], isError: false, details: { ok: true, url, snapshotID: "fixture-snapshot", viewport: { width: 1200, height: 800 } } });
+    const evidence = await call({ action: "preview_evidence", experimentId: "preview-route", previewId: "first-page" });
+    expect(evidence.evidence.items).toHaveLength(1);
+    expect(evidence.evidence.items[0]).toMatchObject({ toolCallId: "trusted-browser-call", verdict: "unverified" });
+    expect(evidence.evidence.items[0].pages[0]).toHaveProperty("observationPreview");
+  } finally { await f.events.get("session_shutdown")!(); }
+  await expect(actualFetch(url)).rejects.toThrow();
 });
 
 it("控制命令的失败有相关性标识，不伪装成成功结果", async () => {

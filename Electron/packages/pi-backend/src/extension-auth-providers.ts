@@ -55,7 +55,7 @@ function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-export async function loadContributedAuthProvider(directory: string): Promise<{
+export async function loadContributedAuthProvider(directory: string, options?: { authPath?: string; cacheDir?: string | null }): Promise<{
   id?: string;
   config: unknown;
 } | undefined> {
@@ -64,7 +64,7 @@ export async function loadContributedAuthProvider(directory: string): Promise<{
   const mod = (await import(pathToFileURL(path).href)) as Record<string, unknown>;
   const factory = mod.createAuthProvider;
   if (typeof factory !== "function") return undefined;
-  const config = (factory as () => unknown)();
+  const config = await (factory as (options?: unknown) => unknown)(options);
   if (!config || typeof config !== "object") return undefined;
   const id = asNonEmptyString(mod.AUTH_PROVIDER_ID);
   return id ? { id, config } : { config };
@@ -72,6 +72,8 @@ export async function loadContributedAuthProvider(directory: string): Promise<{
 
 export async function registerContributedAuthProviders(input: {
   runtime: AuthRuntimeRegistrar;
+  authPath?: string;
+  refreshExisting?: boolean;
   claims: readonly ContributionClaim[];
   directoryOf: (extensionId: string) => string | undefined;
 }): Promise<void> {
@@ -81,12 +83,12 @@ export async function registerContributedAuthProviders(input: {
     const directory = input.directoryOf(claim.extensionId);
     if (!directory) continue;
     try {
-      const loaded = await loadContributedAuthProvider(directory);
+      const loaded = await loadContributedAuthProvider(directory, { authPath: input.authPath, cacheDir: null });
       if (!loaded) continue;
       const providerId = loaded.id ?? claim.contribution.provider.id;
       if (!providerId || seen.has(providerId)) continue;
       seen.add(providerId);
-      if (input.runtime.getProvider?.(providerId)) continue;
+      if (!input.refreshExisting && input.runtime.getProvider?.(providerId)) continue;
       input.runtime.registerProvider(providerId, loaded.config);
     } catch (error) {
       console.warn(

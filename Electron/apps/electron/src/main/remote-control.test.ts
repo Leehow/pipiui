@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { HostBackend, HostEvent } from '@pipi/host-api'
+import { createWsHost, type HostBackend, type HostEvent } from '@pipi/host-api'
 import { createHostAPIRelay } from '../../../../../Relay/src/host-api-relay.js'
 import {
   bindRemoteControlPowerLifecycle,
@@ -225,6 +225,70 @@ describe('createRemoteControlService', () => {
     temps.push(dir)
     return dir
   }
+
+  it('pages growing agent data through the real relay and isolates an oversized response', async () => {
+    const relay = await startRelay()
+    relays.push(relay)
+    const rows = Array.from({ length: 180 }, (_, i) => ({
+      sessionId: 'session', agentId: `agent-${String(i).padStart(3, '0')}`, runId: 'run',
+      name: 'worker', task: 'full task', state: 'ok', finalResult: 'x'.repeat(96 * 1024)
+    }))
+    const backend = mockBackend(vi.fn(async method => {
+      if (method === 'listAgents') return rows
+      if (method === 'getAgentLogs') return 'x'.repeat(9 * 1024 * 1024)
+      if (method === 'capabilities') return {}
+      if (method === 'listProjects') return [{ id: 'project' }]
+      return null
+    }) as any)
+    const dir = await userData()
+    const service = createRemoteControlService({ backend, userDataDir: dir, relayOrigin: relay.origin })
+    services.push(service)
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host not ready')
+    const stored = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8'))
+    const grant = await claim(relay.origin, stored.roomID, stored.pairSecret)
+    const socket = new WebSocket(relay.origin.replace('http:', 'ws:') + '/ws', {
+      headers: { Cookie: cookieHeader(grant.headers.get('set-cookie')) }
+    })
+    await new Promise<void>(resolve => socket.once('open', resolve))
+    let largestFrame = 0
+    socket.on('message', data => { largestFrame = Math.max(largestFrame, data.toString().length) })
+    const host = createWsHost(socket)
+    try {
+      const received = await host.listAgents()
+      expect(received.map(row => row.agentId)).toEqual(rows.map(row => row.agentId))
+      expect(received.every(row => row.finalResult === rows[0].finalResult && row.task === 'full task')).toBe(true)
+      expect(largestFrame).toBeLessThan(1024 * 1024)
+      await expect(host.getAgentLogs('agent', 'session', 'run')).rejects.toMatchObject({ code: 'response_too_large' })
+      await expect(host.listProjects()).resolves.toEqual([{ id: 'project' }])
+      expect(socket.readyState).toBe(WebSocket.OPEN)
+      expect(backend.closed).toBe(false)
+    } finally { socket.close() }
+  })
+
+  it('retires silent handshakes and half-open sockets without rotating identity or overlapping starts', async () => {
+    const sockets: FakeSocket[] = []
+    let time = 100
+    const service = createRemoteControlService({
+      backend: mockBackend(), userDataDir: await userData(), relayOrigin: 'http://relay.test',
+      now: () => time, connectionTimeoutMs: 40, heartbeatTimeoutMs: 100, pingIntervalMs: 10,
+      backoffMs: () => 1,
+      connect: () => { const socket = makeFakeSocket(); sockets.push(socket); return socket }
+    })
+    services.push(service)
+    await service.start()
+    const room = service.getState().roomID
+    await service.start()
+    expect(sockets).toHaveLength(1)
+    // Even if close never emits, the handshake watchdog must release the loop.
+    sockets[0].close = () => { sockets[0].readyState = 2 }
+    await waitFor(() => sockets.length === 2, 'handshake did not time out')
+    sockets[1].fireOpen()
+    sockets[1].fireMessage(JSON.stringify({ v: 2, type: 'ready', hostEpoch: 1 }))
+    time += 101
+    await waitFor(() => sockets.length >= 3, 'silent connection not retired')
+    expect(service.getState().roomID).toBe(room)
+  })
 
   it('pairs, forwards request/response/event, replaces the second browser, and reconnects the same room', async () => {
     const relay = await startRelay()

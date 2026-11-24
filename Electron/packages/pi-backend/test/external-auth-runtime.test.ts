@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -288,6 +288,82 @@ describe("external Pi model runtime", () => {
     await runtime.getAvailable();
     expect((runtime as any).worker?.child?.pid).toBe(pidBefore);
     runtime.stop();
+  });
+
+  it("keeps a ready worker alive past its startup deadline", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-external-ready-deadline-"));
+    const agentDir = join(root, "agent"); const helperPath = join(root, "helper.mjs");
+    await mkdir(agentDir); await writeFile(helperPath, fixture);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const runtime = new ExternalAuthRuntime({ helperPath, agentDir, piPath: "/opt/homebrew/bin/pi", nodePath: process.execPath, env: { HOME: root } });
+    try {
+      await runtime.getAvailable();
+      const worker = (runtime as any).worker;
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(worker.disposed).toBe(false);
+      expect(worker.child.exitCode).toBeNull();
+      await runtime.getAvailable();
+      expect((runtime as any).worker.child.pid).toBe(worker.child.pid);
+    } finally { runtime.stop(); vi.useRealTimers(); }
+  });
+
+  it("recovers an ended stdin without emitting an unhandled stream error", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-external-ended-stdin-"));
+    const agentDir = join(root, "agent"); const helperPath = join(root, "helper.mjs");
+    await mkdir(agentDir);
+    // Stay alive after stdin EOF so this exercises a dead input pipe, not the
+    // already-covered child exit path.
+    await writeFile(helperPath, fixture.replace('if (command === "serve") {', 'if (command === "serve") { setInterval(() => {}, 1000);'));
+    const runtime = new ExternalAuthRuntime({ helperPath, agentDir, piPath: "/opt/homebrew/bin/pi", nodePath: process.execPath, env: { HOME: root }, rpcTimeoutMs: 100 });
+    try {
+      await runtime.getAvailable();
+      const worker = (runtime as any).worker;
+      const errors: Error[] = [];
+      worker.child.stdin.on("error", (error: Error) => errors.push(error));
+      await new Promise<void>(resolve => worker.child.stdin.end(resolve));
+      expect((await runtime.getAvailable()).map((model: any) => model.id)).toEqual(["gpt-5.4"]);
+      expect(errors).toEqual([]);
+      expect(worker.disposed).toBe(true);
+      await runtime.getAvailable();
+      expect((runtime as any).worker.child.pid).not.toBe(worker.child.pid);
+    } finally { runtime.stop(); }
+  });
+
+  it("settles queued RPCs immediately when stopping a worker", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-external-stop-pending-"));
+    const agentDir = join(root, "agent"); const helperPath = join(root, "helper.mjs");
+    await mkdir(agentDir); await writeFile(helperPath, hangFixture);
+    const runtime = new ExternalAuthRuntime({ helperPath, agentDir, piPath: "/opt/homebrew/bin/pi", nodePath: process.execPath, env: { HOME: root } });
+    let calls: Promise<any>[] = [];
+    try {
+      await runtime.getAvailable();
+      const worker = (runtime as any).worker;
+      worker.child.stdin.on("error", () => {}); // observe settlement without crashing the red test process
+      calls = [(runtime as any).query("hang"), (runtime as any).query("list-models")];
+      const settled = Promise.all(calls);
+      const until = Date.now() + 2000;
+      while (worker.pending.size < 2 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+      expect(worker.pending.size).toBe(2);
+      runtime.stop();
+      expect(worker.pending.size).toBe(0);
+      const results = await settled;
+      expect(results.every(result => Array.isArray(result.models))).toBe(true);
+    } finally { runtime.stop(); await Promise.allSettled(calls); }
+  });
+
+  it("contains asynchronous stdin errors and serves the next request on a fresh worker", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-external-pipe-error-"));
+    const agentDir = join(root, "agent"); const helperPath = join(root, "helper.mjs");
+    await mkdir(agentDir); await writeFile(helperPath, fixture);
+    const runtime = new ExternalAuthRuntime({ helperPath, agentDir, piPath: "/opt/homebrew/bin/pi", nodePath: process.execPath, env: { HOME: root } });
+    try {
+      await runtime.getAvailable();
+      const worker = (runtime as any).worker;
+      expect(() => worker.child.stdin.emit("error", Object.assign(new Error("pipe closed"), { code: "EPIPE" }))).not.toThrow();
+      expect(worker.disposed).toBe(true);
+      expect((await runtime.getAvailable()).map((model: any) => model.id)).toEqual(["gpt-5.4"]);
+      expect((runtime as any).worker.child.pid).not.toBe(worker.child.pid);
+    } finally { runtime.stop(); }
   });
 
   it("lazily respawns a resident worker after it dies mid-run", async () => {

@@ -388,13 +388,13 @@ describe("official release pipeline (Office release-chain pattern)", () => {
 });
 
 describe("official signing key seam", () => {
-  it("parses the env-pinned SPKI key and fails closed when unset", () => {
+  it("parses the env-pinned SPKI key and defaults to the bundled release key", () => {
     const { publicKey } = generateKeyPairSync("ed25519");
     const spki = publicKey.export({ format: "der", type: "spki" }).toString("base64");
     process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY = spki;
     expect(extensionUpdateSigningKey()?.type).toBe("public");
     delete process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY;
-    expect(extensionUpdateSigningKey()).toBeUndefined();
+    expect(extensionUpdateSigningKey()?.asymmetricKeyType).toBe("ed25519");
     process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY = "!!!not base64 spki!!!";
     expect(() => extensionUpdateSigningKey()).toThrow(/PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY/);
     delete process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY;

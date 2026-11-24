@@ -8,9 +8,11 @@ import { Type } from "typebox";
 import { capabilityCall } from "./capability-bridge.ts";
 import { isTrivialBrowserEval } from "./browser-eval-guard.ts";
 import { connectBrowserReranker, observeWithOptionalRerank, type BrowserRerankerConnection } from "./browser-reranker.ts";
-import { connectBrowserChoice, runBrowserGoal, type BrowserChoiceConnection, type GoalDependencies } from "./browser-choice-loop.ts";
+import { connectBrowserChoice, type BrowserChoiceConnection, type GoalDependencies } from "./browser-choice-loop.ts";
 import { createGoalTextGenerator } from "./browser-choice-text.ts";
-type BrowserOptimization = { connection: BrowserRerankerConnection; projectRoot: string; choice?: BrowserChoiceConnection; generateText?: GoalDependencies['generateText'] };
+import { runUpstreamGoal } from "./jev-upstream/run.ts";
+import { createUpstreamTextTransport } from "./jev-upstream/text.ts";
+type BrowserOptimization = { connection: BrowserRerankerConnection; projectRoot: string; choice?: BrowserChoiceConnection; generateText?: GoalDependencies['generateText']; upstreamText?: ReturnType<typeof createUpstreamTextTransport> };
 export const BROWSER_AGENT_TOOL_ACTIONS = ["goal"] as const;
 
 const REQUEST_TIMEOUT_MS = 35_000;
@@ -143,7 +145,7 @@ const HELP = [
   "starts, so later items cannot consume an earlier item's fresh observation. watch inside a",
   "batch only registers its non-blocking listener; the batch never waits for the condition.",
   "",
-  "goal {goal, max_steps?, timeoutSecs?, target?}",
+  "goal {goal, url?, max_steps?, timeoutSecs?, target?}",
   "                        Standalone bounded Jev Choice control loop (not actions[]). Requires the",
   "                        enabled Jev extension, its saved key and browser-cloud permission.",
   "                        Jev chooses operation + observed target in one request; TYPE_TEXT uses",
@@ -641,7 +643,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, goal, wait, watch, unwatch, watches, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
-      "goal runs a bounded Jev Choice action loop using the extension's saved key; standalone only, single viewport. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. " +
+      "goal runs the Browser Use jev-ultrafast controller using the saved Jev key; standalone only, single viewport. When the task names a website, pass url to open it before control begins. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. " +
       "Prefer packing consecutive actions that do not need an intermediate observation into one actions[] call (1..8 items), e.g. fill_form then submit click, click then wait, type then Enter. Pass exactly one of action or actions. Stop and observe after navigate, after submitting a form, and when a dialog, captcha, or login wall may appear. " +
       "observe/screenshot are best as the final step of a batch (later items cannot consume an earlier item's observation), and watch in a batch only registers its non-blocking listener without waiting. " +
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
@@ -805,7 +807,7 @@ export default function (pi: ExtensionAPI) {
       }))),
     }),
     async execute(_id, params, signal, _update, ctx) {
-      return executeBrowserTool(params, signal, { connection, choice, projectRoot: ctx?.cwd ?? process.cwd(), generateText: createGoalTextGenerator(ctx as any) });
+      return executeBrowserTool(params, signal, { connection, choice, projectRoot: ctx?.cwd ?? process.cwd(), generateText: createGoalTextGenerator(ctx as any), upstreamText: createUpstreamTextTransport(ctx) });
     },
   });
 }
@@ -841,9 +843,9 @@ async function executeBrowserAction(params: any, signal?: AbortSignal, optimizat
       }
       switch (params.action) {
         case "goal": {
-          const r = await runBrowserGoal(params, {
+          const r = await runUpstreamGoal(params, {
             projectRoot: optimization?.projectRoot ?? process.cwd(), connection: optimization?.choice,
-            generateText: optimization?.generateText, bridge, signal,
+            generateText: optimization?.upstreamText, bridge, signal,
           });
           return { ...text(JSON.stringify(r), r), ...(r.ok ? {} : { isError: true }) };
         }
@@ -1037,9 +1039,10 @@ async function executeBrowserAction(params: any, signal?: AbortSignal, optimizat
             }
             return { content, details: { target: r.target || "both", images: r.images } };
           }
+          const { base64: _base64, ok: _ok, ...image } = r;
           return {
             content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png", ...(r.viewport ? { viewport: r.viewport } : {}) }],
-            details: r.viewport ? { viewport: r.viewport } : {},
+            details: { ...(r.viewport ? { viewport: r.viewport } : {}), image },
           };
         }
         case "back":

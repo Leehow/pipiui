@@ -28,8 +28,11 @@
  * the release-process record.
  */
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, lutimesSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createGzip } from "node:zlib";
+import { pipeline } from "node:stream/promises";
+import { createReadStream, createWriteStream } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -95,8 +98,24 @@ try {
       return name !== ".DS_Store" && name !== "pipiui-host-receipt.json" && name !== ".git";
     },
   });
-  const tar = spawnSync("tar", ["-czf", artifactPath, "-C", join(staging, "package"), extensionId], { encoding: "utf8" });
+  // A retry of the same release must produce the same signed bytes.
+  const files = [];
+  const add = (name, directory) => {
+    const path = join(staging, "package", name);
+    files.push(name);
+    if (directory) {
+      const entries = readdirSync(path, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      for (const entry of entries) add(name + "/" + entry.name, entry.isDirectory());
+    }
+    lutimesSync(path, 0, 0);
+  };
+  add(extensionId, true);
+  const rawArchive = join(staging, "package.tar");
+  const tar = spawnSync("tar", ["-cf", rawArchive, "-C", join(staging, "package"), "--no-recursion", "--null", "-T", "-"], {
+    input: files.join("\0") + "\0", encoding: "utf8", env: { ...process.env, COPYFILE_DISABLE: "1" },
+  });
   if (tar.status !== 0) fail(`tar failed: ${(tar.stderr || "").trim()}`);
+  await pipeline(createReadStream(rawArchive), createGzip(), createWriteStream(artifactPath));
   bytes = readFileSync(artifactPath);
 } catch (error) {
   rmSync(staging, { recursive: true, force: true });

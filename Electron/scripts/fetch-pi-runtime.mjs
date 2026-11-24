@@ -23,6 +23,10 @@ const runtimePackageNames = [
   'pi-web-access',
   'pi-mcp-extension'
 ]
+// Pi's extension loader aliases these deprecated SDK imports to the live
+// @earendil-works SDK. pi-mcp-extension still declares the old peers, so npm
+// installs an unused second SDK tree. Keep unrelated packages such as clipboard.
+const legacyPiSdkPackages = ['pi-coding-agent', 'pi-ai', 'pi-agent-core', 'pi-tui']
 const requiredPackages = {
   ...Object.fromEntries(runtimePackageNames.map(name => [name, backendPackage.dependencies?.[name]])),
   [hermesPackageName]: hermesPackageVersion,
@@ -179,6 +183,15 @@ function koffiPrebuildsToKeep(platform, arch) {
   return platform === 'linux' ? [`linux_${arch}`, `musl_${arch}`] : [`${platform}_${arch}`]
 }
 
+function unusedRuntimeDirectory(name, parent, target) {
+  if (basename(parent) === '@mariozechner' && basename(dirname(parent)) === 'node_modules' && legacyPiSdkPackages.includes(name))
+    return `legacy Pi SDK @mariozechner/${name}`
+  if (name === 'test' && basename(parent) === 'domino' && basename(dirname(parent)) === '@mixmark-io' && basename(dirname(dirname(parent))) === 'node_modules')
+    return 'Domino HTML test corpus'
+  if (basename(parent) === '@esbuild' && basename(dirname(parent)) === 'node_modules' && /^(?:aix|android|darwin|freebsd|linux|netbsd|openbsd|openharmony|sunos|win32)-[a-z0-9]+$/.test(name) && name !== `${target.platform}-${target.arch}`)
+    return `esbuild prebuilt for ${name}, expected ${target.platform}-${target.arch}`
+}
+
 async function pruneRuntimeTree(root, { platform, arch }) {
   const keptPrebuilds = new Set(koffiPrebuildsToKeep(platform, arch))
   let removed = 0
@@ -189,6 +202,13 @@ async function pruneRuntimeTree(root, { platform, arch }) {
     for (const entry of entries) {
       const path = join(dir, entry.name)
       if (entry.isDirectory()) {
+        // npm may put peers below another package rather than at the root.
+        // Domino's entrypoint is lib/; its HTML test corpus is not runtime data.
+        if (unusedRuntimeDirectory(entry.name, dir, { platform, arch })) {
+          await rm(path, { recursive: true, force: true })
+          removed += 1
+          continue
+        }
         if (entry.name === '.bin') {
           await rm(path, { recursive: true, force: true })
           removed += 1
@@ -343,6 +363,11 @@ async function inspectRuntime(root, expected) {
   for (const name of ['pi-web-access', 'pi-mcp-extension']) {
     if (!(await declaredEntrypoint(nodeModules, name))) return { ok: false, reason: `${name} declared Pi extension entrypoint is missing` }
   }
+  for (const entry of await readdir(nodeModules, { recursive: true, withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const reason = unusedRuntimeDirectory(entry.name, entry.parentPath, expected)
+    if (reason) return { ok: false, reason: `runtime still contains the unused ${reason}` }
+  }
   const hermesNative = await inspectHermesNative(nodeModules, expected)
   if (!hermesNative.ok) return hermesNative
   // A runtime prepared before pruning existed would silently add ~245MB to the
@@ -378,10 +403,15 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} failed with status ${result.status}`)
 }
 
-function npmInvocation() {
-  const npmExecPath = process.env.npm_execpath
-  if (npmExecPath) return { command: process.execPath, prefixArgs: [npmExecPath], shell: false }
-  return { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', prefixArgs: [], shell: process.platform === 'win32' }
+async function npmInvocation(verifiedNodeArchiveRoot) {
+  // Use the npm shipped in the checksum-pinned Node archive for every target.
+  // Host npm 10 and 12 produce materially different peer dependency closures.
+  // npm's CLI is portable JavaScript, so the host Node runs it for cross builds.
+  for (const relativePath of ['lib/node_modules/npm/bin/npm-cli.js', 'node_modules/npm/bin/npm-cli.js']) {
+    const entry = join(verifiedNodeArchiveRoot, relativePath)
+    if (await isFile(entry)) return { command: process.execPath, prefixArgs: [entry], shell: false }
+  }
+  throw new Error('Verified Node archive has no npm CLI')
 }
 
 async function bytesWithPinnedChecksum(cacheRoot, asset) {
@@ -467,7 +497,7 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
         [`better-sqlite3@${betterSqliteVersion}`]: true
       }
     }, null, 2)}\n`)
-    const npm = npmInvocation()
+    const npm = await npmInvocation(join(extraction, archiveRoot))
     run(npm.command, [
       ...npm.prefixArgs,
       'install',
@@ -494,6 +524,7 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
       cwd: piLib,
       env: {
         ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
         // pi-hermes-memory's better-sqlite3 addon is loaded by Electron in
         // ELECTRON_RUN_AS_NODE mode. Select the Electron ABI as well as the
         // destination architecture; npm's --cpu/--os alone do not reach every

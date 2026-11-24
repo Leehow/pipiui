@@ -464,6 +464,8 @@ export type AgentSummary = { agentId: string; runId: string; name: string; task:
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = {
   agentId: string;
+  /** Experiment worktrees remain retained even after a successful run. */
+  mergePolicy?: "auto" | "never";
   /** Owning episode session — required: every worktree row belongs to exactly one episode. */
   sessionId: string;
   /** Owning episode run — required: a badge/operation on this status binds to this run alone. */
@@ -474,6 +476,7 @@ export type ComputerUsePermissionKind = "screenRecording" | "accessibility";
 export type ComputerUseState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean };
 export type UpdateCenterItemStatus = "upToDate" | "updateAvailable" | "checkFailed" | "notCheckable";
 export type UpdateCenterItemCategory = "platform" | "runtime" | "toolchain" | "extension";
+export type UpdateGitSource = { owner: string; repo: string; ref: string };
 export type UpdateCenterItem = {
   id: string;
   name: string;
@@ -485,8 +488,13 @@ export type UpdateCenterItem = {
   ownerExtensionName?: string;
   /** Human-facing version source when `packageName` does not apply (e.g. GitHub `owner/repo`). */
   sourceLabel?: string;
+  gitSource?: UpdateGitSource;
+  upstreamUrl?: string;
+  compareUrl?: string;
   /** Host can run the one-click update transaction for this component (official githubReleases package artifact). */
   transactional?: boolean;
+  officialUpdate?: "desktop" | "extension";
+  downloaded?: boolean;
   currentVersion: string;
   latestVersion?: string;
   status: UpdateCenterItemStatus;
@@ -517,6 +525,7 @@ export type PipiuiUpdateEvaluationIntent = {
   ownerExtensionName?: string;
   currentVersion: string;
   latestVersion: string;
+  gitSource?: UpdateGitSource;
 };
 export type PipiuiUpdateEvaluationIntentFields = Omit<PipiuiUpdateEvaluationIntent, "version">;
 export function encodePipiuiUpdateEvaluationIntent(fields: PipiuiUpdateEvaluationIntentFields): string {
@@ -529,6 +538,7 @@ export function encodePipiuiUpdateEvaluationIntent(fields: PipiuiUpdateEvaluatio
     ...(fields.ownerExtensionName === undefined ? {} : { ownerExtensionName: fields.ownerExtensionName }),
     currentVersion: fields.currentVersion,
     latestVersion: fields.latestVersion,
+    ...(fields.gitSource === undefined ? {} : { gitSource: fields.gitSource }),
   })}`;
 }
 
@@ -623,6 +633,9 @@ export type StructuredOutputRequest = {
   strict?: boolean;
   description?: string;
 };
+export * from "./queue-failure.js";
+import type { QueueFailureDetails } from "./queue-failure.js";
+
 /** Host-owned product queue lifecycle (matches the MessageQueue UI states). */
 export type QueuedMessageState = "queued" | "sending" | "failed";
 /** Durable, actionable message payload. Completed messages leave the active queue. */
@@ -634,6 +647,7 @@ export type QueuedMessage = {
   createdAt: number;
   state: QueuedMessageState;
   error?: string;
+  failureDetails?: QueueFailureDetails;
 };
 /** Explicit outcome for the opt-in queue API; legacy `sendPrompt` remains void-compatible. */
 export type QueueEnqueueResult = { outcome: "direct" | "queued"; message: QueuedMessage };
@@ -784,7 +798,7 @@ export const BROWSER_MOBILE_DEVICES: readonly BrowserMobileDevicePreset[] = [
 export function browserMobileDeviceById(id: string | undefined): BrowserMobileDevicePreset {
   return BROWSER_MOBILE_DEVICES.find(item => item.id === id) ?? BROWSER_MOBILE_DEVICES[0]!;
 }
-export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; intent?: string; /** Internal prepared-observation references; not model-visible actions. */ preparation_id?: string; candidate_ids?: string[]; /** Internal choice-snapshot execution; not model-visible. */ choice_guard?: string; operation?: string; candidate_id?: string; option_id?: string; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
+export type BrowserToolRequest = { action: string; /** Internal upstream Jev transport; never model-generated CDP. */ jev_lease?: string; cdp_method?: string; cdp_params?: Record<string, unknown>; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; intent?: string; /** Internal prepared-observation references; not model-visible actions. */ preparation_id?: string; candidate_ids?: string[]; /** Internal choice-snapshot execution; not model-visible. */ choice_guard?: string; operation?: string; candidate_id?: string; option_id?: string; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
 export type BrowserToolImage = { viewport: BrowserViewportKind; base64: string; mimeType: string; width?: number; height?: number };
 export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string; images?: BrowserToolImage[] };
 export type BrowserTabOptions = { url?: string };
@@ -935,7 +949,7 @@ export type StreamEvent =
    *   `context_fold` is a deterministic idle fold (message rewrite, not a
    *   compaction). Absent ⇒ legacy real compaction.
    * - `trigger`: why it started — `manual` (user `/compact`), `proactive_idle`
-   *   (host scheduler: ≥45% AND ≥4min quiet), `near_overflow` (pi's reserve
+   *   (host scheduler: ≥65% AND ≥4min quiet), `near_overflow` (pi's reserve
    *   line `window − reserveTokens`), `overflow` (provider overflow recovery),
    *   `mid_turn` (in-turn tool-loop guard), `idle_fold` (fold inside the idle
    *   scheduler's nudge turn), `auto_fold` (`context_manage` fold whose trigger
@@ -1082,6 +1096,7 @@ export type ExtensionContributions = {
   viewContainers?: readonly ExtensionViewContainerDecl[];
   views?: readonly ExtensionViewDecl[];
   headerActions?: readonly ExtensionHeaderActionDecl[];
+  composerActions?: readonly ExtensionHeaderActionDecl[];
   auth?: ExtensionAuthContribution;
 };
 /** Theme pack entry from an extension manifest's `app.ui.themes`, passed through
@@ -1116,7 +1131,7 @@ export type ExtensionDescriptor = {
   /** Declarative app-half contributions (schema / slash / settings tabs / statusBar). */
   contributions?: ExtensionContributions;
   /** Controlled entries resolved against the extension package directory. */
-  ui?: { headerActions?: readonly ExtensionHeaderActionDecl[]; themes?: readonly ExtensionThemeDecl[] };
+  ui?: { headerActions?: readonly ExtensionHeaderActionDecl[]; composerActions?: readonly ExtensionHeaderActionDecl[]; themes?: readonly ExtensionThemeDecl[] };
 };
 /** Current capability grant snapshot (spec D11 / M4). */
 export type ExtensionCapabilityGrant = {
@@ -1192,7 +1207,33 @@ export function shouldForwardProjectedHostEvent(frame: HostEvent, selectedSessio
   return true;
 }
 
+export interface BashDetailRequest {
+  sessionId: string;
+  toolCallId: string;
+  agentId?: string;
+  runId?: string;
+  field?: 'live' | 'input' | 'output';
+  offset?: number;
+  sinceRevision?: number;
+}
+export interface BashDetailResponse {
+  identity?: { sessionId: string; toolCallId: string; agentId?: string; runId?: string };
+  state: 'running' | 'completed' | 'failed' | 'interrupted' | 'unavailable';
+  revision?: number;
+  unchanged?: boolean;
+  input?: string;
+  output?: string;
+  inputTruncated?: boolean;
+  outputTruncated?: boolean;
+  text?: string;
+  nextOffset?: number;
+  totalBytes?: number;
+  truncated?: boolean;
+}
+
 export interface PipiHostAPI {
+  /** UI-only, bounded pull subscription. No calls while the tool card is closed. */
+  getBashDetails?(request: BashDetailRequest): Promise<BashDetailResponse>;
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
   /** Product Profile catalog and project-local activation. Profile changes affect new Conversations only. */
   listProductProfiles?(projectId?: string): Promise<ProductProfileDescriptor[]>;
@@ -1478,6 +1519,7 @@ export interface PipiHostAPI {
   /** Remove one named server from project `.pi/mcp.json`; returns the refreshed list. Electron-only; old hosts omit it. */
   removeUserMcpServer?(projectId: string, name: string): Promise<UserMcpServer[]>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
+  applyOfficialUpdate?(action: "download" | "restart" | "extension", id: string, version: string): Promise<void>;
   checkForUpdates?(): Promise<UpdateCenterSnapshot>;
   /** 更新中心 one-click update for a transactional extension component. Electron-only; old hosts omit it. */
   updateExtensionComponent?(extensionId: string, componentId?: string): Promise<ExtensionComponentUpdateResult>;
@@ -1515,7 +1557,7 @@ export interface PipiHostAPI {
   readExtensionData?(
     id: string,
     path: string,
-    options?: { tailBytes?: number },
+    options?: { tailBytes?: number; allowMissing?: boolean },
     projectId?: string,
   ): Promise<{ content: string; bytes: number; truncated: boolean }>;
   /** Replace one file under the package's declared `app.data.write` roots. */
@@ -1553,6 +1595,9 @@ export interface HostBackend {
   close?(): Promise<void> | void;
 }
 export interface IpcRendererLike { invoke(channel: string, request: HostRequest): Promise<HostResponse>; on(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; removeListener(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; }
+
+export { isRemoteAgentPageRequest, remoteAgentPage, REMOTE_RESPONSE_MAX_BYTES } from './remote-agent-pages.js';
+import { collectRemoteAgentPages } from './remote-agent-pages.js';
 
 function requestId(): string { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
 
@@ -1612,6 +1657,7 @@ function apiFrom(
     setSessionWorkspace: (sessionId, binding) => invoke("setSessionWorkspace", sessionId, binding),
     clearSessionWorkspace: (sessionId) => invoke("clearSessionWorkspace", sessionId),
     sessionWorkspaceStatus: (sessionId) => invoke("sessionWorkspaceStatus", sessionId),
+    getBashDetails: request => invoke("getBashDetails", request),
     getSessionHistory: (sessionId, before, limit) => before === undefined
       ? invoke("getSessionHistory", sessionId)
       : invoke("getSessionHistory", sessionId, before, limit),
@@ -1708,6 +1754,7 @@ function apiFrom(
     listUserMcpServers: projectId => invoke("listUserMcpServers", projectId),
     addUserMcpServer: (projectId, name, spec) => invoke("addUserMcpServer", projectId, name, spec),
     removeUserMcpServer: (projectId, name) => invoke("removeUserMcpServer", projectId, name),
+    applyOfficialUpdate: (action, id, version) => invoke("applyOfficialUpdate", action, id, version),
     checkForUpdates: () => invoke("checkForUpdates"),
     updateExtensionComponent: (extensionId, componentId) => componentId === undefined
       ? invoke("updateExtensionComponent", extensionId)
@@ -1800,6 +1847,7 @@ function apiFrom(
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   if (options.computerUsePermissions) api.openComputerUsePermission = kind => invoke("openComputerUsePermission", kind);
   if (!options.updateCenter) {
+    delete api.applyOfficialUpdate;
     delete api.checkForUpdates;
     delete api.updateExtensionComponent;
   }
@@ -2008,12 +2056,19 @@ export interface WebSocketLike { readyState: number; send(data: string): void; a
 export type CreateWsHostOptions = {
   /** Per-request wait for a matching response. Omit to use `WS_HOST_REQUEST_TIMEOUT_MS`. */
   requestTimeoutMs?: number;
+  /** Retire pending reads immediately when the connection owner replaces a socket. */
+  signal?: AbortSignal;
 };
 
 export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions = {}): PipiHostAPI {
-  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; sent: boolean }>();
+  const waiting: HostRequest[] = [];
+  // Startup loads project lists, extension contributions and agent pages at
+  // once. Stay below the relay's 32-request cap instead of dropping reads.
+  let inFlight = 0;
+  let pumping = false;
   const events = new Set<(event: HostEvent) => void>();
-  let disconnected = socket.readyState === 2 || socket.readyState === 3;
+  let disconnected = false;
   const requestTimeoutMs = options.requestTimeoutMs ?? WS_HOST_REQUEST_TIMEOUT_MS;
   const failPending = () => {
     if (disconnected) return;
@@ -2024,6 +2079,13 @@ export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions
       item.reject(error);
     }
     pending.clear();
+    waiting.length = 0;
+    inFlight = 0;
+    socket.removeEventListener("message", onMessage);
+    socket.removeEventListener("close", failPending);
+    socket.removeEventListener("error", failPending);
+    options.signal?.removeEventListener("abort", failPending);
+    events.clear();
   };
   const onMessage = (raw: unknown) => {
     if (disconnected) return;
@@ -2034,15 +2096,39 @@ export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions
       const item = pending.get(frame.id);
       if (!item) return;
       pending.delete(frame.id);
+      if (item.sent) inFlight -= 1;
       clearTimeout(item.timer);
       frame.ok ? item.resolve(frame.result) : item.reject(responseError(frame));
+      pump();
     } else {
       events.forEach(listener => listener(frame));
     }
   };
+  const pump = () => {
+    if (pumping || disconnected) return;
+    pumping = true;
+    try {
+      while (!disconnected && inFlight < 8 && waiting.length) {
+        const frame = waiting.shift()!;
+        const item = pending.get(frame.id);
+        if (!item) continue;
+        item.sent = true;
+        inFlight += 1;
+        try { socket.send(JSON.stringify(frame)); }
+        catch {
+          pending.delete(frame.id);
+          inFlight -= 1;
+          clearTimeout(item.timer);
+          item.reject(transportDisconnectedError());
+        }
+      }
+    } finally { pumping = false; }
+  };
   socket.addEventListener("message", onMessage);
   socket.addEventListener("close", failPending);
   socket.addEventListener("error", failPending);
+  options.signal?.addEventListener("abort", failPending, { once: true });
+  if (socket.readyState >= 2 || options.signal?.aborted) failPending();
   const call = (method: HostMethod, params: unknown[]) => new Promise<unknown>((resolve, reject) => {
     if (disconnected || socket.readyState === 2 || socket.readyState === 3) {
       reject(transportDisconnectedError());
@@ -2053,19 +2139,18 @@ export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions
       const item = pending.get(id);
       if (!item) return;
       pending.delete(id);
+      if (item.sent) inFlight -= 1;
       item.reject(transportTimeoutError());
+      pump();
     }, requestTimeoutMs);
-    pending.set(id, { resolve, reject, timer });
-    try {
-      socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
-    } catch {
-      pending.delete(id);
-      clearTimeout(timer);
-      reject(transportDisconnectedError());
-    }
+    pending.set(id, { resolve, reject, timer, sent: false });
+    waiting.push({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params });
+    pump();
   });
   const host = apiFrom(
-    call,
+    (method, params) => method === "listAgents"
+      ? collectRemoteAgentPages(page => call(method, [params[0], params[1], page]))
+      : call(method, params),
     (channel, predicate, listener) => {
       const relay = (event: HostEvent) => { if (event.channel === channel && predicate(event)) listener(event); };
       events.add(relay);

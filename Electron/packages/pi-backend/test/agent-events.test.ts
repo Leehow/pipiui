@@ -837,6 +837,18 @@ describe("subagent lifecycle → AgentSummary", () => {
     });
   });
 
+  it("keeps experiment worktrees unmergeable across terminal updates", async () => {
+    const { deliver, backend } = await harness();
+    deliver({ ...START, mergePolicy: "never" });
+    deliver({ ...END, worktreePath: "/tmp/wt", worktreeLifecycle: "pendingReview" });
+    await expect(backend.handle("getWorktreeStatus", ["session-1", "a1", "r1"])).resolves.toMatchObject({
+      lifecycle: "pendingReview", mergePolicy: "never", merge: "unavailable", discard: "ready",
+    });
+    deliver({ ...END, mergePolicy: "auto", worktreePath: "/tmp/wt", worktreeLifecycle: "pendingReview" });
+    await expect(backend.handle("getWorktreeStatus", ["session-1", "a1", "r1"])).resolves.toMatchObject({ mergePolicy: "never", merge: "unavailable" });
+    await expect(backend.handle("mergeWorktree", ["session-1", "a1", "r1"])).rejects.toThrow("mergePolicy=never");
+  });
+
   it("publishes the worktree lifecycle the panel badges read", async () => {
     const { deliver, events } = await harness();
     deliver(START);
@@ -900,7 +912,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(logs.map(log => [log.itemType, log.name ?? "", log.text, log.charCount])).toEqual([
       ["thinking", "", "Planning project rebuild", 2400],
       ["tool", "bash", "npm run build", undefined],
-      ["toolResult", "", "done", undefined]
+      ["toolResult", "", "", undefined] // Bash body is now fetched on explicit demand.
     ]);
   });
 

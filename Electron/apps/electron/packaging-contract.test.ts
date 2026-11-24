@@ -9,6 +9,20 @@ import workspacePackage from '../../package.json'
 import packageJSON from './package.json'
 
 describe('macOS packaging contract', () => {
+  it('ships the pinned Jev Python runtime and the unchanged upstream snapshot', () => {
+    expect(packageJSON.build.beforePack).toBe('./jev-before-pack.cjs')
+    expect(packageJSON.build.extraResources).toContainEqual({
+      from: '../../.jev-python/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}/python',
+      to: 'pipiui-runtime/extensions/webview-browser-extension/runtime/python',
+    })
+    const entry = packageJSON.build.extraResources.find(e => e.from === '../../resources/runtime')!
+    const source = resolve(import.meta.dirname, entry.from)
+    const filter = new FileMatcher(source, '/unused-package-target', p => p, entry.filter).createFilter()
+    for (const file of ['worker.py', 'vendor/jev_ultrafast/agent.py', 'vendor/jev_ultrafast/snapshot.js', 'vendor/LICENSE']) {
+      const path = resolve(source, 'extensions/webview-browser-extension/agent/jev-upstream', file)
+      expect(filter(path, statSync(path)), file).toBe(true)
+    }
+  })
   it('defines WS_NO_BUFFER_UTIL and WS_NO_UTF_8_VALIDATE so bundled ws skips empty native stubs', () => {
     const viteConfig = readFileSync(resolve(import.meta.dirname, 'electron.vite.config.ts'), 'utf8')
     expect(viteConfig).toMatch(/'process\.env\.WS_NO_BUFFER_UTIL':\s*JSON\.stringify\('1'\)/)
@@ -45,7 +59,7 @@ describe('macOS packaging contract', () => {
     expect(packageJSON.build.extraResources.map(entry => entry.to)).not.toEqual(
       expect.arrayContaining(['pi-ext', 'pi-philosophy', 'swift-extensions'])
     )
-    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+    expect(packageJSON.build.mac.extraResources).toContainEqual(expect.objectContaining({
       from: '../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
       to: 'pipiui-embedded'
     }))
@@ -90,7 +104,7 @@ describe('macOS packaging contract', () => {
 
   it('ships Hermes through the target-specific embedded runtime, never the source-tree node_modules exclusion', () => {
     const runtimeSource = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')
-    const embedded = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-embedded')
+    const embedded = packageJSON.build.mac.extraResources.find(entry => entry.to === 'pipiui-embedded')
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
     expect(runtimeSource?.filter).toContain('!**/target/**')
     expect(runtimeSource?.filter).toContain('!extensions/office-extension/bin/**/officecli')
@@ -365,7 +379,7 @@ describe('macOS packaging contract', () => {
     expect(wrapper).toContain("-name '*.framework' -o -name '*.xpc' -o -name '*.app'")
     expect(wrapper).toMatch(/codesign --sign "\$CSC_NAME" --force --timestamp --options runtime[\s\S]*--entitlements "\$MAC_INHERIT_ENTITLEMENTS" "\$nested"/)
     expect(wrapper).toMatch(/codesign --sign "\$CSC_NAME" --force --timestamp --options runtime[\s\S]*--entitlements "\$MAC_ENTITLEMENTS" "\$app"/)
-    expect(wrapper).toMatch(/--entitlements "\$MAC_ENTITLEMENTS" "\$app"\s+#[\s\S]*verify_embedded_node_signing "\$embedded_node" "\$app"\s+codesign --verify --deep --strict --verbose=2 "\$app"/)
+    expect(wrapper).toMatch(/--entitlements "\$MAC_ENTITLEMENTS" "\$app"\s+#[\s\S]*verify_embedded_node_signing "\$embedded_node" "\$app"[\s\S]*codesign --verify --deep --strict --verbose=2 "\$app"/)
     expect(wrapper).toMatch(/codesign --verify --deep --strict --verbose=2 "\$app"/)
     expect(wrapper).toMatch(/mv "\$APP_SRC" "\$APP_DST"[\s\S]*codesign --verify --deep --strict --verbose=2 "\$APP_DST"/)
   })

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -116,7 +117,8 @@ export async function writeProjectProductActivation(
   if (!parsed) throw new Error("project Product Profile activation must use schemaVersion 2");
   await mkdir(projectAgentDir, { recursive: true });
   const path = projectProductActivationPath(projectAgentDir);
-  const tmp = `${path}.${process.pid}-${Date.now()}.tmp`;
+  // Concurrent writers in one process share pid and millisecond; the UUID keeps their temp files apart.
+  const tmp = `${path}.${process.pid}-${Date.now()}-${randomUUID()}.tmp`;
   await writeFile(tmp, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
   try {
     await rename(tmp, path);
@@ -154,8 +156,10 @@ export async function readProjectProductActivation(
     }
     return current;
   }
+  // Schema 3 is the format Pipi Hydra writes into the same project, and Hydra migrates v2 back to it
+  // on read. Rewriting here would ping-pong the file between the two Apps on every read.
   const v3 = parseV3(raw, defaultProfileId);
-  if (v3) return writeProjectProductActivation(projectAgentDir, v3);
+  if (v3) return v3;
   const migrated = parseLegacy(raw, options.legacyProfileId ?? LEGACY_PRODUCT_PROFILE_ID);
   if (!migrated) throw new Error("project extension activation file is invalid");
   return writeProjectProductActivation(projectAgentDir, migrated);

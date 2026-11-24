@@ -78,13 +78,15 @@ describe("M4 tool wiring — image_gen / image_edit via extension entry", () => 
   async function loadExtension() {
     const mod = await import("../agent/index.js");
     const pi = mockPi();
-    (mod.default as unknown as (pi: unknown) => void)(pi.api);
+    await (mod.default as unknown as (pi: unknown) => Promise<void>)(pi.api);
     return pi;
   }
 
   function setFetch(responder: (url: string, call: number) => Response) {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      // Catalog startup is independent of the image-operation response sequence.
+      if (url === "https://cli-chat-proxy.grok.com/v1/models") return Response.json({ data: [] });
       const headers = (init?.headers ?? {}) as Record<string, string>;
       let body: Record<string, unknown> = {};
       try { body = JSON.parse(String(init?.body ?? "{}")); } catch {}

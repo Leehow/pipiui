@@ -48,9 +48,102 @@ function validTrial(value: TrialRecord, experimentId: string, filename: string):
 }
 const commandText = (command: CommandSpec) => `${command.shell ? "Shell" : "直接执行"}：${[command.executable, ...command.args].map((arg) => JSON.stringify(arg)).join(" ")}`;
 
+// Narrow renderer-only views of batch-control/comparison-control receipts.
+// Do not import the Node agent implementation into the panel.
+type BatchListItem = { id: string; experimentId: string; revision: number; state: string; progress: { queued: number; active: number; finished: number; total: number } };
+type ReportView = { experimentId: string; batchId: string; revision: number; fingerprint: string; state: string; totals: { planned: number; started: number; notStarted: number; startUnknown: number; missingRecords: number }; [key: string]: unknown };
+type ViewerResponse = { version: 1; requestId?: string; action?: "batch_list" | "batch_report"; batches?: BatchListItem[]; report?: ReportView; error?: { message: string } };
+const batchStateLabels: Record<string, string> = { queued: "排队中", running: "运行中", completed: "已结束（不代表质量通过）", cancelled: "已取消", interrupted: "已中断" };
+
 /** Use the host's React instance; compiled extension modules have no bare imports. */
 export function createComponent(react: typeof ReactTypes) {
   const { createElement: h, useEffect, useRef, useState } = react;
+  function BatchViewer({ api, experimentId }: { api?: ExtensionHostAPI; experimentId: string }) {
+    const [batches, setBatches] = useState<BatchListItem[]>([]);
+    const [report, setReport] = useState<ReportView>();
+    const [loaded, setLoaded] = useState(false);
+    const [offset, setOffset] = useState(0);
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState("");
+    const pending = useRef<{ requestId: string; action: "batch_list" | "batch_report"; batchId?: string; offset: number }>();
+    const timer = useRef<ReturnType<typeof setTimeout>>();
+    const alive = useRef(true);
+    function finish() {
+      pending.current = undefined;
+      if (timer.current) clearTimeout(timer.current);
+      setBusy(false);
+    }
+    function accept(value: ViewerResponse) {
+      const request = pending.current;
+      if (!alive.current || !request || value.requestId !== request.requestId) return;
+      finish();
+      if (value.error) { setError(value.error.message); return; }
+      if (value.version !== 1 || value.action !== request.action) { setError("批次响应身份不匹配，请重新读取。"); return; }
+      if (request.action === "batch_list") {
+        const items = value.batches;
+        if (!Array.isArray(items) || items.length > 20 || items.some((item) => !item || item.experimentId !== experimentId || typeof item.id !== "string" || !slug.test(item.id) || !Number.isInteger(item.revision) || typeof item.state !== "string" || !item.progress || ![item.progress.total, item.progress.queued, item.progress.active, item.progress.finished].every((n) => Number.isSafeInteger(n) && n >= 0))) {
+          setError("批次列表字段或实验身份不匹配。"); return;
+        }
+        setBatches(items); setOffset(request.offset); setLoaded(true);
+      } else {
+        const next = value.report;
+        if (!next || next.experimentId !== experimentId || next.batchId !== request.batchId || typeof next.fingerprint !== "string" || !Number.isInteger(next.revision) || typeof next.state !== "string" || !next.totals || ![next.totals.planned, next.totals.started, next.totals.notStarted, next.totals.startUnknown, next.totals.missingRecords].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+          setError("报告字段或批次身份不匹配。"); return;
+        }
+        setReport(next);
+      }
+    }
+    useEffect(() => {
+      alive.current = true;
+      const dispose = api?.subscribeExt((event) => {
+        if (event.type === "result" && event.payload) accept(event.payload as ViewerResponse);
+      });
+      return () => { alive.current = false; pending.current = undefined; if (timer.current) clearTimeout(timer.current); dispose?.(); };
+    }, [api, experimentId]);
+    async function load(action: "batch_list" | "batch_report", batchId?: string, pageOffset = offset) {
+      if (pending.current) return;
+      setError(""); setReport(undefined);
+      if (!api?.invoke) { setError("当前没有可用的实验控制通道，请打开项目会话。"); return; }
+      const requestId = globalThis.crypto.randomUUID();
+      pending.current = { requestId, action, batchId, offset: pageOffset };
+      setBusy(true);
+      timer.current = setTimeout(() => {
+        if (!alive.current) return;
+        finish(); setError("读取批次结果超时，可重新读取；不会启动任何 Pi。");
+      }, 30000);
+      try {
+        const result = await api.invoke(action, { version: 1, requestId, action, experimentId, ...(action === "batch_report" ? { batchId, section: "summary" } : { limit: 20, offset: pageOffset }) });
+        if (!alive.current || pending.current?.requestId !== requestId) return;
+        if (!result.ok) throw new Error(result.error.message);
+        const direct = result.data as ViewerResponse | undefined;
+        if (direct?.version === 1 && (direct.action === action || direct.error)) accept({ ...direct, requestId });
+        // A transport ack is not a report; wait for the correlated result event.
+      } catch (cause) {
+        if (!alive.current || pending.current?.requestId !== requestId) return;
+        finish(); setError(cause instanceof Error ? cause.message : "读取批次失败。");
+      }
+    }
+    return <section aria-label="Pi 批次与报告（只读）" style={cardStyle}>
+      <strong>Pi 批次与报告（只读）</strong>
+      <small>仅查询已保存的批次和报告，不启动 Pi、不采用、不合并。新实验或采用决定请在主聊天说明。</small>
+      <button type="button" disabled={busy} onClick={() => void load("batch_list", undefined, 0)}>读取已有 Pi 批次</button>
+      {busy && <small role="status">正在读取…</small>}
+      {error && <div role="alert">{error}<button type="button" aria-label="关闭批次错误" onClick={() => setError("")}>×</button></div>}
+      {loaded && !batches.length && <small>本页暂无已保存的 Pi 批次；不会自动运行。</small>}
+      {batches.map((batch) => <div key={batch.id} style={{ display: "grid", gap: 5 }}>
+        <span>{batch.id} · r{batch.revision} · {batchStateLabels[batch.state] ?? batch.state}</span>
+        <small>排队 {batch.progress.queued} · 活跃 {batch.progress.active} · 已结束 {batch.progress.finished} / {batch.progress.total}</small>
+        <button type="button" disabled={busy} onClick={() => void load("batch_report", batch.id)}>查看报告 {batch.id}</button>
+      </div>)}
+      {loaded && <div><span>批次列表第 {offset / 20 + 1} 页 </span><button type="button" disabled={busy || offset === 0} onClick={() => void load("batch_list", undefined, Math.max(0, offset - 20))}>上一页批次</button><button type="button" disabled={busy || batches.length < 20} onClick={() => void load("batch_list", undefined, offset + 20)}>下一页批次</button></div>}
+      {report && <section aria-label="批次报告摘要" style={{ overflowWrap: "anywhere" }}>
+        <strong>{report.batchId} · r{report.revision} · {batchStateLabels[report.state] ?? report.state}</strong>
+        <p>计划 {report.totals.planned} · 实际启动 {report.totals.started} · 未启动 {report.totals.notStarted} · 启动未知 {report.totals.startUnknown} · 缺失记录 {report.totals.missingRecords}</p>
+        <small>报告指纹：{report.fingerprint}。执行结束不等于质量通过；失败、未知用量与公平条件见下方原始摘要。</small>
+        <details><summary>展开权威报告摘要（含失败、限制与未知项）</summary><pre style={{ whiteSpace: "pre-wrap", maxHeight: 320, overflow: "auto" }}>{JSON.stringify(report, null, 2)}</pre></details>
+      </section>}
+    </section>;
+  }
   function InventoryReader({ api, record }: { api?: ExtensionHostAPI; record: PanelRecord }) {
     const [open, setOpen] = useState(false);
     const [kind, setKind] = useState<InventoryKind>("files");
@@ -285,6 +378,7 @@ export function createComponent(react: typeof ReactTypes) {
   }
   return function ExperimentPanel({ api }: { api?: ExtensionHostAPI }) {
     const [records, setRecords] = useState<PanelRecord[]>([]);
+    const [selectedExperiment, setSelectedExperiment] = useState("");
     const [id, setId] = useState("design-contrast");
     const [question, setQuestion] = useState("");
     const [scope, setScope] = useState(".");
@@ -372,7 +466,11 @@ export function createComponent(react: typeof ReactTypes) {
     const parsePaths = (value: string) => value.split(/\n/).map((part) => part.trim()).filter(Boolean);
 
     return <section aria-label="实验台" style={panelStyle}>
-      <header><h2 style={{ margin: "0 0 6px", fontSize: 17 }}>实验台</h2><p style={{ margin: 0, color: "var(--muted)", lineHeight: 1.6 }}>先验证问题，再决定采用。实验是可选流程，不会自动合并原型。</p></header>
+      <header><h2 style={{ margin: "0 0 6px", fontSize: 17 }}>实验台</h2><p style={{ margin: 0, color: "var(--muted)", lineHeight: 1.6 }}>请在主聊天说：“先做原型，比较方案后给我报告。”实验是可选流程，不会自动合并原型；无需填写下面的兼容表单。</p></header>
+      <section aria-label="查看已有实验" style={cardStyle}>
+        <label>查看实验<select style={fieldStyle} value={selectedExperiment} onChange={(event) => setSelectedExperiment(event.currentTarget.value)}><option value="">请选择已有实验</option>{records.map((record) => <option key={record.id} value={record.id}>{record.id} — {record.question}</option>)}</select></label>
+        {records.some((record) => record.id === selectedExperiment) && <BatchViewer key={selectedExperiment} api={api} experimentId={selectedExperiment} />}
+      </section>
       {error && <div role="alert" style={{ ...cardStyle, borderColor: "var(--danger)" }}><div style={{ display: "flex", gap: 8, alignItems: "start" }}><span style={{ flex: 1, overflowWrap: "anywhere" }}>{error}</span><button type="button" aria-label="关闭错误" onClick={() => setError("")}>×</button></div></div>}
       <form aria-label="新建实验" style={cardStyle} onSubmit={(event) => {
         event.preventDefault();
@@ -412,7 +510,7 @@ export function createComponent(react: typeof ReactTypes) {
           <details><summary>纳入／排除路径预览（每类最多 5 项，完整内容请查看清单）</summary>{inventoryKinds.slice(0, 5).map((kind) => <div key={kind}><strong>{inventoryLabels[kind]}（{inventoryCount(record, kind)}）</strong><ul style={{ paddingLeft: 18, overflowWrap: "anywhere" }}>{inventoryPreview(record, kind).slice(0, 5).map((item, index) => <li key={index}>{itemText(item)}</li>)}</ul>{inventoryCount(record, kind) > Math.min(5, inventoryPreview(record, kind).length) && <small>此类预览已截断。</small>}</div>)}</details>
         </div>}
         <InventoryReader key={`${record.id}-${record.sequence}`} api={api} record={record} />
-        {record.kind === "command" ? <CommandTrials key={`trials-${record.id}-${record.sequence}`} api={api} record={record} /> : <small>{record.kind === "pi" ? "Pi 行为评测" : "浏览器原型验收"}适配将在后续阶段提供；当前未执行此类实验。</small>}
+        {record.kind === "command" ? <CommandTrials key={`trials-${record.id}-${record.sequence}`} api={api} record={record} /> : <small>{record.kind === "pi" ? "Pi 行为评测" : "浏览器原型验收"}请从主聊天发起；已有 Pi 批次可在上方只读查看。此卡片本身不执行实验。</small>}
         <button type="button" disabled={busy} onClick={() => void invoke({ action: record.state === "draft" ? "freeze" : "revise", experimentId: record.id })}>{record.state === "draft" ? "冻结当前基线" : "创建新修订"}</button>
       </article>)}
     </section>;

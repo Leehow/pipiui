@@ -1,4 +1,7 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
+import { BashDetailsStore, bashInputSummary, boundedText, maskBashWindowEdges, transformBashPage } from "./bash-details.js";
+import { BashHistoryReader } from "./bash-history.js";
+import type { BashDetailRequest, BashDetailResponse } from "@pipi/host-api";
 import { createExtensionHostWorkers, type ExtensionHostWorkers } from "./extension-host-workers.js";
 import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs, type Dirent } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -38,6 +41,8 @@ import {
   type TurnTelemetryRendererSample,
   type Project,
   type QueueEnqueueResult,
+  type QueueFailureDetails,
+  type QueueFailureStage,
   type QuotaSnapshot,
   type PlanSnapshot,
   type ProductPackArchiveResult,
@@ -88,9 +93,10 @@ import {
   type ComputerDescriptor,
   type PiCommand,
   type SpawnFeatures,
+  MOUNTED_EXTENSIONS_ENV,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
-import { applyExtensionUpdate, extensionUpdateStoreRoot, findPackageRoot, installLocalExtensionPackage, type ExtensionUpdateResult } from "./extension-update-engine.js";
+import { applyExtensionUpdate, extensionUpdateStoreRoot, findPackageRoot, installLocalExtensionPackage, type ExtensionUpdateFetch, type ExtensionUpdateResult } from "./extension-update-engine.js";
 import {
   SEED_MANAGED_EXTENSION_IDS,
   applySeedMountOverrides,
@@ -148,6 +154,7 @@ import {
   type QueuedDispatchPayload,
   type QueuedMessage,
 } from "./message-queue.js";
+import { loginRecordStatus, QueueDispatchError } from "./queue-failure.js";
 import { FileQueueStore, type QueueStore } from "./queue-store.js";
 import { UserInputPriority } from "./user-input-priority.js";
 import {
@@ -239,7 +246,7 @@ import { handleExtEmit, handleExtState, toolResultDetailsField } from "./extensi
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import { JEV_COMPUTER_ENABLED_KEY, JEV_CONTEXT_ENABLED_KEY, JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
-import { JevCredentialStore, type ExtensionSecretCipher } from "./jev-credential-store.js";
+import { JevCredentialStore } from "./jev-credential-store.js";
 import {
   clearExtensionSecrets,
   extensionSecretEnvs,
@@ -408,6 +415,9 @@ export {
   ZCODE_TASK_COLUMNS,
   type ExternalSessionRoots,
 } from "./external-sessions.js";
+
+/** This source tree ships Coding only; project Product Profiles cannot change host identity. */
+const HOST_PRODUCT_ID = "pipiui";
 
 const MAX_TEXT_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_BINARY_DOCUMENT_BYTES = 50 * 1024 * 1024;
@@ -661,6 +671,7 @@ async function writeCanonicalModelsFile(path: string, contents: string): Promise
 }
 
 export type PiBackendOptions = {
+  appVersion?: string;
   /** Explicit Pi process invocation. Packaged Electron supplies bundled Node + unpacked Pi CLI. */
   piCommand?: PiCommand;
   /** Legacy/development shorthand for a directly executable external `pi`. */
@@ -727,16 +738,10 @@ export type PiBackendOptions = {
   /** Test-injected Structured Outputs validator. Production loads the grok host entry. */ structuredOutputNormalize?: StructuredOutputNormalize;
   structuredOutputsEnabled?: StructuredOutputsEnabled;
   /** In-memory vault namespace key. Never used as a disk path. */ vaultDir?: string;
-  /**
-   * Host-injected OS encryption for the Jev extension API key. The global tool vault
-   * stays RAM-only. Absent: reads without stored credentials work, but saving a key
-   * fails explicitly. Electron injects OS encryption; tests inject a fake cipher.
-   */
-  extensionSecretCipher?: ExtensionSecretCipher;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /**
-   * Always-on host summary compaction at the 45% + quiet threshold.
+   * Always-on host summary compaction at the 65% + quiet threshold.
    * Defaults off so Headroom/context-fold own the first pass; the scheduler
    * still falls back to a host `compact` when that rewrite leaves usage at
    * or above the high watermark. Pi keeps near-overflow / overflow safety.
@@ -867,6 +872,8 @@ type Live = {
   exiting?: boolean;
   /** Extension ids THIS child's spawn mounted (snapshot; the overlay may already differ). */
   mountedExtensionIds?: Set<string>;
+  providerMounts?: Map<string, Pick<QueueFailureDetails, "extensionId" | "extensionVersion" | "mountRequested" | "settingsSecretInjected">>;
+  agentDirAtSpawn?: string;
   /** A hot-reload/state change wants a respawn; deferred while the session was busy. */
   pendingExtensionRestart?: boolean;
   /** The child is not a settled turn until all spawn initialization has succeeded. */
@@ -1308,7 +1315,7 @@ async function rewriteSessionCwd(path: string, cwd: string): Promise<void> {
  * structure (thinking + toolCall parts on assistant, toolCallId on toolResult)
  * so resumed sessions render the same folded cards as the live stream.
  */
-function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
+function historyEntryFromMessage(entry: any, secrets: RevealedSecret[] = []): HistoryEntry | undefined {
   const message = entry.message ?? {};
   const role = message.role === "toolResult" ? "tool" : message.role;
   if (role !== "user" && role !== "assistant" && role !== "tool") return undefined;
@@ -1356,6 +1363,7 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
               ? JSON.stringify(args)
               : String(args ?? ""),
         };
+        if (tool.name === "bash") tool.input = bashInputSummary(redactText(tool.input, secrets));
         tools.push(tool);
         activities = activities ?? [];
         activities.push({ type: "tool", contentIndex, tool });
@@ -1408,6 +1416,12 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
     // (pi ToolResultMessage `details`). Kept separate from `content` so typed
     // image base64 never lands in the plain-text channel.
     if (message.details !== undefined) result.details = message.details;
+    if (message.toolName === "bash") {
+      result.content = "";
+      result.activities = undefined;
+      result.images = undefined;
+      result.details = undefined;
+    }
   }
   if (role === "assistant" && message.stopReason === "error") {
     const errorMessage =
@@ -1429,7 +1443,7 @@ function redactHistoryEntry(entry: HistoryEntry | undefined, secrets: RevealedSe
   };
 }
 function visibleHistoryEntry(entry: any, secrets: RevealedSecret[] = []): HistoryEntry | undefined {
-  if (entry?.type === "message") return redactHistoryEntry(historyEntryFromMessage(entry), secrets);
+  if (entry?.type === "message") return redactHistoryEntry(historyEntryFromMessage(entry, secrets), secrets);
   if (isVisibleCustomMessage(entry)) {
     const content = text(entry.content);
     if (!content) return undefined;
@@ -2137,6 +2151,10 @@ type IsolatedProjectHome = {
 };
 
 export class PiHostBackend implements HostBackend {
+  private readonly bashDetails = new BashDetailsStore();
+  private readonly bashHistory = new BashHistoryReader();
+  private readonly workerBashReady = new Map<string, SessionRuntimeToken>();
+  private readonly workerBashRequests = new Map<string, { sessionId: string; agentId: string; runId: string; toolCallId: string; field?: 'live' | 'input' | 'output'; offset?: number; resolve: (detail: BashDetailResponse) => void; timer: ReturnType<typeof setTimeout> }>();
   readonly protocolVersion = 2 as const;
   private listeners = new Set<(event: HostEvent) => void>();
   /** Paths opened outside a chat session (for example the global document watcher). */
@@ -2389,7 +2407,9 @@ export class PiHostBackend implements HostBackend {
   private structuredOutputsReady?: Promise<StructuredOutputController>;
   private structuredOutputNormalize?: StructuredOutputNormalize;
   private structuredOutputsEnabledFn?: StructuredOutputsEnabled;
+  private readonly appVersion?: string;
   constructor(options: PiBackendOptions = {}) {
+    this.appVersion = options.appVersion;
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
     this.proactiveSummaryCompaction = options.proactiveSummaryCompaction ?? false;
@@ -2397,7 +2417,7 @@ export class PiHostBackend implements HostBackend {
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.vaultDir = options.vaultDir ?? this.agentDir;
-    this.jevCredentials = new JevCredentialStore(options.extensionSecretCipher);
+    this.jevCredentials = new JevCredentialStore();
     this.agentPersistMinIntervalMs = options.agentPersistMinIntervalMs ?? AGENT_PERSIST_MIN_INTERVAL_MS;
     this.agentLogPersistDebounceMs = options.agentLogPersistDebounceMs ?? AGENT_LOG_PERSIST_DEBOUNCE_MS;
     this.agentRetentionMaxTerminal = options.agentRetentionMaxTerminal ?? AGENT_RETENTION_MAX_TERMINAL;
@@ -2513,6 +2533,7 @@ export class PiHostBackend implements HostBackend {
     this.refreshRuntimeTree();
     this.extensionLoader = new ExtensionLoader({
       registry: this.extensions,
+      productId: HOST_PRODUCT_ID,
       builtinRoot: join(this.runtimeRoot, "extensions"),
       appRoot: join(this.agentDir, "extensions"),
       sharedStoreRoot: this.extensionStoreRoot(),
@@ -2548,14 +2569,20 @@ export class PiHostBackend implements HostBackend {
         options.terminalAction
           ? options.terminalAction(event, sessionId)
           : { ok: false, error: "terminal host unavailable" },
-      onHostCapability: async (event, sessionId) =>
-        options.hostCapabilityAction
-          ? options.hostCapabilityAction(event, sessionId)
-          : { ok: false, code: "host_unavailable", error: "host capability broker unavailable" },
-      onHostCapabilityMint: async (event, sessionId) =>
-        options.hostCapabilityTokenAction
-          ? options.hostCapabilityTokenAction(event, sessionId)
-          : { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" },
+      onHostCapability: async (event, sessionId) => {
+        const bound = this.bindHostCapabilityProject(event, sessionId);
+        if (!bound) return { schemaVersion: 1, ok: false, code: "permission_denied", error: "host capability project does not belong to the active session" };
+        return options.hostCapabilityAction
+          ? options.hostCapabilityAction(bound, sessionId)
+          : { ok: false, code: "host_unavailable", error: "host capability broker unavailable" };
+      },
+      onHostCapabilityMint: async (event, sessionId) => {
+        const bound = this.bindHostCapabilityProject(event, sessionId);
+        if (!bound) return { schemaVersion: 1, ok: false, code: "permission_denied", error: "host capability project does not belong to the active session" };
+        return options.hostCapabilityTokenAction
+          ? options.hostCapabilityTokenAction(bound, sessionId)
+          : { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" };
+      },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
       onDocumentsList: (sessionId) => this.listOpenedDocumentsForSession(sessionId),
       onModelPinValidate: (input) =>
@@ -3109,6 +3136,14 @@ export class PiHostBackend implements HostBackend {
 
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
+    this.bashDetails.clear();
+    this.bashHistory.clear();
+    for (const pending of this.workerBashRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ state: "unavailable" });
+    }
+    this.workerBashRequests.clear();
+    this.workerBashReady.clear();
     // 宿主 worker 的生命周期就是"项目开着"，宿主关掉它们就该结束。
     this.extensionHostWorkers.stopAll();
     if (this.closed) return;
@@ -4305,6 +4340,39 @@ export class PiHostBackend implements HostBackend {
         return this.clearSessionWorkspace(params[0]);
       case "sessionWorkspaceStatus":
         return this.sessionWorkspaceStatus(params[0]);
+      case "getBashDetails": {
+        const request = params[0] as BashDetailRequest;
+        if (!request || typeof request.sessionId !== "string" || typeof request.toolCallId !== "string" || !request.toolCallId || request.toolCallId.length > 1024) throw new Error("Invalid bash detail identity");
+        const session = await this.findSession(request.sessionId);
+        if (request.agentId !== undefined || request.runId !== undefined) return this.readWorkerBashDetails(request);
+        const field = request.field ?? "live";
+        if (field !== "live" && field !== "input" && field !== "output") throw new Error("Invalid bash detail field");
+        const identity = { sessionId: request.sessionId, toolCallId: request.toolCallId };
+        const snapshot = this.bashDetails.get(request.sessionId, request.toolCallId);
+        if (field === "live" && snapshot) {
+          if (request.sinceRevision === snapshot.revision) return { identity, state: snapshot.state, revision: snapshot.revision, unchanged: true } satisfies BashDetailResponse;
+          return { ...snapshot, identity };
+        }
+        if (field !== "live") {
+          if (request.offset !== undefined && (!Number.isSafeInteger(request.offset) || request.offset < 0)) throw new Error("Invalid bash detail offset");
+          const page = await this.bashHistory.read(session.path, request.toolCallId, field, request.offset, value => redactText(value, this.sessionSecrets(request.sessionId)));
+          return { ...page, identity, text: redactText(page.text, this.sessionSecrets(request.sessionId)) };
+        }
+        const sanitize = (value: string) => redactText(value, this.sessionSecrets(request.sessionId));
+        const input = await this.bashHistory.read(session.path, request.toolCallId, "input", undefined, sanitize);
+        let output = await this.bashHistory.read(session.path, request.toolCallId, "output", undefined, sanitize);
+        const hasEarlierOutput = output.nextOffset !== undefined;
+        if (hasEarlierOutput) output = await this.bashHistory.read(session.path, request.toolCallId, "output", Math.max(0, output.totalBytes - 32768), sanitize);
+        const stillRunning = this.live.get(request.sessionId)?.toolNames.get(request.toolCallId) === "bash";
+        return {
+          identity,
+          state: stillRunning ? "running" : output.state === "running" ? "interrupted" : output.state,
+          input: redactText(input.text, this.sessionSecrets(request.sessionId)),
+          output: redactText(output.text, this.sessionSecrets(request.sessionId)),
+          inputTruncated: input.nextOffset !== undefined || input.truncated,
+          outputTruncated: hasEarlierOutput || output.truncated,
+        } satisfies BashDetailResponse;
+      }
       case "getSessionHistory": {
         const session = await this.findSession(params[0] as string);
         const requestedBefore = params[1];
@@ -4661,13 +4729,13 @@ export class PiHostBackend implements HostBackend {
             .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0) || left.runId.localeCompare(right.runId));
           const logs: CachedAgentLog[] = [];
           for (const run of runs) {
-            for (const entry of this.agentLogCache.get(this.agentLogKey(sessionId, agentId, run.runId)) ?? []) {
+            for (const entry of this.projectBashAgentLogs(this.agentLogCache.get(this.agentLogKey(sessionId, agentId, run.runId)) ?? [], sessionId)) {
               logs.push({ itemType: entry.itemType, text: entry.text, name: entry.name, isError: entry.isError, ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}) });
             }
           }
           return logs;
         }
-        return this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [];
+        return this.projectBashAgentLogs(this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [], sessionId);
       }
       case "abortAgent": {
         const [aSession, aAgentId, aRunId] = this.episodeWire("abortAgent", params);
@@ -5300,6 +5368,17 @@ export class PiHostBackend implements HostBackend {
       sessionsRoot: home.sessionsDir,
     };
   }
+  /** The authenticated bridge session owns grants; its worktree is only an execution directory. */
+  private bindHostCapabilityProject(event: Record<string, unknown>, sessionId: string): Record<string, unknown> | undefined {
+    const live = this.live.get(sessionId);
+    if (!live) return undefined;
+    const projectRoot = live.projectRoot ?? (live.cwd ? this.verifiedProjectRoot(live.cwd) : undefined);
+    if (!projectRoot) return undefined;
+    // Accept only this session's host-recorded project or cwd, never another project's grants.
+    if (event.projectRoot !== projectRoot && event.projectRoot !== live.cwd) return undefined;
+    return { ...event, projectRoot };
+  }
+
   private verifiedProjectRoot(displayOrCwd: string): string {
     if (this.profileMode !== "isolated") return displayOrCwd;
     return this.lookupIsolatedHome(displayOrCwd)?.realProjectRoot ?? displayOrCwd;
@@ -5906,6 +5985,15 @@ export class PiHostBackend implements HostBackend {
       };
       rollbackLive = live;
       live.mountedExtensionIds = mountedExtensionIds;
+      live.agentDirAtSpawn = spawnEnv.PI_CODING_AGENT_DIR;
+      const requested = new Set(output.env[MOUNTED_EXTENSIONS_ENV]?.split(","));
+      live.providerMounts = new Map();
+      for (const pkg of productSpawn.registeredExtensions) {
+        if (pkg.authProviderId) live.providerMounts.set(pkg.authProviderId, {
+          extensionId: pkg.id, extensionVersion: pkg.version, mountRequested: requested.has(pkg.id),
+          settingsSecretInjected: requested.has(pkg.id) && Object.keys(pkg.secretEnv ?? {}).some(key => Boolean(spawnEnv[key])),
+        });
+      }
       this.live.set(id, live);
       child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
     child.stderr.on("data", (chunk) => {
@@ -6296,15 +6384,19 @@ export class PiHostBackend implements HostBackend {
       } else if (d.type === "toolcall_delta") {
         const index = d.contentIndex ?? 0;
         const delta = redactor("tool", index).push(d.delta ?? "");
-        live.toolArgs.set(index, (live.toolArgs.get(index) ?? "") + delta);
-        this.stream({
+        const previousArgs = live.toolArgs.get(index) ?? "";
+        live.toolArgs.set(index, previousArgs + delta);
+        // RPC omits the tool name until toolcall_end. Keep provisional args
+        // bounded; named non-bash tools receive authoritative args at end.
+        const previewDelta = delta.slice(0, Math.max(0, 120 - previousArgs.length));
+        if (previewDelta) this.stream({
           type: "tool_call",
           sessionId: id,
           contentIndex: index,
           segment: live.messageEpoch,
           toolCallId: `content-${index}`,
           name: "tool",
-          delta,
+          delta: previewDelta,
         });
       } else if (d.type === "toolcall_end") {
         const index = d.contentIndex ?? 0;
@@ -6319,6 +6411,7 @@ export class PiHostBackend implements HostBackend {
             : typeof call.arguments === "string"
               ? redactText(call.arguments, secrets)
               : buffered;
+        if (call.name === "bash" && call.id) this.bashDetails.set(id, call.id, { input: args });
         this.stream({
           type: "tool_call",
           sessionId: id,
@@ -6326,7 +6419,7 @@ export class PiHostBackend implements HostBackend {
           segment: live.messageEpoch,
           toolCallId: call.id ?? `content-${index}`,
           name: call.name ?? "tool",
-          delta: args,
+          delta: call.name === "bash" ? bashInputSummary(args) : args,
         });
       }
       if (isHostedAssistantEvent(d)) {
@@ -6485,6 +6578,10 @@ export class PiHostBackend implements HostBackend {
       // proof; any tool could return a fold-shaped payload.
       if (typeof e.toolCallId === "string" && typeof e.toolName === "string") {
         live.toolNames.set(e.toolCallId, e.toolName);
+        if (e.toolName === "bash") {
+          const args = (e as { args?: unknown }).args;
+          if (args !== undefined) this.bashDetails.set(id, e.toolCallId, { input: redactText(JSON.stringify(args), this.sessionSecrets(id)) });
+        }
       }
     } else if (e.type === "tool_execution_update") {
       // A tool's onUpdate partial is a cumulative snapshot; reduce it to its
@@ -6493,6 +6590,11 @@ export class PiHostBackend implements HostBackend {
       // tool_execution_end; nothing here touches the transcript's tool card.
       const partialContent = (e as { partialResult?: { content?: unknown } }).partialResult?.content;
       const { text: partialText } = extractResult(partialContent);
+      const updateName = typeof e.toolName === "string" ? e.toolName : live.toolNames.get(e.toolCallId);
+      if (updateName === "bash") {
+        this.bashDetails.set(id, e.toolCallId, { output: redactText(partialText, this.sessionSecrets(id)), state: "running" });
+        return;
+      }
       const line = partialText.split("\n").filter((l) => l.trim()).pop()?.trim() ?? "";
       if (line) {
         this.stream({
@@ -6506,14 +6608,16 @@ export class PiHostBackend implements HostBackend {
     } else if (e.type === "tool_execution_end") {
       this.touchTurnActivity(live);
       const { text: resultText, images } = extractResult(e.result?.content)
+      const bashResult = live.toolNames.get(e.toolCallId) === "bash";
+      if (bashResult) this.bashDetails.set(id, e.toolCallId, { output: redactText(resultText, this.sessionSecrets(id)), state: e.isError ? "failed" : "completed" });
       this.stream({
         type: "tool_result",
         sessionId: id,
         toolCallId: e.toolCallId,
-        content: resultText,
-        images: images.length > 0 ? images : undefined,
+        content: bashResult ? "" : resultText,
+        images: !bashResult && images.length > 0 ? images : undefined,
         isError: e.isError,
-        ...toolResultDetailsField(e.result),
+        ...(!bashResult ? toolResultDetailsField(e.result) : {}),
       });
       // A successful `context_manage` fold (deterministic message rewrite, no
       // summarizer) is a fold, not a compaction: pi emits no compaction
@@ -6557,6 +6661,7 @@ export class PiHostBackend implements HostBackend {
     const epoch = live.turnEpoch;
     if (epoch === undefined || live.terminalEpoch === epoch) return false;
     live.terminalEpoch = epoch;
+    this.bashDetails.interrupt(live.session.id);
     live.pendingFinalReconciliation = undefined;
     this.turnTelemetry.terminal(live.session.id, status);
     this.stopEscalation.cancel(live.session.id);
@@ -6963,7 +7068,19 @@ export class PiHostBackend implements HostBackend {
   /** Pi model ids are not provider-unique. Never silently accept a same-id sibling. */
   private async selectExactModel(live: Live, provider: string, modelId: string) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await this.command(live.session.id, { type: "set_model", provider, modelId });
+      try {
+        await this.command(live.session.id, { type: "set_model", provider, modelId });
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== `Model not found: ${provider}/${modelId}`) throw error;
+        const occurredAt = Date.now();
+        const [appLogin, sessionLogin] = await Promise.all([
+          loginRecordStatus(this.agentDir, provider), loginRecordStatus(live.agentDirAtSpawn, provider),
+        ]);
+        throw new QueueDispatchError(error.message, {
+          stage: "select_model", occurredAt, platform: `${process.platform} ${process.arch}`, appVersion: this.appVersion,
+          provider, modelId, ...live.providerMounts?.get(provider), appLogin, sessionLogin,
+        });
+      }
       const state = await this.command(live.session.id, { type: "get_state" });
       if (state.model?.provider === provider && state.model?.id === modelId) return;
     }
@@ -7096,12 +7213,31 @@ export class PiHostBackend implements HostBackend {
         const target = this.settingsFile();
         await fs.mkdir(dirname(target), { recursive: true });
         const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
-        await fs.writeFile(
-          tmp,
-          JSON.stringify(settings, null, 2) + "\n",
-          "utf8",
-        );
-        await fs.rename(tmp, target);
+        try {
+          await fs.writeFile(
+            tmp,
+            JSON.stringify(settings, null, 2) + "\n",
+            "utf8",
+          );
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await fs.rename(tmp, target);
+              break;
+            } catch (error) {
+              // Windows readers can temporarily deny delete sharing, which
+              // prevents an otherwise valid atomic replacement. Keep the
+              // original intact and retry the same completed temporary file.
+              const code = (error as NodeJS.ErrnoException).code;
+              if (process.platform !== "win32" || attempt >= 9 ||
+                  !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) throw error;
+              // Cold-start readers can hold the file for several seconds.
+              // Ten attempts allow at most 7.175 seconds of asynchronous backoff.
+              await new Promise(resolve => setTimeout(resolve, Math.min(25 * 2 ** attempt, 2000)));
+            }
+          }
+        } finally {
+          await fs.rm(tmp, { force: true }).catch(() => undefined);
+        }
       });
     this.settingsWrite = write;
     await write;
@@ -8122,6 +8258,18 @@ export class PiHostBackend implements HostBackend {
       return withSeedVersionPriority(item, resolved);
     }));
   }
+  async updateOfficialExtension(extensionId: string, targetVersion: string, fetchImpl?: ExtensionUpdateFetch): Promise<void> {
+    const installed = (await this.listBundledUpdateExtensions()).find(item => item.id === extensionId);
+    if (!installed) throw new Error("本机未安装此官方扩展");
+    await applyExtensionUpdate({ extensionId, currentVersion: installed.version, targetVersion, source: { type: "official" } }, {
+      storeRoot: this.extensionStoreRoot(), seedRoot: this.seedRoot(), signingPublicKey: extensionUpdateSigningKey(), fetchImpl,
+    });
+    this.extensionLoader.scan(this.extensionLoader.loadedProject());
+    if (this.extensionLoader.authContribution(extensionId)) {
+      await this.refreshModelsAfterAuthChange(true, "extension").catch(error =>
+        console.warn("[pipiui] plugin installed; model catalog refresh failed", error));
+    }
+  }
   /** App-profile shared extension store (content-addressed objects + slots). */
   private extensionStoreRoot(): string {
     return extensionUpdateStoreRoot(this.agentDir);
@@ -8301,7 +8449,7 @@ export class PiHostBackend implements HostBackend {
     const { id, projectRoot } = await this.resolveExtensionDataAccess(idValue, projectId);
     if (typeof pathValue !== "string" || !pathValue.trim()) throw new Error("data path 必须是 string");
     const tail = isRecord(optionsValue) && typeof optionsValue.tailBytes === "number" ? optionsValue.tailBytes : undefined;
-    return this.extensionLoader.readDataFile(id, projectRoot, pathValue, tail);
+    return this.extensionLoader.readDataFile(id, projectRoot, pathValue, tail, isRecord(optionsValue) && optionsValue.allowMissing === true);
   }
 
   /**
@@ -8583,10 +8731,10 @@ export class PiHostBackend implements HostBackend {
     return { ...values, ...secretPresence(this.vaultDir, secretKeys) };
   }
   /**
-   * Durable OS-encrypted projection for the Jev API key ({projectAgentHome}/jev-optimizer/credential.enc).
-   * Written atomically BEFORE the per-run vault cache, matching the PDF durable-then-cache order
-   * without copying its plaintext file. Missing encryption must never pretend a key was saved.
-   * Clear deletes the blob even without a cipher so it cannot resurrect.
+   * Local Jev API key ({projectAgentHome}/jev-optimizer/credential.json).
+   * Written atomically BEFORE the per-run vault cache, matching the PDF durable-then-cache order.
+   * A failed disk write must never pretend a key was saved. Clear removes the local credential.
+   * Legacy ciphertext is never read, so it cannot resurrect a cleared key.
    */
   private async persistJevCredential(
     extensionId: string,
@@ -8684,7 +8832,7 @@ export class PiHostBackend implements HostBackend {
         this.jevRuntimeState.revokeComputer(root);
       }
       const namespace = this.extensionVaultNamespace(scope, root);
-      // Durable projection first: paddleocr.json / Jev ciphertext are authoritative across restarts.
+      // Durable projection first: paddleocr.json / Jev credential.json are authoritative across restarts.
       await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
       try {
         await this.persistJevCredential(id, root, { saved: validated.secrets, cleared: validated.cleared });
@@ -8965,7 +9113,7 @@ export class PiHostBackend implements HostBackend {
    * store) and returned keyed by env var name. Values never enter settings snapshots,
    * IPC payloads, or redaction/transcript surfaces. For pdf-extension the durable
    * store is `{projectAgentHome}/paddleocr.json`; for jev-optimizer it is the
-   * OS-encrypted `{projectAgentHome}/jev-optimizer/credential.enc`. Both hydrate into
+   * local `{projectAgentHome}/jev-optimizer/credential.json`. Both hydrate into
    * the same project vault namespace used by settings presence, so code and browser
    * spawns share one credential after restart.
    */
@@ -9811,7 +9959,10 @@ export class PiHostBackend implements HostBackend {
         await this.registerExtensionAuthProviders(real);
         return {
           getProviders: () => real.getProviders(),
-          getAvailable: () => real.getAvailable(),
+          getAvailable: async () => {
+            await this.registerExtensionAuthProviders(real, true);
+            return real.getAvailable();
+          },
           login: (p: any, t: any, i: any) => real.login(p, t, i),
           logout: (p: any) => real.logout(p),
         };
@@ -9828,9 +9979,11 @@ export class PiHostBackend implements HostBackend {
   private async registerExtensionAuthProviders(real: {
     registerProvider?(id: string, config: unknown): void;
     getProvider?(id: string): unknown;
-  }): Promise<void> {
+  }, refreshExisting = false): Promise<void> {
     await registerExtensionAuthProviders({
       runtime: real,
+      authPath: join(this.agentDir, "auth.json"),
+      refreshExisting,
       claims: this.extensionLoader.contributionClaims(),
       directoryOf: (id) => this.extensionLoader.directoryOf(id),
     });
@@ -10665,13 +10818,17 @@ export class PiHostBackend implements HostBackend {
     if (recordTurn) this.turnTelemetry.beginDispatch(id, payload.turnTelemetry);
     let leaseAttempt: SessionLeaseAttempt | undefined;
     let leaseCommitted = false;
+    let stage: QueueFailureStage = "lease";
+    const model = this.sessionModelStates.get(id)?.model;
     try {
       leaseAttempt = await this.requireLease(id, generation);
       this.assertSessionGeneration(id, generation);
       // This check is the linearization point for a queued dispatch: teardown
       // can revoke it while lease acquisition is paused, before ensure() runs.
+      stage = "session";
       const live = await this.ensure(id, generation);
       this.assertSessionGeneration(id, generation);
+      stage = "prepare_message";
       if (behavior === "prompt" && payload.text.trim()) {
         await this.startAutomaticSessionTitle(live, payload.text);
         this.assertSessionGeneration(id, generation);
@@ -10719,10 +10876,12 @@ export class PiHostBackend implements HostBackend {
         this.turnTelemetry.preparationComplete(id, Buffer.byteLength(JSON.stringify(body), "utf8"));
         this.turnTelemetry.dispatchStarted(id);
       }
+      let rpcReceipt: any;
       try {
         this.structuredOutputs?.assertReadyToSend(id);
         this.assertSessionGeneration(id, generation);
-        await this.command(id, body, false, runtimeToken);
+        stage = "dispatch";
+        rpcReceipt = await this.command(id, body, false, runtimeToken);
         this.assertSessionGeneration(id, generation);
       } catch (error) {
         if (body.type !== "prompt" || !isAlreadyProcessingError(error)) {
@@ -10740,8 +10899,13 @@ export class PiHostBackend implements HostBackend {
         // Register before writing: a user echo can arrive before the RPC ack.
         const receipt = this.noteUnconfirmedSteer(id, payload, source?.id);
         try {
-          await this.command(id, { ...body, streamingBehavior: "steer" }, false, runtimeToken);
+          rpcReceipt = await this.command(id, { ...body, streamingBehavior: "steer" }, false, runtimeToken);
           this.assertSessionGeneration(id, generation);
+          if (rpcReceipt?.disposition === "handled") {
+            const remaining = this.unconfirmedSteers.get(id)?.filter(item => item !== receipt);
+            if (remaining?.length) this.unconfirmedSteers.set(id, remaining);
+            else this.unconfirmedSteers.delete(id);
+          }
         } catch (fallbackError) {
           if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) {
             const remaining = this.unconfirmedSteers.get(id)?.filter(item => item !== receipt);
@@ -10753,14 +10917,29 @@ export class PiHostBackend implements HostBackend {
       }
       this.assertSessionGeneration(id, generation);
       if (recordTurn) this.turnTelemetry.dispatchAccepted(id);
-      if (behavior === "steer" && payload.text.trim()) this.noteUnconfirmedSteer(id, payload);
+      if (rpcReceipt?.disposition === "handled") {
+        if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
+        if (!this.queue.isTurnActive(id)) {
+          if (recordTurn) {
+            this.turnTelemetry.terminal(id, "settled");
+            this.turnTelemetry.flushTerminal(id);
+          }
+          this.stream({ type: "status", sessionId: id, status: "settled", pendingFollowUps: live.followUps, turnEpoch: live.turnEpoch });
+        }
+      } else if (behavior === "steer" && payload.text.trim()) this.noteUnconfirmedSteer(id, payload);
       leaseCommitted = true;
+      return rpcReceipt;
     } catch (error) {
       if (!leaseCommitted) await this.rollbackSessionLeaseAttempt(leaseAttempt);
       // A revoked dispatch must not terminalize telemetry belonging to a new
       // lifecycle that reused this session id.
       if (recordTurn && this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) this.turnTelemetry.failDispatch(id);
-      throw error;
+      if (error instanceof QueueDispatchError) throw error;
+      const message = redactText(error instanceof Error ? error.message : String(error), this.sessionSecrets(id));
+      throw new QueueDispatchError(message, {
+        stage, occurredAt: Date.now(), platform: `${process.platform} ${process.arch}`, appVersion: this.appVersion,
+        provider: model?.provider, modelId: model?.id,
+      });
     }
   }
 
@@ -10903,11 +11082,12 @@ export class PiHostBackend implements HostBackend {
     // Explicit user input lifts manual-stop revival suppression.
     this.noteExplicitUserSend(id);
     this.beginSessionRuntime(id);
-    await this.dispatchQueuedMessage(
+    const receipt = await this.dispatchQueuedMessage(
       id,
       { text: prompt, attachments: [] },
       "follow_up",
     );
+    if (receipt?.disposition === "handled") return;
     const live = this.live.get(id);
     if (!live) return;
     live.followUps.push(prompt);
@@ -11819,7 +11999,7 @@ export class PiHostBackend implements HostBackend {
     const status: WorktreeStatus = {
       ...current,
       lifecycle: "pendingReview",
-      merge: "ready",
+      merge: current.mergePolicy === "never" ? "unavailable" : "ready",
       discard: "ready",
     };
     this.worktrees.set(key, status);
@@ -11933,6 +12113,74 @@ export class PiHostBackend implements HostBackend {
     }
   }
 
+  private projectBashAgentLogs(logs: CachedAgentLog[], sessionId: string): CachedAgentLog[] {
+    const bashCalls = new Set(logs.filter(log => log.itemType === "tool" && log.name === "bash").map(log => log.toolCallId).filter(Boolean));
+    const legacyBash = logs.some(log => log.itemType === "tool" && log.name === "bash" && !log.toolCallId);
+    return logs.map((log, index) => {
+      // Legacy logs have no stable call id. Mirror only reliable slot/adjacent
+      // pairing; an ambiguous nameless result degrades instead of loading body.
+      const preceding = logs[index - 1];
+      const slot = log.contentIndex === undefined ? undefined : logs.find(item => item.itemType === "tool" && item.contentIndex === log.contentIndex);
+      const legacyOwner = slot ?? (preceding?.itemType === "tool" ? preceding : undefined);
+      if (log.itemType === "toolResult" && !log.toolCallId && !log.name && (legacyOwner?.name === "bash" || (!legacyOwner && legacyBash))) return { ...log, text: "" };
+      if (log.itemType === "tool" && log.name === "bash") return { ...log, text: boundedText(redactText(maskBashWindowEdges(log.text, this.sessionSecrets(sessionId), false, true), this.sessionSecrets(sessionId)), false, 120) };
+      if (log.itemType === "toolResult" && (log.name === "bash" || (log.toolCallId && bashCalls.has(log.toolCallId)))) return { ...log, name: "bash", text: "" };
+      return log;
+    });
+  }
+
+  private bashAgentLogForUI(entry: CachedAgentLog, sessionId: string, agentId: string, runId: string): CachedAgentLog & { itemType: "toolResult" | "tool" | "text" | "thinking" } {
+    const logs = entry.itemType === "toolResult" || entry.name === "bash" ? this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [] : [];
+    const index = entry.contentIndex === undefined ? logs.length - 1 : logs.findIndex(log => log.contentIndex === entry.contentIndex);
+    const projected = index >= 0 ? this.projectBashAgentLogs(logs, sessionId)[index]! : entry;
+    const itemType = projected.itemType === "toolResult" || projected.itemType === "tool" || projected.itemType === "thinking" ? projected.itemType : "text";
+    return { ...projected, itemType };
+  }
+
+  private async readWorkerBashDetails(request: BashDetailRequest): Promise<BashDetailResponse> {
+    const { sessionId, agentId, runId, toolCallId } = request;
+    if (typeof agentId !== "string" || !/^[A-Za-z0-9_-]{2,160}$/.test(agentId) || typeof runId !== "string" || !runId || runId.length > 160) throw new Error("Exact worker run is required for bash details");
+    if (request.field !== undefined && !["live", "input", "output"].includes(request.field)) throw new Error("Invalid bash detail field");
+    if (request.offset !== undefined && (!Number.isSafeInteger(request.offset) || request.offset < 0)) throw new Error("Invalid bash detail offset");
+    await this.getAgentExact(sessionId, agentId, runId);
+    const identity = { sessionId, agentId, runId, toolCallId };
+    const logs = this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [];
+    const call = logs.find(log => log.itemType === "tool" && log.toolCallId === toolCallId && log.name === "bash");
+    const result = call ? logs.find(log => log.itemType === "toolResult" && log.toolCallId === toolCallId) : undefined;
+    const fallback: BashDetailResponse = {
+      identity, state: "unavailable", input: call ? boundedText(redactText(maskBashWindowEdges(call.text, this.sessionSecrets(sessionId), false, true), this.sessionSecrets(sessionId)), false, 32768) : undefined,
+      output: result ? boundedText(redactText(maskBashWindowEdges(result.text, this.sessionSecrets(sessionId), true, false), this.sessionSecrets(sessionId)), true, 32768) : undefined,
+      inputTruncated: Boolean(call), outputTruncated: Boolean(result), truncated: true,
+    };
+    const owner = this.liveSessionProcess(sessionId);
+    const readyToken = this.workerBashReady.get(this.agentKey(agentId, sessionId, runId));
+    // Capabilities belong to one owner instance, not to a session across restarts.
+    if (!owner || readyToken === undefined || readyToken !== owner.runtimeToken || this.closed) return fallback;
+    if (this.workerBashRequests.size >= 4) throw new Error("Worker bash detail channel busy");
+    const requestId = crypto.randomUUID();
+    return new Promise<BashDetailResponse>((resolve, reject) => {
+      const fail = (error: unknown) => {
+        const pending = this.workerBashRequests.get(requestId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.workerBashRequests.delete(requestId);
+        reject(error);
+      };
+      const timer = setTimeout(() => fail(new Error("子代理日志读取超时，请重试。")), 2500);
+      this.workerBashRequests.set(requestId, { sessionId, agentId, runId, toolCallId, field: request.field, offset: request.offset, resolve: value => {
+        // An evicted runtime cache falls back to the explicitly limited old log.
+        resolve(value.state === "unavailable" ? fallback : value);
+      }, timer });
+      const payload = encodeURIComponent(JSON.stringify({ requestId, agentId, runId, toolCallId, field: request.field, offset: request.offset, sinceRevision: request.sinceRevision }));
+      // No ensure(), auto-spawn or retry: never redirect a detail request to a
+      // replacement runtime that has not advertised this command.
+      if (this.liveSessionProcess(sessionId) !== owner) {
+        clearTimeout(timer); this.workerBashRequests.delete(requestId); resolve(fallback); return;
+      }
+      void this.writeCommand(owner, { type: "prompt", message: `/subagent_bash_detail ${payload}`, streamingBehavior: "followUp" }).catch(fail);
+    });
+  }
+
   private async agentCommand(sessionId: string, id: string, runId: string, operation: "abort" | "resolve") {
     // Exact episode binding: the composite key names the row the caller is looking
     // at. A stale run or another session's same-slug worker is rejected here; the
@@ -12031,6 +12279,8 @@ export class PiHostBackend implements HostBackend {
     if (newerLiveRun)
       throw new Error(`worktree ${operation} refused: a newer run of ${id} is live in this session and owns the worktree`);
     const current = await this.getWorktree(sessionId, id, runId);
+    if (operation === "merge" && current.mergePolicy === "never")
+      throw new Error("worktree merge refused: experiment mergePolicy=never; adoption requires a separate implementation");
     if (current.lifecycle === "none")
       throw new Error(`no worktree recorded for ${id} run ${runId || "?"} in session ${sessionId || "?"}`);
     if (operation === "merge" && current.merge !== "ready")
@@ -12298,7 +12548,10 @@ export class PiHostBackend implements HostBackend {
         : undefined;
     const lifecycle = explicit ?? fallback;
     if (!lifecycle) return;
+    const mergePolicy = raw.mergePolicy === "never" || previous?.mergePolicy === "never"
+      ? "never" : raw.mergePolicy === "auto" ? "auto" : previous?.mergePolicy;
     const status: WorktreeStatus = {
+      ...(mergePolicy ? { mergePolicy } : {}),
       agentId: raw.agentId,
       sessionId,
       runId: raw.runId,
@@ -12307,7 +12560,9 @@ export class PiHostBackend implements HostBackend {
       error: raw.worktreeError ?? previous?.error,
       lifecycle,
       merge:
-        lifecycle === "pendingReview"
+        mergePolicy === "never"
+          ? "unavailable"
+          : lifecycle === "pendingReview"
           ? "ready"
           : lifecycle === "merged" || lifecycle === "mergedCleanupPending"
             ? "merged"
@@ -12331,6 +12586,44 @@ export class PiHostBackend implements HostBackend {
     );
   }
   private mapAgentEvent(raw: any, sessionId?: string) {
+    if (raw.kind === "bash_detail_ready") {
+      const owner = sessionId ? this.liveSessionProcess(sessionId) : undefined;
+      if (owner?.process?.pid && raw.ownerPid === owner.process.pid && sessionId && typeof raw.agentId === "string" && typeof raw.runId === "string") {
+        this.workerBashReady.set(this.agentKey(raw.agentId, sessionId, raw.runId), owner.runtimeToken);
+        while (this.workerBashReady.size > 512) this.workerBashReady.delete(this.workerBashReady.keys().next().value!);
+      }
+      return;
+    }
+    if (raw.kind === "bash_detail") {
+      const pending = this.workerBashRequests.get(raw.requestId);
+      if (!pending || sessionId !== pending.sessionId || raw.agentId !== pending.agentId || raw.runId !== pending.runId) return;
+      this.workerBashRequests.delete(raw.requestId);
+      clearTimeout(pending.timer);
+      const data = raw.detail;
+      const state = data && ["running", "completed", "failed", "interrupted", "unavailable"].includes(data.state) ? data.state as BashDetailResponse["state"] : "unavailable";
+      const secrets = this.sessionSecrets(pending.sessionId);
+      const safeText = (value: unknown, left = false, right = false) => typeof value === "string" ? boundedText(redactText(maskBashWindowEdges(value, secrets, left, right), secrets), false, 32768) : undefined;
+      const rawPage = typeof data?.text === "string" ? data.text : undefined;
+      const page = rawPage === undefined ? undefined : transformBashPage(rawPage, (value, clipped) => redactText(maskBashWindowEdges(value, secrets,
+        (pending.offset ?? 0) > 0 || (pending.field === "output" && data?.truncated === true),
+        clipped || data?.nextOffset !== undefined || (pending.field === "input" && data?.truncated === true)), secrets));
+      const nextOffset = page && rawPage !== undefined && page.consumedBytes < Buffer.byteLength(rawPage)
+        ? (pending.offset ?? 0) + page.consumedBytes
+        : Number.isSafeInteger(data?.nextOffset) && data.nextOffset >= 0 ? data.nextOffset : undefined;
+      pending.resolve({
+        identity: { sessionId: pending.sessionId, agentId: pending.agentId, runId: pending.runId, toolCallId: pending.toolCallId },
+        state, revision: Number.isSafeInteger(data?.revision) ? data.revision : undefined,
+        unchanged: data?.unchanged === true,
+        input: safeText(data?.input, false, data?.inputTruncated === true),
+        output: safeText(data?.output, data?.outputTruncated === true, false),
+        text: page?.text,
+        inputTruncated: data?.inputTruncated === true, outputTruncated: data?.outputTruncated === true,
+        truncated: data?.truncated === true,
+        nextOffset,
+        totalBytes: Number.isSafeInteger(data?.totalBytes) && data.totalBytes >= 0 ? data.totalBytes : undefined,
+      });
+      return; // Point-to-point reply only: never cache/broadcast a detail response.
+    }
     const key = this.agentKey(raw.agentId, sessionId, raw.runId);
     const current = this.agents.get(key);
     const eventKind = ["start", "end", "update", "usage", "log", "log_delta", "closeout", "diagnostics", "activity", "stalled"].includes(raw.kind)
@@ -12559,7 +12852,7 @@ export class PiHostBackend implements HostBackend {
       // authoritative turn boundary instead of rewriting the whole log store
       // for every 50ms preview frame.
       this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry, false);
-      this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
+      this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...this.bashAgentLogForUI(entry, logSessionId, agent.agentId, agent.runId) });
     } else if (raw.kind === "log" && logSessionId) {
       this.resetAgentLogStreamSlots(logSessionId, agent.agentId, agent.runId);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, itemType: "text", text: "", resetStreamSlots: true });
@@ -12567,7 +12860,7 @@ export class PiHostBackend implements HostBackend {
         const charCount = num2(item.charCount);
         const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError, ...(typeof item.toolCallId === "string" && item.toolCallId ? { toolCallId: item.toolCallId } : {}), ...(charCount === undefined ? {} : { charCount }) };
         this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
-        this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
+        this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...this.bashAgentLogForUI(entry, logSessionId, agent.agentId, agent.runId) });
       }
     }
     // A text-only turn may produce no terminal `log` batch because its streamed
@@ -12625,8 +12918,6 @@ export { FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from "./freeze-probe.js";
 export { HEADROOM_ENGINE_VERSION } from "./headroom-managed-runtime.js";
 export {
   JevCredentialStore,
-  jevCredentialCipherPath,
-  EXTENSION_SECRET_ENCRYPTION_UNAVAILABLE,
-  JEV_CREDENTIAL_DECRYPT_FAILED,
-  type ExtensionSecretCipher,
+  jevCredentialPath,
+  JEV_CREDENTIAL_READ_FAILED,
 } from "./jev-credential-store.js";

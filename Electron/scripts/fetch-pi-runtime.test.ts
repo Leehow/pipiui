@@ -49,7 +49,7 @@ describe('persistent embedded Pi runtime CLI', () => {
         return header
       })()),
       writeFile(launcher, '#!/bin/sh\n'),
-      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' }))
+      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '1.0.0' }))
     ])
     await Promise.all([chmod(node, 0o755), chmod(launcher, 0o755)])
     for (const [name, version] of [['pi-web-access', '0.28.0'], ['pi-mcp-extension', '1.5.0']]) {
@@ -68,7 +68,7 @@ describe('persistent embedded Pi runtime CLI', () => {
       piLauncher: 'pi/bin/pi',
       nodeModules: 'pi/lib/node_modules',
       packages: {
-        '@earendil-works/pi-coding-agent': '0.84.2',
+        '@earendil-works/pi-coding-agent': '1.0.0',
         'pi-web-access': '0.28.0',
         'pi-mcp-extension': '1.5.0',
         'pi-hermes-memory': '0.9.8',
@@ -108,6 +108,43 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(missing.stderr).toContain('Embedded Pi runtime check failed for darwin-x64')
     expect(missing.stderr).toContain('npm --prefix Electron run runtime:prepare -- --platform darwin --arch x64')
     expect(await readdir(root)).toEqual(beforeEntries)
+  })
+
+  it('rejects a cached runtime carrying unused legacy SDK peers without deleting its files', async () => {
+    const target = await seed()
+    const oldSdk = join(target, 'pi/lib/node_modules/@mariozechner/pi-coding-agent')
+    const clipboard = join(target, 'pi/lib/node_modules/@mariozechner/clipboard')
+    await Promise.all([mkdir(oldSdk, { recursive: true }), mkdir(clipboard, { recursive: true })])
+    await writeFile(join(oldSdk, 'package.json'), JSON.stringify({ version: '0.73.1' }))
+    await writeFile(join(clipboard, 'package.json'), JSON.stringify({ version: '0.3.9' }))
+    const result = run(['--check'], '')
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('unused legacy Pi SDK @mariozechner/pi-coding-agent')
+    expect(JSON.parse(await readFile(join(oldSdk, 'package.json'), 'utf8')).version).toBe('0.73.1')
+    expect(JSON.parse(await readFile(join(clipboard, 'package.json'), 'utf8')).version).toBe('0.3.9')
+  })
+
+  it('requires refreshing a cache that still carries the Domino test corpus', async () => {
+    const target = await seed()
+    const fixtures = join(target, 'pi/lib/node_modules/fixture-package/node_modules/@mixmark-io/domino/test')
+    await mkdir(fixtures, { recursive: true })
+    await writeFile(join(fixtures, 'fixture.html'), '<p>test data</p>')
+    const result = run(['--check'], '')
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('unused Domino HTML test corpus')
+    expect(await readFile(join(fixtures, 'fixture.html'), 'utf8')).toBe('<p>test data</p>')
+  })
+
+  it('rejects foreign esbuild prebuilds at nested peer locations without touching the target binary', async () => {
+    const target = await seed()
+    const scope = join(target, 'pi/lib/node_modules/peer/node_modules/@esbuild')
+    await Promise.all(['linux-x64', 'darwin-arm64'].map(name => mkdir(join(scope, name, 'bin'), { recursive: true })))
+    await writeFile(join(scope, 'linux-x64/bin/esbuild'), 'foreign binary')
+    await writeFile(join(scope, 'darwin-arm64/bin/esbuild'), 'target binary')
+    const result = run(['--check'], '')
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('esbuild prebuilt for linux-x64, expected darwin-arm64')
+    expect(await readFile(join(scope, 'darwin-arm64/bin/esbuild'), 'utf8')).toBe('target binary')
   })
 
   it('never execs Helper.app from the Node shim (Gatekeeper re-scan)', async () => {

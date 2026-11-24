@@ -22,7 +22,7 @@ function moduleRoot() {
  * agent provider module. No per-extension host special case. Credential
  * persistence stays in pi's credential store under the current Pi home.
  */
-async function registerBundledAuthProviders(rt) {
+async function registerBundledAuthProviders(rt, refreshExisting = false) {
   try {
     if (typeof rt.registerProvider !== "function") return;
     // Same home precedence as extension agent halves: PI_COC_AGENT_DIR >
@@ -47,9 +47,9 @@ async function registerBundledAuthProviders(rt) {
             ? mod.GROK_BUILD_PROVIDER_ID.trim()
             : fallbackId;
         if (typeof factory !== "function" || !id || seen.has(id)) return;
-        if (typeof rt.getProvider === "function" && rt.getProvider(id)) { seen.add(id); return; }
+        if (!refreshExisting && typeof rt.getProvider === "function" && rt.getProvider(id)) { seen.add(id); return; }
         seen.add(id);
-        rt.registerProvider(id, factory());
+        rt.registerProvider(id, await factory({ authPath: join(agentDir, "auth.json"), cacheDir: null }));
       } catch (error) {
         console.warn(`[pi-auth-helper] auth provider registration failed (${origin}): ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -95,6 +95,10 @@ export function serializeAvailableModel(model) {
     input: model.input,
     thinkingLevelMap: model.thinkingLevelMap,
     compat: model.compat,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    cost: model.cost,
+    capabilities: model.capabilities,
   };
 }
 function interaction() {
@@ -111,7 +115,9 @@ async function runCommand(rt, command, args) {
 }
 /** Reset the reused runtime's cached catalog/availability so the next command re-fetches (auth change). */
 async function reload(rt) {
-  if (typeof rt.refresh === "function") await rt.refresh({ force: true, allowNetwork: true, signal: AbortSignal.timeout(MODEL_REFRESH_TIMEOUT_MS) });
+  const signal = AbortSignal.timeout(MODEL_REFRESH_TIMEOUT_MS);
+  await registerBundledAuthProviders(rt, true);
+  if (typeof rt.refresh === "function") await rt.refresh({ force: true, allowNetwork: true, signal });
 }
 /** Resident worker: reuse one ModelRuntime across many commands via newline-delimited JSON-RPC on stdin/stdout. */
 async function serve() {

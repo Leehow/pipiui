@@ -114,7 +114,7 @@
 <body>
   <div class="wrap">
     <header>
-      <p class="eyebrow">Open source · macOS / Windows / Linux</p>
+      <p class="eyebrow">Open source · macOS / Windows / Linux / Android</p>
       <h1>PipiUI</h1>
       <p class="lead">pi coding agent 的图形界面。管理项目与会话，看着工具实时流式输出，也可以从手机或浏览器远程接管。</p>
     </header>
@@ -122,29 +122,42 @@
     <div class="downloads">
       <article class="card">
         <h2>macOS 版</h2>
-        <p class="meta">Electron · macOS 14+ · Apple 芯片 · Coding 版 2026-09-13 · 基础版 2026-09-08</p>
+        <p class="meta">Electron · macOS 14+ · Apple 芯片 / Intel · Coding 版 0.0.12 · 基础版 0.0.13 · 2026-11-23</p>
         <div class="actions">
-          <a class="btn btn-mac" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-latest.zip">基础版 zip（291 MB）</a>
-          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-latest.zip">Coding 优化版（360 MB）</a>
+          <a class="btn btn-mac" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-latest.zip">基础版 Apple 芯片（308 MiB）</a>
+          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-latest.zip">Coding Apple 芯片（361 MiB）</a>
+          <a class="btn btn-mac" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-mac-x64-latest.zip">基础版 Intel（318 MiB）</a>
+          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-mac-x64-latest.zip">Coding Intel（372 MiB）</a>
+        </div>
+      </article>
+      <article class="card">
+        <h2>Android 手机与平板</h2>
+        <p class="meta">Android 8.0+ · 0.1.1 · 2026-11-21</p>
+        <p>在 Mac（Apple 芯片 0.0.8 及以上）或 Windows（x64 0.0.15 及以上）的 Coding 版中打开「设置 → 扩展 → 安装扩展 ZIP」，选中手机支持插件。点击左下角的手机图标绑定电脑，再在安卓 App 登录同一账号。</p>
+        <div class="actions">
+          <a class="btn btn-mac" href="https://pipi.aichattrpg.com/downloads/PipiUI-0.1.1.apk">下载安卓 APK</a>
+          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-mobile-support-0.1.0.zip">下载桌面手机插件</a>
+          <a class="btn btn-gh" href="https://remote.deepwood.cn/mobile/">注册或登录</a>
         </div>
       </article>
       <article class="card">
         <h2>Windows 版</h2>
-        <p class="meta">Windows 10/11 x64 · NSIS .exe · Coding 版 2026-10-22 · 基础版 2026-10-22</p>
+        <p class="meta">Windows 10/11 x64 · NSIS .exe · Coding 版 0.0.18 · 基础版 0.0.19 · 2026-11-23</p>
         <div class="actions">
-          <a class="btn btn-win" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-windows-latest.exe">基础版 exe（约 229 MiB）</a>
-          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-windows-latest.exe">Coding 优化版（约 271 MiB）</a>
+          <a class="btn btn-win" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-windows-latest.exe">基础版 exe（229 MiB）</a>
+          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-windows-latest.exe">Coding 优化版（271 MiB）</a>
         </div>
       </article>
       <article class="card">
         <h2>Linux 版</h2>
-        <p class="meta">amd64 · .deb · Coding 版 2026-09-13 · 基础版 2026-09-08</p>
+        <p class="meta">amd64 · .deb · Coding 版 0.0.18 · 基础版 0.0.19 · 2026-11-23</p>
         <div class="actions">
-          <a class="btn btn-linux" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-linux-latest.deb">基础版 deb（178 MB）</a>
-          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-linux-latest.deb">Coding 优化版（226 MB）</a>
+          <a class="btn btn-linux" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-base-linux-latest.deb">基础版 deb（214 MiB）</a>
+          <a class="btn btn-gh" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-linux-latest.deb">Coding 优化版（269 MiB）</a>
         </div>
       </article>
     </div>
+    <p class="alt">发送失败时，点错误旁的「更多」查看详情，再点「复制诊断信息」，把复制的文字发给客服。桌面版内置 Flapcode 0.1.1。可在「设置 → 更新中心」下载软件更新并重启安装，也可独立更新插件。还没有更新中心的旧版本请先从本页下载安装一次。</p>
     <p class="alt">同一个 App 的两种发行物。基础版是新项目的默认形态：通用工作台、会话、模型与扩展管理。Coding 优化版额外内置 Office、PDF 与代码检索三个扩展（约 125 MB），装了它才有这三项能力——两个包都能在应用内切换 Profile。</p>
     <div class="actions">
       <a class="btn btn-gh" href="https://github.com/Leehow/pipiui">GitHub 仓库</a>

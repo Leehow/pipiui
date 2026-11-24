@@ -20,6 +20,21 @@ const item = (state: "queued" | "sending" | "failed", error?: string) => ({
 });
 
 describe("FileQueueStore", () => {
+  it("restores only known diagnostic fields for a failure and tolerates older records", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-queue-store-"));
+    const store = new FileQueueStore(root);
+    const failed = item("failed", "Authorization: Bearer sk-sensitive");
+    const details = { stage: "select_model" as const, occurredAt: 1725000000000, platform: "win32 x64", sessionLogin: "absent" as const };
+    await store.save(failed.sessionId, [
+      { ...failed, failureDetails: { ...details, ...{ apiKey: "should-never-be-forwarded" } } },
+      { ...item("sending"), failureDetails: details }, { ...failed, id: "legacy" },
+    ]);
+    const [restored, pending, legacy] = await store.load(failed.sessionId);
+    expect(restored.failureDetails).toEqual(details);
+    expect(restored.error).not.toContain("sk-sensitive");
+    expect(pending.failureDetails).toBeUndefined();
+    expect(legacy.failureDetails).toBeUndefined();
+  });
   it("atomically round-trips queued and failed items, preserves attachment fields, and restores sending as queued", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-queue-store-"));
     const store = new FileQueueStore(root);

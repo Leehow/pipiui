@@ -8,6 +8,7 @@ type Offer = {
   version: 1; provider: 'jev-optimizer'; instanceId: string;
   availability(root: string, signal?: AbortSignal): Promise<{ ready: boolean; reason?: string }>;
   choose(input: { projectRoot: string; goal: string; candidates: ChoiceCandidate[]; scroll: { canUp: boolean; canDown: boolean }; history?: Array<{ operation: string; candidateName?: string }>; signal?: AbortSignal }): Promise<Outcome>;
+  evaluate?(input: { projectRoot: string; body: unknown; signal?: AbortSignal }): Promise<{ status: string; reason?: string; response?: unknown }>;
 };
 type Bus = { on(channel: string, listener: (value: unknown) => void): (() => void) | void; emit(channel: string, value: unknown): void };
 type Connected = { offer: Offer; signal: AbortSignal };

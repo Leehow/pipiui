@@ -1,8 +1,13 @@
+import { hostname } from 'node:os'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   createHostBackendSession,
+  isRemoteAgentPageRequest,
+  remoteAgentPage,
+  REMOTE_RESPONSE_MAX_BYTES,
+  type AgentSummary,
   type HostBackend,
   type HostBackendSession,
   type HostWireFrame,
@@ -90,6 +95,8 @@ export type RemoteControlServiceOptions = {
   probeTimeoutMs?: number
   backoffMs?: (attempt: number) => number
   pingIntervalMs?: number
+  connectionTimeoutMs?: number
+  heartbeatTimeoutMs?: number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }
 
@@ -121,6 +128,11 @@ export function newRemoteIdentity(): Pick<RemoteControlStored, 'roomID' | 'hostT
 export function withRemoteSessionCapabilities(backend: HostBackend): HostBackend {
   return {
     async handle(method, params) {
+      if (method === 'applyOfficialUpdate') throw new Error('请在桌面端安装官方更新')
+      if (method === 'listAgents' && isRemoteAgentPageRequest(params[2])) {
+        const rows = await backend.handle(method, params.slice(0, 2)) as AgentSummary[]
+        return remoteAgentPage(rows, params[2])
+      }
       if (method === 'capabilities') {
         const caps = await backend.handle(method, params) as Record<string, unknown>
         return {
@@ -222,6 +234,8 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   const connect = options.connect ?? defaultConnect
   const backoffMs = options.backoffMs ?? defaultBackoff
   const pingIntervalMs = options.pingIntervalMs ?? 20_000
+  const connectionTimeoutMs = options.connectionTimeoutMs ?? 10_000
+  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 60_000
   const sleep = options.sleep ?? defaultSleep
   const probeTimeoutMs = options.probeTimeoutMs ?? 8_000
   const storePath = join(options.userDataDir, REMOTE_CONTROL_STORE_FILE)
@@ -239,6 +253,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   let stopping = false
   let checkSeq = 0
   let suppressPaired = 0
+  let retireConnection: ((reason: string) => void) | undefined
 
   const emit = (patch: Partial<RemoteControlState>) => {
     state = { ...state, ...patch }
@@ -279,17 +294,28 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     if (currentSocket && currentSocket.readyState < 2) {
       try { currentSocket.close(1000, 'host stop') } catch { /* already closed */ }
     }
+    retireConnection?.('host stop')
   }
 
   const bindSession = (target: SocketLike) => {
     const bound = createHostBackendSession(remoteBackend, frame => {
       if (target.readyState !== 1) return
       try {
-        target.send(JSON.stringify({
+        const payload = JSON.stringify({
           ...frame,
           ...(hostEpoch ? { hostEpoch } : {}),
           ...(generation ? { generation } : {})
-        }))
+        })
+        if (Buffer.byteLength(payload) > REMOTE_RESPONSE_MAX_BYTES) {
+          if (frame.type === 'response') {
+            target.send(JSON.stringify({ protocolVersion: 2, type: 'response', id: frame.id,
+              ok: false, errorCode: 'response_too_large', error: 'This result is too large for remote control; open its details on the desktop.' }))
+          } else {
+            emit({ error: '一条远程实时更新过大，未能发送；请重新加载该会话或在桌面查看详情。' })
+          }
+          return
+        }
+        target.send(payload)
       } catch { /* close race */ }
     })
     session = bound
@@ -378,6 +404,16 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       pairSecretHash: hashPairSecret(stored.pairSecret)
     }
     let opened = false
+    let settled = false
+    let lastReceivedAt = now()
+    const connectionTimer = setTimeout(() => retire('Relay 握手超时，正在重连'), connectionTimeoutMs)
+    const retire = (reason: string) => {
+      if (settled) return
+      if (reason !== 'host stop') emit({ error: reason })
+      try { target.close(4000, 'reconnect') } catch { /* still retire if close fails */ }
+      onClose()
+    }
+    retireConnection = retire
     const onOpen = () => {
       if (opened) return
       opened = true
@@ -385,21 +421,34 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       bindSession(target)
       reconnectAttempt = 0
       pingTimer = setInterval(() => {
+        if (now() - lastReceivedAt >= heartbeatTimeoutMs) {
+          retire('Relay 心跳超时，正在重连')
+          return
+        }
         if (target.readyState !== 1) return
-        try { target.send(JSON.stringify({ v: 2, type: 'ping', at: now() })) } catch { /* ignore */ }
+        try { target.send(JSON.stringify({ v: 2, type: 'ping', at: now() })) } catch { retire('Relay 连接已失效，正在重连') }
       }, pingIntervalMs)
       if (typeof pingTimer === 'object' && 'unref' in pingTimer) (pingTimer as NodeJS.Timeout).unref()
     }
     const onMessage = (event: { data?: unknown } | string) => {
       if (token !== runToken) return
+      lastReceivedAt = now()
       const payload = typeof event === 'string' || Buffer.isBuffer(event)
         ? event
         : event && typeof event === 'object' && 'data' in event
           ? event.data
           : event
       handlePayload(payload, hello.roomID)
+      if (state.status === 'ready' || state.status === 'paired') {
+        clearTimeout(connectionTimer)
+        if (state.error) emit({ error: undefined })
+      }
     }
     const onClose = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(connectionTimer)
+      if (retireConnection === retire) retireConnection = undefined
       if (target.on && target.off) {
         target.off('open', onOpen)
         target.off('message', onMessage)
@@ -414,7 +463,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       resolve()
     }
     const onError = () => {
-      /* close follows */
+      retire('Relay 连接失败，正在重连')
     }
     if (target.on) {
       target.on('open', onOpen)
@@ -443,6 +492,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       } catch (error) {
         emit({ error: error instanceof Error ? error.message : String(error) })
       }
+      if (token !== runToken) return
       await clearTransport()
       if (stopping || token !== runToken || !stored?.enabled) break
       reconnectAttempt += 1
@@ -505,7 +555,8 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     if (stored.enabled && state.status !== 'ready' && state.status !== 'paired') {
       const ready = await waitForHostReady(probeTimeoutMs)
       if (seq !== checkSeq || pairUrl() !== url) return getState()
-      if (!ready && state.status !== 'ready' && state.status !== 'paired') {
+      const currentStatus = getState().status
+      if (!ready && currentStatus !== 'ready' && currentStatus !== 'paired') {
         return finishCheck(seq, url, { status: 'failed', pairUrl: url, reason: 'Host 连接超时', checkedAt: now() })
       }
     }
@@ -533,6 +584,9 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   }
 
   const start = async (relayOrigin?: string) => {
+    if (stored?.enabled && loopAbort && !loopAbort.signal.aborted &&
+      (!relayOrigin || relayOrigin.replace(/\/$/, '') === stored.relayOrigin)) return getState()
+    if (loopAbort) await stop()
     const previousUrl = pairUrl()
     stored = { ...ensureStored(relayOrigin), enabled: true }
     if (pairUrl() !== previousUrl) invalidateChecks({ status: 'idle', pairUrl: null })
@@ -582,9 +636,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     // the existing run loop perform a fresh hello without rotating the room
     // or disturbing the paired browser.
     if (!stored?.enabled) return
-    if (socket && socket.readyState < 2) {
-      try { socket.close(4000, 'power state changed') } catch { /* close race */ }
-    }
+    retireConnection?.('电源状态已变化，正在重新连接 Relay')
   }
 
   const getState = () => state
@@ -607,8 +659,29 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     return getState()
   }
 
+  const mobileLogin = async () => {
+    const origin = 'https://remote.deepwood.cn'
+    if (stored?.enabled && stored.relayOrigin !== origin) throw new Error('请先关闭当前自定义中继，再连接 Deepwood')
+    await start(origin)
+    for (let attempt = 0; attempt < 50 && stored?.enabled; attempt++) {
+      if (state.status === 'ready' || state.status === 'paired') break
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    if (!stored?.enabled || stored.relayOrigin !== origin || !['ready','paired'].includes(state.status)) throw new Error('电脑尚未连接 Deepwood，请稍后再试')
+    const response = await (options.fetchImpl ?? fetch)(origin + '/mobile/ticket', {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room: stored.roomID, proof: stored.hostToken, name: hostname() })
+    })
+    if (!response.ok) throw new Error('无法创建电脑绑定链接，请重试')
+    const { ticket } = await response.json() as { ticket?: string }
+    if (!ticket || !/^[a-f0-9]{64}$/.test(ticket)) throw new Error('绑定链接无效')
+    return { ...getState(), mobileLoginUrl: origin + '/mobile/#' + ticket }
+  }
+
   return {
     getState,
+    mobileLogin,
     start,
     stop,
     reset,
@@ -722,6 +795,7 @@ export function registerRemoteControlIpc(
       event.sender.once?.('destroyed', () => { renderers.delete(event.sender) })
     }
     const type = command?.type
+    if (type === 'mobileLogin') return service.mobileLogin()
     if (type === 'start') return mergeRemoteState(await service.start(command.relayOrigin), debug?.getState())
     if (type === 'stop') return mergeRemoteState(await service.stop(), debug?.getState())
     if (type === 'reset') return mergeRemoteState(await service.reset(command.relayOrigin), debug?.getState())

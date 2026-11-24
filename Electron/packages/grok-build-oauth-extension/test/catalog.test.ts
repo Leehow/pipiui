@@ -34,14 +34,11 @@ describe("grok-build conversation catalog gating", () => {
     const claim = grokClaim();
     expect(claim.contribution.provider.id).toBe(AUTH_PROVIDER_ID);
     expect(claim.contribution.provider.oauth).toBe(true);
-    expect(claim.contribution.provider.models.map((model) => model.id)).toEqual([
-      ...GROK_BUILD_CONVERSATION_MODEL_IDS,
-    ]);
+    expect(claim.contribution.provider.models).toEqual([]);
     expect(grokBuildManifestModels().map((model) => model.id)).toEqual([
       ...GROK_BUILD_CONVERSATION_MODEL_IDS,
     ]);
     expect(grokBuildManifestModels().find((model) => model.id === "grok-4.6")?.contextWindow).toBe(500000);
-    expect(claim.contribution.provider.models.find((model) => model.id === "grok-4.6")?.contextWindow).toBe(500000);
     expect(GROK_BUILD_CONVERSATION_MODEL_IDS).not.toContain("grok-imagine-image-quality");
     expect(grokBuildManifestModels().every((model) => model.api === "openai-responses")).toBe(true);
     expect(grokBuildManifestModels().every((model) => (
@@ -82,18 +79,14 @@ describe("grok-build conversation catalog gating", () => {
     expect(disabled.map((model) => `${model.provider}/${model.id}`)).toEqual(["anthropic/a1"]);
   });
 
-  it("adds declared models only while enabled and authenticated, and never writes secrets", () => {
+  it("does not resurrect the static floor through manifest fallback, and never writes secrets", () => {
     const claims = [grokClaim(true)];
     const overlay = resolveContributedCatalog({
       claims,
       authenticatedProviders: new Set(["grok-build"]),
       existing: [{ provider: "anthropic", id: "a1" }],
     });
-    expect(overlay.models.map((model) => `${model.provider}/${model.id}`)).toEqual([
-      "grok-build/grok-4.6",
-      "grok-build/grok-4-fast",
-      "grok-build/grok-code-fast-1",
-    ]);
+    expect(overlay.models).toEqual([]);
     const status = extensionAuthStatus({
       extensionId: "grok-build-oauth",
       providerId: "grok-build",

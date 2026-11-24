@@ -196,6 +196,44 @@ describe("vendored philosophy: delivery", () => {
     expect(result.skipped.find((s) => s.id === "typo")?.reason).toMatch(/names nobody that exists/);
   });
 
+  // These are prompt contracts, not claims about how a live model will behave.
+  it("separates investigation and requirement clarity from implementation authorization", () => {
+    const foundation = layers.find((l) => l.id === "foundation")!.body;
+    const text = foundation.replace(/\s+/g, " ");
+    expect(compose().text).toContain(foundation);
+    expect(text).toContain("Read-only investigation and research delegation may support it");
+    expect(text).toContain("authorizes work within the scope the user named, even when phrased as a question");
+    expect(text).toContain("investigate and restore established behavior");
+    expect(text).toContain("An explicit request for cause or analysis only takes precedence");
+    expect(text).toContain("Authorization is not requirement clarity");
+    expect(text).toContain("When the intended outcome and boundaries are clear, proceed");
+    expect(text).toContain("announcing an assumption is not clarification");
+    expect(text).toContain("A small or reversible change is not evidence that the requirement is clear");
+    expect(text).not.toContain("Do not dispatch workers");
+  });
+
+  it("waits for consequential answers without imposing a question quota", () => {
+    const foundation = layers.find((l) => l.id === "foundation")!.body.replace(/\s+/g, " ");
+    expect(foundation).toContain("Ask the necessary independent questions together");
+    expect(foundation).toContain("No fixed question quota, no compulsory questionnaire");
+    expect(foundation).toContain("Pause work that depends on an unanswered decision");
+    expect(foundation).toContain("Waiting for that answer is a valid stop");
+    expect(foundation).toContain("report it to the dispatcher and pause the dependent work");
+    expect(foundation).toContain("Never ask a generic \"should I continue?\" when the requested work and its scope are already clear");
+    expect(foundation).not.toContain("Ask exactly one minimal question");
+  });
+
+  it("does not use task size or a tracking plan as a substitute for clear requirements", () => {
+    const planning = layers.find((l) => l.id === "planning")!.body.replace(/\s+/g, " ");
+    expect(planning).toContain("Requirement clarity and work size are separate");
+    expect(planning).toContain("neither proof that the requirement is understood nor permission");
+    expect(planning).toContain("A focused clarification does not by itself require a spec, a skill, or a plan approval");
+    expect(planning).toContain("Clear, contained requests need neither a routine recap nor another confirmation");
+    expect(planning).toContain("research-only requests end with their answer, not implementation");
+    expect(planning).toContain("Do not defer a known product ambiguity to the final plan approval");
+    expect(planning).not.toContain("Recon comes before the first question");
+  });
+
   it("separates lightweight tracking from the formal approval boundary", () => {
     const planning = layers.find((l) => l.id === "planning")!.body;
     expect(planning).toMatch(/approvalRequired: false/);
@@ -235,9 +273,9 @@ describe("vendored philosophy: delivery", () => {
     expect(planning).toMatch(/facts then decisions → design against the code → spec and slice →\s*publish/);
     expect(planning).toMatch(/frontier rounds/);
     // Grilling is filtered, not relentless: design is the agent's, questions are for collisions.
-    expect(planning).toMatch(/design is yours/);
-    expect(planning).toMatch(/Ask only where reasonable answers genuinely collide/);
-    expect(planning).toMatch(/One round\s+is the norm, zero is common/);
+    expect(planning).toMatch(/Design choices that follow from the code and the settled goal are yours/);
+    expect(planning).toMatch(/Ask only where\s+reasonable answers genuinely collide/);
+    expect(planning).toMatch(/neither a fixed quota nor an exhaustive interview/);
     expect(planning).toMatch(/Name the \*\*seams\*\*/);
     expect(planning).toMatch(/Prefactor/);
     expect(planning).toMatch(/tracer bullets/);

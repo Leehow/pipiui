@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildBrowserChoicePayload, executeBrowserChoice, executeBrowserChoiceAvailability, type BrowserChoiceInput } from "./browser-choice.js";
+import { buildBrowserChoicePayload, executeBrowserChoice, executeBrowserChoiceAvailability, evaluateUpstreamChoice, type BrowserChoiceInput } from "./browser-choice.js";
 import type { JevDeps } from "./types.js";
 
 const KEY = "sk-synthetic-choice-secret";
@@ -25,6 +25,25 @@ function result(body: any, operation = "CLICK") {
 const fetchResult = (operation = "CLICK", mutate: (v: any) => void = () => {}): JevDeps["fetch"] => async (_url, init) => {
   const value = result(JSON.parse(String(init!.body)), operation); mutate(value); return new Response(JSON.stringify(value));
 };
+
+test('upstream requests preserve current values but share project authority and credential redaction', async () => {
+  const body = { state: { page: { text: KEY }, elements: [{ value: 'Paris', checked: 'true' }] },
+    questions: { operation: { type: 'choice', criteria: { DONE: 'Finished' } } } };
+  let sent: any;
+  const options = deps({ fetch: async (_url, request) => {
+    sent = JSON.parse(String(request!.body));
+    return new Response(JSON.stringify({ answers: { operation: answer(['DONE']) }, usage: { input_tokens: 10 } }));
+  } });
+  assert.equal((await evaluateUpstreamChoice({ projectRoot: root, body }, options)).status, 'applied');
+  assert.equal(sent.state.elements[0].value, 'Paris');
+  assert.equal(sent.state.elements[0].checked, 'true');
+  assert.ok(!JSON.stringify(sent).includes(KEY));
+  let calls = 0;
+  const denied = deps({ readState: async () => state({ browserEnabled: false }), fetch: async () => { calls++; return new Response(); } });
+  assert.equal((await evaluateUpstreamChoice({ projectRoot: root, body }, denied)).reason, 'browser-disabled');
+  assert.equal(calls, 0);
+  assert.equal((await evaluateUpstreamChoice({ projectRoot: '/other', body }, options)).reason, 'project-mismatch');
+});
 
 test("preserves a full Unicode goal rather than dropping its final requirements", () => {
   const goal = `${'先检查页面内容'.repeat(30)}最后选择蓝色而不是红色`;

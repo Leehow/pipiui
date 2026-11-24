@@ -485,7 +485,7 @@ function ExtensionPackageRow({
             {settingsOpen ? '收起设置' : '设置'}
           </button>
           {settingsOpen && (
-            <SchemaSettingsForm host={host} extensionId={ext.id} projectId={projectId} schema={settingsSchema} />
+            <SchemaSettingsForm key={`${ext.id}:${projectId ?? ''}`} host={host} extensionId={ext.id} projectId={projectId} schema={settingsSchema} />
           )}
         </div>
       )}

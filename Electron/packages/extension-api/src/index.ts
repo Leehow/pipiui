@@ -8,6 +8,8 @@ export const EXTENSION_CAPABILITIES = [
   "stream.render",
   "terminal.read",
   "notifications",
+  "data.read",
+  "data.write",
 ] as const;
 
 export type ExtensionCapability = (typeof EXTENSION_CAPABILITIES)[number];
@@ -164,6 +166,7 @@ export type ExtensionManifest = {
       panels?: ExtensionUiPanel[];
       toolRenderers?: ExtensionUiToolRenderer[];
       headerActions?: ExtensionUiHeaderAction[];
+      composerActions?: ExtensionUiHeaderAction[];
       documentRenderers?: ExtensionUiDocumentRenderer[];
       settingsSections?: ExtensionUiSettingsSection[];
       slashCommands?: ExtensionUiSlashCommand[];
@@ -196,6 +199,14 @@ export type ExtensionGitStatus = {
 };
 
 /** Restricted props injected into an `app.ui.headerActions` entry. */
+/** Restricted composer contribution. No complete host API reaches the extension. */
+export type ComposerActionProps = {
+  api: ExtensionHostAPI;
+  sessionId: string;
+  model?: {provider: string; id: string; api?: string};
+  disabled: boolean;
+};
+
 export type HeaderActionProps = {
   workspaceId?: string;
   git?: {
@@ -296,7 +307,7 @@ export type ExtensionDataRead = { content: string; bytes: number; truncated: boo
  */
 export type ExtensionDataAPI = {
   list: (dir: string) => Promise<ExtensionDataFile[]>;
-  read: (path: string, options?: { tailBytes?: number }) => Promise<ExtensionDataRead>;
+  read: (path: string, options?: { tailBytes?: number; allowMissing?: boolean }) => Promise<ExtensionDataRead>;
   /**
    * Replace one declared writable file. Present only with the `data.write` capability.
    *
@@ -333,7 +344,7 @@ export type ExtensionHostBacking = {
   readExtensionData?(
     id: string,
     path: string,
-    options?: { tailBytes?: number },
+    options?: { tailBytes?: number; allowMissing?: boolean },
     projectId?: string,
   ): Promise<ExtensionDataRead>;
   writeExtensionData?(
@@ -445,6 +456,17 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
   if (host.getExtensionAuthStatus) {
     api.auth = {
       status: () => host.getExtensionAuthStatus!(id),
+    };
+  }
+
+  if (caps.has("data.read") || caps.has("data.write")) {
+    api.data = {
+      list: dir => host.listExtensionData
+        ? host.listExtensionData(id, dir, options.projectId) : Promise.reject(new Error("data.read unavailable")),
+      read: (path, readOptions) => host.readExtensionData
+        ? host.readExtensionData(id, path, readOptions, options.projectId) : Promise.reject(new Error("data.read unavailable")),
+      ...(caps.has("data.write") ? {write: (path: string, content: string) => host.writeExtensionData
+        ? host.writeExtensionData(id, path, content, options.projectId) : Promise.reject(new Error("data.write unavailable"))} : {}),
     };
   }
 

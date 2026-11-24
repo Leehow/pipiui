@@ -7,7 +7,7 @@ import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, Brows
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
-import { RemoteConnectionPanel } from './RemoteConnectionPanel'
+import { RemoteConnectionPanel, remoteControlFromWindow } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
 import { DEMO_BOSS_TOOL_NAMES, DEMO_SKILL_NAMES } from './subagent-debug-demo'
 import { ModelQuickMenu } from './ModelQuickMenu'
@@ -22,6 +22,7 @@ import { useWorkbenchContainers, useWorkbenchViews } from './workbench/workbench
 import { canAdoptExternalHistory, externalHistoryToMessages, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
 import { SlashMenu } from './SlashMenu'
 import { ThinkingChip } from './thinking-chip'
+import { useComposerActions } from './workbench/composer-actions'
 import type { WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
 import { freezeProbe, freezeProbeHistoryIpcEnd, freezeProbeHistoryIpcStart } from './freeze-probe'
@@ -45,6 +46,7 @@ import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, filesFromClipboard, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
 import { composerInputFilesFromList, DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, modelHasInputFiles, type InputFileAttachmentsHandle, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
+import { BashDetailsProvider } from './BashToolDetails'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
 import { parseSubagentSignal } from './subagent-signal'
@@ -1507,7 +1509,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [computerUseAvailable, setComputerUseAvailable] = useState(false)
   const [projectError, setProjectError] = useState<string | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
-  const [modalInitialView, setModalInitialView] = useState<'manage' | 'add'>('manage')
+  const [modalInitialView, setModalInitialView] = useState<'manage' | 'add' | 'updates'>('manage')
   const [gitBinary, setGitBinary] = useState<boolean | 'unknown'>('unknown')
   const vision = useVisionRouting(host)
   const scanExternal = useScanExternalSessions(host)
@@ -3716,7 +3718,25 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const toolsTrack = productBrowserWorkspaceActive
     ? fitBrowserToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
     : fitToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.tools)
-  const baseSidebarProps: SidebarProps = { projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, theme: themeScheme, onToggleTheme: toggleTheme }
+  const [mobileProject, setMobileProject] = useState('')
+  useEffect(() => {
+    let current = true
+    if (selectedProject && !modalOpen && remoteControlFromWindow()) {
+      void host.listExtensions?.(selectedProject).then(items => {
+        if (current) setMobileProject(items.some(item => item.id === 'mobile-support' && item.state === 'enabled') ? selectedProject : '')
+      }).catch(() => { if (current) setMobileProject('') })
+    }
+    return () => { current = false }
+  }, [host, selectedProject, modalOpen])
+  const mobileEnabled = Boolean(selectedProject && selectedProject === mobileProject && !modalOpen)
+  const mobileRemote = remoteControlFromWindow()
+  const openMobile = mobileEnabled && mobileRemote && host.openExternal ? () => {
+    void mobileRemote.invoke({ type: 'mobileLogin' }).then(state => {
+      if (!state.mobileLoginUrl) throw new Error('未收到绑定链接')
+      return host.openExternal!(state.mobileLoginUrl)
+    }).catch(error => setProjectError(String(error)))
+  } : undefined
+  const baseSidebarProps: SidebarProps = { onOpenMobile: openMobile, projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, onShowUpdates: updates.snapshot?.items.some(item => item.officialUpdate && item.status === 'updateAvailable') ? () => { setModalInitialView('updates'); setModalOpen(true) } : undefined, theme: themeScheme, onToggleTheme: toggleTheme }
   const codingSidebarProps: SidebarProps = { ...baseSidebarProps, onOpenComputerUse: computerUseAvailable ? () => setComputerUseOpen(true) : undefined, onOpenRemote: () => setRemoteOpen(true), onOpenSubagentModels: () => setSubagentModelsOpen(true) }
   return <main className={shellClass} data-theme={theme} data-scheme={themeScheme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
     {narrowViewport && (!productSidebarCollapsed || !productToolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
@@ -3739,7 +3759,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
             />
           </div>
         ) : (
-        <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
+        <BashDetailsProvider host={host} sessionId={selectedSession}><LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
           {selectedSession ? (
             <div key={selectedSession} className="session-transcript-slot" data-session-transcript={selectedSession}>
               <Transcript
@@ -3759,7 +3779,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
           ) : (
             <Transcript messages={messages} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
           )}
-        </LiveSubagentBindingProvider>
+        </LiveSubagentBindingProvider></BashDetailsProvider>
         )}
       </div>
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
@@ -3935,8 +3955,9 @@ function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
 /** Stable composer chrome (model chip, quick menu, thinking control, stats/quota/balance
  * pills). Memoized with useCallback-backed handlers so per-keystroke draft updates,
  * which re-render only the Composer, never re-render this row. */
-const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readOnly, streaming, compacting, compactingLabel, statsRefreshKey, host, sessionId, modelState, visibility, quickOpen, onOpenBrowserLogin, onSelectModel, onThinkingChange, onQuickOpenChange }: { hideSessionChrome?: boolean; readOnly: boolean; streaming: boolean; compacting: boolean; compactingLabel?: string | null; statsRefreshKey: number; host: PipiHostAPI; sessionId: string; modelState: ModelState | null; visibility: ModelVisibilityController; quickOpen: boolean; onOpenBrowserLogin?: () => void; onSelectModel: (model: Model) => void; onThinkingChange: (level: ThinkingLevel) => void; onQuickOpenChange: (value: boolean | ((previous: boolean) => boolean)) => void }) {
-  return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} compactingLabel={compactingLabel ?? undefined} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
+const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readOnly, working, streaming, compacting, compactingLabel, statsRefreshKey, host, sessionId, modelState, visibility, quickOpen, onOpenBrowserLogin, onSelectModel, onThinkingChange, onQuickOpenChange }: { hideSessionChrome?: boolean; readOnly: boolean; working: boolean; streaming: boolean; compacting: boolean; compactingLabel?: string | null; statsRefreshKey: number; host: PipiHostAPI; sessionId: string; modelState: ModelState | null; visibility: ModelVisibilityController; quickOpen: boolean; onOpenBrowserLogin?: () => void; onSelectModel: (model: Model) => void; onThinkingChange: (level: ThinkingLevel) => void; onQuickOpenChange: (value: boolean | ((previous: boolean) => boolean)) => void }) {
+  const composerActions = useComposerActions()
+  return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} />{composerActions.map(action => <Fragment key={action.id}>{action.render({sessionId, model: modelState?.model, disabled: readOnly || working || streaming || compacting})}</Fragment>)}</>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} compactingLabel={compactingLabel ?? undefined} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
 })
 
 function Composer({ streaming, working, stopping, stopError, compacting, compactingLabel, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, catalogNotice, onDismissCatalogNotice, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; compactingLabel?: string | null; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; catalogNotice?: string | null; onDismissCatalogNotice?: () => void; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[], hasReadyInputFiles?: boolean) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
@@ -4253,7 +4274,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
     <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? (hideSessionChrome ? '外部会话只读' : '会话由另一版本运行中') : queueBusy ? 'Boss 正在工作，发送将进入队列，待当前回复完成后处理…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label="发送消息" title={queueBusy ? '加入队列，待 Boss 当前回复完成后发送' : undefined} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
-    <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} compactingLabel={compactingLabel} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
+    <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} working={working} streaming={streaming} compacting={compacting} compactingLabel={compactingLabel} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
@@ -4262,12 +4283,12 @@ function ToolQuickRail({ variant, collapsible = false, activeTab, toolsCollapsed
   const railCtx: PanelRailContext = { host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }
   const [floatCollapsed, setFloatCollapsed] = useState(() => {
     if (variant !== 'float') return false
-    try { return localStorage.getItem(TOOL_QUICK_RAIL_COLLAPSED_KEY) === 'true' } catch { return false }
+    try { return localStorage.getItem(TOOL_QUICK_RAIL_COLLAPSED_KEY) !== 'false' } catch { return true }
   })
   const visiblePanels = panels.filter(panel => !panel.visibleInRail || panel.visibleInRail(railCtx))
   const compact = variant === 'float' && collapsible && floatCollapsed
   const displayedPanels = compact
-    ? [visiblePanels.find(panel => panel.id === activeTab) ?? visiblePanels[0]].filter(Boolean)
+    ? []
     : visiblePanels
   const toggleCompact = () => {
     const next = !floatCollapsed

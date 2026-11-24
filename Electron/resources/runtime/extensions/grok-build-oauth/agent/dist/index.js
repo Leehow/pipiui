@@ -1,7 +1,7 @@
 import { resolveOAuthConfig } from "./oauth/config.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok, parseImportConfirm } from "./oauth/import.js";
-import { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
+import { createAuthProvider, createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
 import { registerInputFilesHooks } from "./input-files-hooks.js";
 import { registerStructuredOutputHooks } from "./structured-output-hooks.js";
 import { createBroker } from "./oauth/broker.js";
@@ -63,7 +63,7 @@ function getBroker(signal) {
         fetchImpl: fetch,
     });
 }
-export default function (pi) {
+export default async function (pi) {
     // Pi-native OAuth provider `grok-build` — do not override `xai`.
     // The canonical provider config lives in ./provider.js and is shared with
     // the PipiUI host auth runtime (single source, no copied OAuth transport).
@@ -376,4 +376,7 @@ export default function (pi) {
             return runImageOp({ kind: "edit", prompt: p.prompt, aspectRatio: p.aspect_ratio, refs: p.image ?? [] }, signal);
         },
     });
+    // Extension loading awaits this promise before resolving the requested model.
+    // Tools and the offline floor are registered synchronously for older hosts.
+    pi.registerProvider(GROK_BUILD_PROVIDER_ID, await createAuthProvider({ emit: (event, payload) => emit(event, payload) }));
 }

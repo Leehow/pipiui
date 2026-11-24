@@ -3,8 +3,8 @@
  *
  * Declared once and consumed by:
  * - the Pi provider factory (`createAuthProvider`) so session runtime can stream;
- * - the manifest `auth.provider.models` contribution so the host catalog can
- *   overlay the same ids when the Pi runtime catalog is empty.
+ * This list is the offline floor only. The async factory prefers the official
+ * Grok Build catalog; the manifest must not resurrect retired floor models.
  *
  * Image generation stays on `image_gen` / `image_edit` tools — these ids are
  * conversation models only. They are never written to models.json.
@@ -30,7 +30,7 @@ export const GROK_BUILD_CAPABILITIES = {
 /**
  * Concrete, tested Grok Build chat models. Official xAI Responses ids
  * reachable with the grok-build OAuth access token. Keep this list small and
- * explicit — do not scrape a live catalog. Reasoning flags stay as declared.
+ * explicit as an offline floor. Online metadata comes from catalog.ts.
  */
 export const GROK_BUILD_CONVERSATION_MODELS = [
     {

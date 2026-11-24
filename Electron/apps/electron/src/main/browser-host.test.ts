@@ -129,6 +129,38 @@ function browserHarness() {
   return { host, contents, view, createView, attach }
 }
 
+describe('screenshot provenance', () => {
+  it('uses the captured contents URL and the real URL redactor', async () => {
+    const { host, contents } = await liveBrowser()
+    contents.url = 'https://shop.example/?token=secret-value&preview=demo'
+    const shot = await host.toolAction({ action: 'screenshot' })
+    expect(shot).toMatchObject({ ok: true, viewport: 'desktop', tabId: expect.any(String) })
+    expect(String(shot.url)).toContain('preview=demo')
+    expect(String(shot.url)).not.toContain('secret-value')
+  })
+
+  it.each(['url', 'same-url-reload', 'redaction'] as const)('rejects capture drift: %s', async mode => {
+    const { host, contents } = browserHarness()
+    await host.loadURL('https://shot.example/')
+    if (mode === 'redaction') {
+      contents.executeJavaScript.mockImplementationOnce(async () => {
+        contents.url = 'https://changed.example/'
+        return { ok: true, url: 'https://shot.example/' }
+      })
+    } else {
+      contents.capturePage.mockImplementationOnce(async () => {
+        if (mode === 'url') contents.url = 'https://changed.example/'
+        else contents.emit('did-start-loading')
+        return { toPNG: () => Buffer.from('png') }
+      })
+    }
+    const shot = await host.toolAction({ action: 'screenshot' })
+    expect(shot).toMatchObject({ ok: false, code: 'navigation_interrupted' })
+    expect(shot.base64).toBeUndefined()
+    expect(shot.url).toBeUndefined()
+  })
+})
+
 describe('intent observation host routing', () => {
   it('preserves intent and hard filters in a single page dispatch', async () => {
     const { host, contents } = browserHarness()
@@ -1763,19 +1795,23 @@ describe('BrowserTabsHost dual viewport',
       const both = await host.toolAction(asRequest({ action: 'screenshot', target: 'both' }))
       expect(created).toHaveLength(2)
       created[1].contents.pageText = 'mobile-state'
+      created[1].contents.url = 'https://mobile-shot.example/'
       const refreshedBoth = await host.toolAction(asRequest({ action: 'screenshot', target: 'both' }))
       expect(both.ok).toBe(true)
       expect(refreshedBoth.base64).toBeUndefined()
       const images = Array.isArray(refreshedBoth.images) ? refreshedBoth.images as Array<{ viewport?: string; base64?: string; mimeType?: string; width?: number; height?: number }> : []
       expect(images).toEqual([
-        expect.objectContaining({ viewport: 'desktop', mimeType: 'image/png', width: 700, height: 500 }),
-        expect.objectContaining({ viewport: 'mobile', mimeType: 'image/png', width: 390, height: 844 })
+        expect.objectContaining({ viewport: 'desktop', url: 'https://shot.example', tabId: single.tabId, mimeType: 'image/png', width: 700, height: 500 }),
+        expect.objectContaining({ viewport: 'mobile', url: 'https://mobile-shot.example/', tabId: single.tabId, mimeType: 'image/png', width: 390, height: 844 })
       ])
       expect(images[0]?.base64).not.toBe(images[1]?.base64)
       expect(Buffer.from(String(images[0]?.base64), 'base64').toString()).toContain('desktop-state')
       expect(Buffer.from(String(images[1]?.base64), 'base64').toString()).toContain('mobile-state')
       expect(created[0].view.getBounds?.()).toEqual({ x: 10, y: 20, width: 700, height: 500 })
       expect(created[0].contents.url).toBe('https://shot.example')
+      // Active currently resolves to the host's primary desktop pane, not a new identity.
+      const active = await host.toolAction(asRequest({ action: 'screenshot', target: 'active' }))
+      expect(active).toMatchObject({ ok: true, viewport: 'desktop', url: created[0].contents.url, tabId: single.tabId })
     })
 
     it('treats omitted target as active and accepts a legacy request object', async () => {

@@ -24,7 +24,7 @@ const SETTINGS_NAV_HINTS: Record<string, string> = {
   models: '模型与凭据',
   extensions: '能力与集成',
   themes: 'Logo 与配色',
-  updates: '运行时版本',
+  updates: '软件与插件版本',
 }
 
 function TrashIcon() {
@@ -229,15 +229,15 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   onRequestUpdate: (prompt: string) => void
   onClose: () => void
   /** First-run onboarding opens straight into the provider login pane. */
-  initialView?: 'manage' | 'add'
+  initialView?: 'manage' | 'add' | 'updates'
   projectId?: string
 }) {
   const sections = useSettingsSections().filter(section => (
     HOST_SETTINGS_TAB_IDS as readonly string[]
   ).includes(section.id))
-  const [tab, setTab] = useState(DEFAULT_SETTINGS_TAB)
+  const [tab, setTab] = useState(initialView === 'updates' ? 'updates' : DEFAULT_SETTINGS_TAB)
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
-  const [view, setView] = useState<'manage' | 'add'>(initialView)
+  const [view, setView] = useState<'manage' | 'add'>(initialView === 'add' ? 'add' : 'manage')
   // DOM slot under the 扩展 tab; ExtensionsPane portals its pack sub-nav here.
   const [extensionsSubnavSlot, setExtensionsSubnavSlot] = useState<HTMLDivElement | null>(null)
 

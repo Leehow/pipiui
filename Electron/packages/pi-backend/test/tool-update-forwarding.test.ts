@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createPiHostBackend } from "../src/index.js";
+import { putSecret, mountSecret } from "../src/secret-vault.js";
 
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
@@ -39,6 +40,46 @@ async function fixture() {
 }
 
 describe("tool_update forwarding", () => {
+  it("redacts historical bash before bounding both summary projections", async () => {
+    const backend = await fixture();
+    try {
+      const secret = 'boundary-private-credential';
+      await putSecret(join(root, 'agent'), { name: 'boundary', envName: 'BOUNDARY_KEY', value: secret });
+      await mountSecret(join(root, 'agent'), 's1', 'boundary');
+      const call = { type: 'message', id: 'm1', parentId: null, timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'toolCall', id: 'bash-secret', name: 'bash', arguments: { command: 'x'.repeat(115) + secret } }] } };
+      await writeFile(join(root, 'sessions/project/s1.jsonl'), JSON.stringify({ type: 'session', version: 3, id: 's1', cwd: join(root, 'project') }) + '\n' + JSON.stringify(call) + '\n');
+      const history: any = await backend.handle('getSessionHistory', ['s1']);
+      expect(JSON.stringify(history)).not.toContain('bound');
+      const assistant = history.find((row: any) => row.role === 'assistant');
+      expect(assistant.tools[0].input).toBe(assistant.activities[0].tool.input);
+      expect(assistant.tools[0].input.length).toBeLessThan(160);
+    } finally { await backend.close(); }
+  });
+  it("keeps bash bodies off the broadcast and exposes them only through bounded reads", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe(event => { if (event.channel === "stream") events.push(event.event); });
+    try {
+      await backend.handle("sendPrompt", ["s1", "__bash_details__"]);
+      await eventually(() => events.some(event => event.type === "tool_call" && event.name === "bash"));
+      let snapshot: any;
+      await eventually(async () => {
+        snapshot = await backend.handle("getBashDetails", [{ sessionId: "s1", toolCallId: "bash-detail" }]);
+        return snapshot.output === "PRIVATE_LIVE_BODY";
+      });
+      expect(snapshot.state).toBe("running");
+      expect(snapshot.input.length).toBeGreaterThan(120);
+      const unchanged = await backend.handle("getBashDetails", [{ sessionId: "s1", toolCallId: "bash-detail", sinceRevision: snapshot.revision }]);
+      expect(unchanged).toMatchObject({ unchanged: true });
+      expect(unchanged).not.toHaveProperty("output");
+      await eventually(() => events.some(event => event.type === "tool_result" && event.toolCallId === "bash-detail"));
+      snapshot = await backend.handle("getBashDetails", [{ sessionId: "s1", toolCallId: "bash-detail" }]);
+      expect(snapshot).toMatchObject({ state: "completed", output: "PRIVATE_FINAL_BODY" });
+      expect(JSON.stringify(events)).not.toContain("PRIVATE_");
+      const call = events.find(event => event.type === "tool_call" && event.name === "bash");
+      expect(JSON.parse(call.delta).command.length).toBeLessThanOrEqual(120);
+    } finally { off(); await backend.close(); }
+  });
   it("projects tool_execution_update partials as last-line, truncated tool_update events", async () => {
     const backend = await fixture();
     const events: any[] = [];

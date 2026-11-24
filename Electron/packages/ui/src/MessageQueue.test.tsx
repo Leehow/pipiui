@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MessageQueue, messageQueueSummary } from './MessageQueue'
 import type { MessageQueueItem } from './MessageQueue'
@@ -171,6 +171,43 @@ describe('MessageQueue', () => {
     const error = screen.getByTestId('queue-error-2')
     expect(error.textContent).toBe('上游超时')
     expect(error.getAttribute('role')).toBe('alert')
+  })
+
+  it('opens the failure snapshot in read-only mode and copies only the visible diagnostics', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    const previous = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    try {
+      const failed: MessageQueueItem = {
+        id: 'customer-row', status: 'failed', text: 'private prompt', images: [{ name: 'private.jpg' }],
+        error: 'Model not found: flapcode/gpt-6-sol sk-flapcode-example-secret',
+        failureDetails: {
+          stage: 'select_model', occurredAt: 1700000000000, platform: 'win32 x64', appVersion: '0.0.16',
+          provider: 'flapcode', modelId: 'gpt-6-sol', extensionId: 'flapcode', extensionVersion: '0.1.1',
+          mountRequested: true, settingsSecretInjected: false, appLogin: 'present', sessionLogin: 'absent'
+        }
+      }
+      render(<MessageQueue items={[failed]} mutationsDisabled expanded {...callbacks()} />)
+      const summary = screen.getByText('更多').closest('summary')!
+      const disclosure = summary.parentElement as HTMLDetailsElement
+      expect(disclosure.open).toBe(false)
+      fireEvent.click(summary)
+      expect(disclosure.open).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: '复制诊断信息' }))
+      await waitFor(() => expect(screen.getByText('已复制')).toBeTruthy())
+      const report = writeText.mock.calls[0][0]
+      expect(report).toBe(disclosure.querySelector('pre')?.textContent)
+      expect(report).toContain('会话登录记录　无记录')
+      expect(report).toContain('插件　flapcode 0.1.1')
+      expect(report).toContain('插件设置密钥　未注入会话')
+      expect(report).toContain('set_model')
+      expect(report).not.toMatch(/private|sk-flapcode/)
+      fireEvent.click(summary)
+      expect(disclosure.open).toBe(false)
+    } finally {
+      if (previous) Object.defineProperty(navigator, 'clipboard', previous)
+      else Reflect.deleteProperty(navigator, 'clipboard')
+    }
   })
 
   it('disables all mutating actions and the editor while pending', () => {

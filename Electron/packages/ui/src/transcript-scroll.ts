@@ -5,6 +5,15 @@ export const TRANSCRIPT_FIRST_ITEM_BASE = 1_000_000_000_000
 export const TRANSCRIPT_PIN_MAX_ATTEMPTS = 4
 
 /**
+ * Distance from the transcript tail, in px, that still counts as "the newest
+ * row is on screen". It covers the waiting-row reserve, a turn footer and a
+ * horizontal scrollbar, so a nudge that leaves the just-sent message visible
+ * keeps following instead of freezing the transcript there while the answer
+ * streams below the fold. A deliberate scroll past this band still detaches.
+ */
+export const TRANSCRIPT_TAIL_SLACK_PX = 120
+
+/**
  * Paging identity is richer than a host id because malformed/imported history
  * can contain duplicate ids. Include stable history fields so two different
  * imported rows sharing an id do not collapse into one prepend identity.

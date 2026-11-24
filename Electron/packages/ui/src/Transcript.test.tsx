@@ -458,3 +458,80 @@ describe('Transcript jump to previous user', () => {
     })
   })
 })
+
+/** jsdom has no layout: pin the metrics the tail-distance gate reads. */
+function attachScroller(container: HTMLElement, metrics: { scrollHeight: number; scrollTop: number; clientHeight: number }) {
+  const area = container.querySelector('.transcript-area')!
+  const scroller = document.createElement('div')
+  scroller.setAttribute('data-testid', 'virtuoso-scroller')
+  for (const [key, value] of Object.entries(metrics)) {
+    Object.defineProperty(scroller, key, { configurable: true, get: () => value })
+  }
+  area.appendChild(scroller)
+  return scroller
+}
+
+describe('Transcript tail follow band', () => {
+  const area = (view: { container: HTMLElement }) => view.container.querySelector('.transcript-area')!
+
+  it('keeps the tail pinned when the newest row is still on screen', async () => {
+    const first = makeMessages(3, 0)
+    const view = render(<Transcript active messages={first} {...handlers} />)
+    await flushPin()
+    attachScroller(view.container, { scrollHeight: 1000, scrollTop: 780, clientHeight: 150 })
+    fireEvent.wheel(area(view), { deltaY: -20 })
+    act(() => virtuosoInstances[0]!.atBottomStateChange?.(false))
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+
+    view.rerender(<Transcript active messages={[...first, { id: 'answer', role: 'assistant', content: '答案来了', timestamp: 9 }]} {...handlers} />)
+    await waitFor(() => expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 'LAST', align: 'end', behavior: 'auto' }))
+  })
+
+  it('stays detached once the reader is well above the tail', async () => {
+    const first = makeMessages(3, 0)
+    const view = render(<Transcript active messages={first} {...handlers} />)
+    await flushPin()
+    attachScroller(view.container, { scrollHeight: 4000, scrollTop: 1000, clientHeight: 150 })
+    fireEvent.wheel(area(view), { deltaY: -600 })
+    act(() => virtuosoInstances[0]!.atBottomStateChange?.(false))
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+
+    view.rerender(<Transcript active messages={[...first, { id: 'answer', role: 'assistant', content: '答案来了', timestamp: 9 }]} {...handlers} />)
+    act(() => virtuosoInstances[0]!.totalListHeightChanged?.(4200))
+    await flushPin()
+    expect(virtuosoInstances[0]!.scrollToIndex).not.toHaveBeenCalled()
+    expect(virtuosoInstances[0]!.followOutput?.(false)).toBe(false)
+  })
+
+  it('re-anchors the tail when a new human prompt arrives', async () => {
+    const first = makeMessages(3, 0)
+    const view = render(<Transcript active messages={first} {...handlers} />)
+    await flushPin()
+    attachScroller(view.container, { scrollHeight: 4000, scrollTop: 1000, clientHeight: 150 })
+    fireEvent.wheel(area(view), { deltaY: -600 })
+    act(() => virtuosoInstances[0]!.atBottomStateChange?.(false))
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+
+    view.rerender(<Transcript active messages={[...first, { id: 'u-key', role: 'user', content: 'key:apikey_2129b969b7193ef14a53bb71358e538fc305_d162fea', timestamp: 9 }]} {...handlers} />)
+    await waitFor(() => expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 'LAST', align: 'end', behavior: 'auto' }))
+  })
+
+  it('does not re-anchor the tail for an older-history prepend or an injected signal', async () => {
+    const first = makeMessages(3, 0)
+    const view = render(<Transcript active messages={first} {...handlers} />)
+    await flushPin()
+    attachScroller(view.container, { scrollHeight: 4000, scrollTop: 1000, clientHeight: 150 })
+    fireEvent.wheel(area(view), { deltaY: -600 })
+    act(() => virtuosoInstances[0]!.atBottomStateChange?.(false))
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+
+    const prepended: ChatMessage[] = [
+      { id: 'u-old', role: 'user', content: '更早的提问', timestamp: -2 },
+      { id: 'a-old', role: 'assistant', content: '更早的回答', timestamp: -1 },
+      ...first,
+    ]
+    view.rerender(<Transcript active messages={[...prepended, { id: 'hb', role: 'user', content: '[subagent-heartbeat] outstanding=1 vanished=0', timestamp: 8 }]} {...handlers} />)
+    await flushPin()
+    expect(virtuosoInstances[0]!.scrollToIndex).not.toHaveBeenCalled()
+  })
+})

@@ -1,3 +1,4 @@
+import { OFFICIAL_EXTENSION_PUBLIC_KEY } from "./official-extension-key.js";
 import { createPublicKey } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -166,13 +167,11 @@ export function selectTransactionalUpdateComponent(input: {
 
 /**
  * Official ed25519 verification key for extension update transactions, pinned
- * out-of-band by the host (`PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY`, base64 SPKI
- * DER). Absent/unset → `undefined` and the engine refuses every artifact
- * (fail closed); the recovery seed keeps the App functional.
+ * in the desktop build. A base64 SPKI DER override is available to test and
+ * custom release hosts.
  */
 export function extensionUpdateSigningKey(): import("node:crypto").KeyObject | undefined {
-  const raw = process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY?.trim();
-  if (!raw) return undefined;
+  const raw = process.env.PIPIUI_EXTENSION_UPDATE_PUBLIC_KEY?.trim() || OFFICIAL_EXTENSION_PUBLIC_KEY;
   try {
     return createPublicKey({ key: Buffer.from(raw, "base64"), format: "der", type: "spki" });
   } catch {

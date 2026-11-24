@@ -6,6 +6,9 @@ import { FLAPCODE_DEFAULT_MODEL_ID, flapcodeManifestModels } from "../agent/mode
 // These assert catalog metadata, not relay availability or subscription prices.
 describe("Flapcode GPT-6 catalog", () => {
   it.each([
+    // GPT-6.1 model docs and standard pricing checked 2026-11-07.
+    { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+    { id: "gpt-6.1-terra", name: "GPT-6.1 Terra", input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
     { id: "gpt-6-astra", name: "GPT-6 Astra", input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
     { id: "gpt-6-sol", name: "GPT-6 Sol", input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
     { id: "gpt-6-luna", name: "GPT-6 Luna", input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
@@ -29,7 +32,7 @@ describe("Flapcode GPT-6 catalog", () => {
       high: "high",
       xhigh: "xhigh",
       max: "max",
-      ...(id === "gpt-6-astra" ? { off: null } : {}),
+      ...(["gpt-6-astra", "gpt-6.1-sol"].includes(id) ? { off: null } : {}),
     });
   });
 

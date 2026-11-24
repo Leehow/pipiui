@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
 import { visionHostMethods } from './useVisionRouting'
+import {registerComposerAction} from './workbench/composer-actions'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
 const virtuosoHarness = {
@@ -1067,15 +1068,15 @@ describe('PipiUI main layout', () => {
     // chat header instead of the tall desktop column, safe-area aware.
     const phone = css.match(/@media \(max-width:720px\)\{\.tool-quick-rail-float[^\n]*\}/)?.[0] ?? ''
     expect(phone).toContain('flex-direction:row')
-    expect(phone).toMatch(/top:calc\(60px \+ env\(safe-area-inset-top/)
+    expect(phone).toMatch(/top:calc\(56px \+ env\(safe-area-inset-top/)
     expect(phone).toContain('bottom:auto')
     // While another pane overlay owns the screen the bar hides entirely
     // instead of floating above an open drawer.
     expect(phone).toContain('.pipiui-shell.tools-collapsed:not(.sidebar-collapsed) .tool-quick-rail-float{display:none}')
-    // Touch-sized targets: 44px floating launcher buttons, ≥40px drawer tabs,
+    // Compact floating buttons, with the existing ≥40px drawer tabs,
     // both dropping the double-tap-zoom delay for direct manipulation.
     expect(phone).toContain('touch-action:manipulation')
-    expect(phone).toMatch(/\.tool-quick-rail-float \.tool-rail-button\{width:44px;height:44px;min-height:44px;flex-basis:44px/)
+    expect(phone).toMatch(/\.tool-quick-rail-float \.tool-rail-button\{width:32px;height:32px;min-height:32px;flex-basis:32px/)
     expect(phone).toMatch(/\.tool-panel-header \.tool-rail-button\{width:40px;height:40px;min-height:40px;flex-basis:40px/)
     // The desktop rule keeps its vertical column contract outside that block.
     const floatRule = [...css.matchAll(/\.tool-quick-rail-float\{[^}]*\}/g)].map(match => match[0]).find(rule => rule.includes('position:fixed')) ?? ''
@@ -1095,6 +1096,7 @@ describe('PipiUI main layout', () => {
     const floatRail = container.querySelector('.chat-viewport .tool-quick-rail')!
     expect(floatRail.className).toContain('tool-quick-rail-float')
     expect(screen.getByLabelText('消息输入框')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '展开工具快捷栏' }))
     await waitFor(() => expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(false))
     // Tapping a tool opens the pane as a full overlay with its own header
     // tabs; the float launcher unmounts so nothing obscures the overlay.
@@ -1112,32 +1114,27 @@ describe('PipiUI main layout', () => {
     vi.unstubAllGlobals()
   })
 
-  it('collapses the phone tool rail to the active tool and remembers the choice after reopening a pane', async () => {
+  it('starts the phone rail collapsed to one launcher and remembers explicit changes', async () => {
     const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
     vi.stubGlobal('matchMedia', vi.fn(() => media))
     localStorage.removeItem('pipiui:eui:tool-quick-rail-collapsed:v1')
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
-
     const floatRail = () => container.querySelector('.chat-viewport .tool-quick-rail')
-    expect(screen.getByRole('button', { name: '收起工具快捷栏' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Browser' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: '收起工具快捷栏' }))
-
     expect(floatRail()?.className).toContain('is-collapsed')
+    expect(floatRail()?.querySelectorAll('button')).toHaveLength(1)
     expect(screen.getByRole('button', { name: '展开工具快捷栏' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Subagents' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Browser' })).toBeNull()
-    expect(localStorage.getItem('pipiui:eui:tool-quick-rail-collapsed:v1')).toBe('true')
-
-    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
-    expect(floatRail()).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
-    expect(floatRail()?.className).toContain('is-collapsed')
-
     fireEvent.click(screen.getByRole('button', { name: '展开工具快捷栏' }))
     expect(screen.getByRole('button', { name: 'Browser' })).toBeTruthy()
     expect(localStorage.getItem('pipiui:eui:tool-quick-rail-collapsed:v1')).toBe('false')
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    expect(floatRail()).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    expect(floatRail()?.className).not.toContain('is-collapsed')
+    fireEvent.click(screen.getByRole('button', { name: '收起工具快捷栏' }))
+    expect(floatRail()?.querySelectorAll('button')).toHaveLength(1)
+    expect(localStorage.getItem('pipiui:eui:tool-quick-rail-collapsed:v1')).toBe('true')
     vi.unstubAllGlobals()
   })
 
@@ -5014,4 +5011,46 @@ describe('model provider add (pi auth flow)', () => {
     expect(newTab).not.toHaveBeenCalled()
     Reflect.deleteProperty(window, 'pipiRemoteControl')
   })
+})
+
+it('places an extension action immediately right of thinking in the real Composer', async () => {
+  const host = createMockHost({productProfiles:true})
+  const extensions = await host.listExtensions!()
+  host.listExtensions = async () => [...extensions,{id:'openai-fast',name:'OpenAI Fast',version:'0.1.0',state:'enabled',source:'builtin',capabilities:[]}]
+  const profiles = await host.listProductProfiles!('demo')
+  host.listProductProfiles = async () => profiles.map(p=>({...p,recommendedExtensionIds:[...(p.recommendedExtensionIds||[]),'openai-fast']}))
+  const dispose = registerComposerAction('openai-fast',{id:'openai-fast.toggle',render:context=><button data-testid='fast-position' disabled={context.disabled}>Fast</button>})
+  try {
+    render(<App host={host}/>)
+    const button = await screen.findByTestId('fast-position')
+    const thinking = screen.getByTestId('thinking-chip-anchor')
+    expect(thinking.nextElementSibling).toBe(button)
+    expect(button.closest('.composer-options-left')).toBe(thinking.parentElement)
+  } finally {dispose()}
+})
+
+it('keeps Fast disabled for a sending queue and queued work after stopped, then enables after drain in the real App', async () => {
+  const host = createMockHost({productProfiles:true})
+  const profiles = await host.listProductProfiles!('demo')
+  host.listProductProfiles = async () => profiles.map(p=>({...p,recommendedExtensionIds:[...(p.recommendedExtensionIds||[]),'openai-fast']}))
+  const extensions = await host.listExtensions!()
+  host.listExtensions = async () => [...extensions,{id:'openai-fast',name:'OpenAI Fast',version:'0.1.0',state:'enabled',source:'builtin',capabilities:[]}]
+  let queue=[queuedMessage('fast-busy','welcome','synthetic queued work','sending')]
+  let listener: ((event: StreamEvent) => void) | undefined
+  host.listQueue=async()=>queue
+  host.subscribeStream=(_sessionId,callback)=>{listener=callback;return()=>{listener=undefined}}
+  const dispose=registerComposerAction('openai-fast',{id:'openai-fast.toggle',render:context=><button data-testid='fast-busy-app' disabled={context.disabled}>Fast</button>})
+  try {
+    render(<App host={host}/>)
+    const button=await screen.findByTestId('fast-busy-app') as HTMLButtonElement
+    await waitFor(()=>expect(button.disabled).toBe(true))
+    await act(async()=>{listener?.({type:'status',sessionId:'welcome',status:'stopped'})})
+    await waitFor(()=>expect(button.disabled).toBe(false))
+    queue=[queuedMessage('fast-busy','welcome','synthetic queued work','queued')]
+    await act(async()=>{listener?.({type:'queue_update',sessionId:'welcome',queue})})
+    await waitFor(()=>expect(button.disabled).toBe(true))
+    queue=[]
+    await act(async()=>{listener?.({type:'queue_update',sessionId:'welcome',queue})})
+    await waitFor(()=>expect(button.disabled).toBe(false))
+  }finally{dispose()}
 })

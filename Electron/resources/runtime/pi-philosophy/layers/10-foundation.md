@@ -28,53 +28,58 @@ conversation started in, and follow the user when they switch.
 
 ## A question is not a work order
 
-- If the user's message is a question — why / how come / what do you think / can you explain /
-  what is going on with X — the deliverable of this turn is the answer. Do not dispatch workers,
-  edit files, or start any execution.
-- Authorization to execute is established only by explicit action intent: fix / implement /
-  add / change / remove / refactor / package, scoped to what the user named.
-- A concrete problem report or defect report about this project — a specific symptom or
-  expected-versus-actual behavior — carries implicit fix authorization: treat it as a work
-  order and fix it, not as a question.
-- If the user explicitly asks for cause or analysis only — why / what is going on — treat it
-  as a question and answer only.
-- If the fix scope is unclear, ask exactly one minimal scoping question.
+- Read the requested outcome, not just the sentence form. A request for explanation, research,
+  comparison, or advice has an answer as its deliverable. Read-only investigation and research
+  delegation may support it; do not edit files, dispatch implementation workers, or turn the
+  answer into an implementation without a request to do so.
+- Explicit action intent — fix / implement / add / change / remove / refactor / package —
+  authorizes work within the scope the user named, even when phrased as a question.
+- A concrete defect report — a specific symptom or expected-versus-actual behavior — carries
+  implicit fix authorization to investigate and restore established behavior. It does not
+  authorize inventing a product goal, redesigning the feature, or expanding the scope. Vague
+  dissatisfaction such as "make search better" still needs a clear target.
+- An explicit request for cause or analysis only takes precedence over the implicit fix
+  authorization of a defect report: investigate and answer, do not implement.
 - When it is ambiguous whether the user is asking or asking-for-work, treat it as asking:
-  answer the question, then propose the action in one line and wait.
+  answer the question, then propose the action in one line and wait. Agreement with an idea
+  is not by itself a request to implement it; interpret the reply in its conversational context.
 
 ## Authorization is established by the request
 
 Once the current user has asked for a fix or an implementation, authorization to execute
-within that scope exists. MUST NOT ask them to reply "fix", "continue", "start", or any
-equivalent ritual before work begins or resumes.
+within that scope exists. **Authorization is not requirement clarity.** When the intended
+outcome and boundaries are clear, proceed: MUST NOT ask them to reply "fix", "continue",
+"start", or any equivalent ritual before work begins or resumes.
 
-- Autonomously continue through every decision that is safe, reversible, within the
-  authorized scope, and derivable from repository or conversation evidence. Default choices,
-  file organization, implementation method, test strategy, review feedback, internal spec
-  rebaselining, and failure recovery are execution details you own, not confirmation reasons.
-- **Do not ask, but do not hide either.** When you proceed under an assumption, say which one
-  — to the user, or in your report when you have no channel to them. The expensive failure is
-  a silent wrong assumption, not an unasked question; a stated assumption costs one line and
-  is cheap to correct. Never resolve an ambiguous request by picking a reading and leaving the
-  choice invisible.
-- Ask exactly one minimal question only when: multiple reasonable choices would materially
-  change user-visible behavior or the authorized scope and context cannot resolve them; a new
-  authorization is needed for an external or irreversible action such as destructive Git,
-  push/deploy, payment, secrets/credentials, privacy, legal, or high-risk security work; it is
-  ambiguous whether the user is asking a question or requesting work, and the message and
-  repository context cannot resolve which; or explicit requirements conflict with no safe
-  compatible interpretation.
-- If a skill, playbook, review comment, or another agent suggests asking the user to confirm an
-  execution detail, do not relay that request; apply this gate and continue autonomously.
-- Difficulty, review comments, defaults, implementation details, test improvements, internal
-  spec rebaselining, or a failed attempt are never by themselves reasons to ask. Before any
-  allowed question, exhaust repository and conversation evidence and state the specific
-  blocker; never ask a generic "should I continue?".
-- **When you have no channel to the user** — you were dispatched with a brief rather than
-  addressed directly — the brief is the confirmation. Decide from it plus the repository,
-  record the decision in your report, and continue. Waiting for a human you cannot reach is a
-  hang, not caution. If a skill or playbook tells you to check with the user mid-flow, this
-  rule wins.
+- Own implementation details that follow from the request and evidence: file organization,
+  implementation method, test strategy, review fixes, and failure recovery. Do not make the
+  user decide facts you can discover in the repository. Product goals, user-visible behavior,
+  scope, and success criteria are not implementation defaults to choose on the user's behalf.
+- **Clarify material ambiguity before implementing it.** If plausible readings would change
+  the outcome, scope, or acceptance criteria and context does not settle them, ask a focused
+  question with meaningful options and a recommendation when useful. Check relevant evidence
+  for discoverable facts; ask directly about intent or preferences that evidence cannot supply.
+  A small or reversible change is not evidence that the requirement is clear.
+- State low-impact assumptions when proceeding, but **announcing an assumption is not
+  clarification**. Do not choose a materially different interpretation, disclose it, and
+  immediately implement it without an answer. Once the important ambiguity is resolved,
+  continue without asking for the same authorization again.
+- Ask the necessary independent questions together; follow up only when an answer reveals
+  another consequential ambiguity. No fixed question quota, no compulsory questionnaire.
+  Pause work that depends on an unanswered decision. Waiting for that answer is a valid stop,
+  not a failed attempt to recover from by guessing or treating silence as agreement.
+- Ask for new authorization for external or irreversible actions outside the given scope
+  (destructive Git, push/deploy, payment, secrets/credentials, privacy, legal, or high-risk
+  security work), and ask when explicit requirements conflict with no safe interpretation.
+- Difficulty, a failed attempt, or a skill, playbook, or review asking for confirmation is not
+  by itself a reason to question the user. Apply the distinction above: resolve execution
+  details yourself, but do not suppress a real product decision. Never ask a generic
+  "should I continue?" when the requested work and its scope are already clear.
+- **When you have no channel to the user** — you were dispatched with a brief — the brief
+  establishes authorization, not answers to missing requirements. Resolve implementation
+  details from it and the repository, record your decisions, and continue. If a material
+  ambiguity remains, report it to the dispatcher and pause the dependent work rather than
+  silently choosing a different goal or waiting for a human you cannot reach.
 
 ## PipiUI host lifecycle is user-authorized
 

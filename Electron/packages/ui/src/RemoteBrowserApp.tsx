@@ -33,6 +33,9 @@ export type RemoteBrowserAppOptions = {
   schedule?: (fn: () => void, ms: number) => number
   cancel?: (id: number) => void
   hysteresisMs?: number
+  connectionTimeoutMs?: number
+  heartbeatTimeoutMs?: number
+  pingIntervalMs?: number
 }
 
 type SocketClose = { code?: number; reason?: string }
@@ -51,8 +54,9 @@ async function claimPair(
   pairID: string,
   secret: string,
   fetchImpl: typeof fetch,
+  signal: AbortSignal,
 ): Promise<void> {
-  const page = await fetchImpl(`/pair/${pairID}`, { credentials: 'same-origin' })
+  const page = await fetchImpl(`/pair/${pairID}`, { credentials: 'same-origin', signal })
   if (page.status === 404 || page.status === 403) {
     const error = new Error('pairing rejected') as Error & { closeKind: ReturnType<typeof classifyRemoteClose> }
     error.closeKind = page.status === 404 ? 'expired' : 'auth'
@@ -60,43 +64,60 @@ async function claimPair(
   }
   if (!page.ok) {
     const error = new Error('pairing rejected') as Error & { closeKind: ReturnType<typeof classifyRemoteClose> }
-    error.closeKind = 'auth'
+    error.closeKind = page.status >= 500 || page.status === 429 ? 'transient' : 'auth'
     throw error
   }
+  if (signal.aborted) throw new Error('connection cancelled')
   const claim = await fetchImpl(`/pair/${pairID}/claim`, {
     method: 'POST',
+    signal,
     credentials: 'same-origin',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ secret }),
   })
   if (!claim.ok) {
     const error = new Error('pairing rejected') as Error & { closeKind: ReturnType<typeof classifyRemoteClose> }
-    error.closeKind = claim.status === 404 ? 'expired' : 'auth'
+    error.closeKind = claim.status === 404 ? 'expired' : claim.status >= 500 || claim.status === 429 ? 'transient' : 'auth'
     throw error
   }
 }
 
-function waitForSocket(socket: BrowserSocket): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const succeed = () => {
-      if (settled) return
-      settled = true
-      resolve()
-    }
-    const fail = (event?: SocketClose) => {
-      if (settled) return
-      settled = true
-      const error = new Error(event?.reason || 'socket closed') as Error & SocketClose
-      error.code = event?.code
-      error.reason = event?.reason
-      reject(error)
-    }
-    socket.addEventListener('open', succeed, { once: true })
-    socket.addEventListener('error', fail, { once: true })
-    socket.addEventListener('close', fail, { once: true })
-    if (socket.readyState === 1) succeed()
-  })
+async function bounded<T>(work: Promise<T>, signal: AbortSignal, timeoutMs: number): Promise<T> {
+  if (signal.aborted) throw new Error('connection cancelled')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let abort: () => void = () => {}
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      abort = () => reject(new Error('connection cancelled'))
+      signal.addEventListener('abort', abort, { once: true })
+      timer = setTimeout(() => reject(new Error('connection timed out')), timeoutMs)
+    })])
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', abort)
+  }
+}
+
+async function waitForSocket(socket: BrowserSocket, signal: AbortSignal, timeoutMs: number): Promise<void> {
+  if (socket.readyState === 1) return
+  let succeed = () => {}
+  let fail: (event?: SocketClose) => void = () => {}
+  try {
+    await bounded(new Promise<void>((resolve, reject) => {
+      succeed = resolve
+      fail = event => reject(Object.assign(new Error(event?.reason || 'socket closed'), {
+        code: event?.code, reason: event?.reason
+      }))
+      socket.addEventListener('open', succeed)
+      socket.addEventListener('error', fail)
+      socket.addEventListener('close', fail)
+      if (socket.readyState >= 2) fail()
+    }), signal, timeoutMs)
+  } finally {
+    socket.removeEventListener('open', succeed)
+    socket.removeEventListener('error', fail)
+    socket.removeEventListener('close', fail)
+  }
 }
 
 export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
@@ -105,7 +126,6 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
   const [phase, setPhase] = useState<RemotePhase>('connecting')
   const [closeCopy, setCloseCopy] = useState<RemoteCloseCopy | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const stopRef = useRef(false)
   const optionsRef = useRef(options)
   optionsRef.current = options
 
@@ -133,15 +153,19 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
   }, [phase, closeCopy, options.hysteresisMs])
 
   useEffect(() => {
-    stopRef.current = false
+    let stopped = false
+    const lifetime = new AbortController()
     const opts = optionsRef.current
+    const timeoutMs = opts.connectionTimeoutMs ?? 10_000
+    const heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 60_000
+    const now = opts.now ?? Date.now
     const demo = opts.demo ?? (import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_PIPIUI_DEMO === 'true'
     if (demo) {
       setPhase('connecting')
       const next = (opts.demoHost ?? createMockHost)()
       setHost(next)
       setPhase('connected')
-      return () => { stopRef.current = true }
+      return () => { stopped = true }
     }
 
     const location = opts.location ?? (typeof window !== 'undefined' ? window.location : { protocol: 'http:', host: 'localhost', pathname: '/', hash: '' })
@@ -158,7 +182,14 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
     let pingTimer = 0
     let hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
     let pendingReconnect = false
+    let connectionInFlight = false
+    let retryAfterAttempt = false
+    let terminalStop = false
+    let lastReceivedAt = now()
+    let lastConnectedAt = 0
+    let detachSocketStop: (() => void) | undefined
     let activeSocket: BrowserSocket | undefined
+    let socketLifetime: AbortController | undefined
     let lastControl: string | undefined
     let controlListener: ((raw: unknown) => void) | undefined
 
@@ -166,6 +197,7 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       const copy = remoteCloseCopy(kind)
       setCloseCopy(copy)
       if (!copy.reconnect) {
+        terminalStop = true
         setPhase('disconnected')
         setError(copy.detail)
         return false
@@ -182,13 +214,28 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
     const runClaim = async (pair: StoredRemotePair): Promise<boolean> => {
       setPhase('pairing')
       try {
-        await claimPair(pair.pairID, pair.secret, fetchImpl)
+        const claimAbort = new AbortController()
+        const abortClaim = () => claimAbort.abort()
+        lifetime.signal.addEventListener('abort', abortClaim, { once: true })
+        const timer = setTimeout(abortClaim, timeoutMs)
+        try { await bounded(claimPair(pair.pairID, pair.secret, fetchImpl, claimAbort.signal), lifetime.signal, timeoutMs) }
+        finally {
+          clearTimeout(timer)
+          claimAbort.abort()
+          lifetime.signal.removeEventListener('abort', abortClaim)
+        }
+        if (stopped) return false
         writeStoredRemotePair(pair)
         return true
       } catch (reason) {
-        if (stopRef.current) return false
-        const kind = (reason as { closeKind?: RemoteCloseKind }).closeKind ?? 'auth'
-        failUnrecoverable(kind)
+        if (stopped) return false
+        let kind = (reason as { closeKind?: RemoteCloseKind }).closeKind ?? 'transient'
+        // A restarted relay forgets rooms briefly until the desktop re-registers.
+        // Its claim endpoint deliberately reports a missing room as 403, just
+        // like invalid credentials. Only a previously proven connection gets
+        // this bounded recovery window; explicit replaced/expired controls stop.
+        if ((kind === 'expired' || kind === 'auth') && lastConnectedAt && now() - lastConnectedAt < 60_000) kind = 'transient'
+        if (applyClose(kind)) scheduleReconnect()
         return false
       }
     }
@@ -205,7 +252,10 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
 
     const retireSocket = (socket?: BrowserSocket) => {
       if (!socket) return
+      socketLifetime?.abort()
       stopPing()
+      detachSocketStop?.()
+      detachSocketStop = undefined
       if (controlListener) {
         socket.removeEventListener('message', controlListener)
         controlListener = undefined
@@ -216,8 +266,16 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
 
     const attachControlListener = (socket: BrowserSocket) => {
       const onMessage = (raw: unknown) => {
+        lastReceivedAt = now()
         const type = readControlType(raw)
-        if (type) lastControl = type
+        if (type && type !== 'pong' && type !== 'ping') lastControl = type
+        if (type === 'error') {
+          const data = raw && typeof raw === 'object' && 'data' in raw ? (raw as { data: unknown }).data : raw
+          try {
+            const frame = typeof data === 'string' ? JSON.parse(data) : data
+            if (frame?.reason === 'host_offline') socket.close()
+          } catch { /* invalid controls are ignored */ }
+        }
       }
       controlListener = onMessage
       socket.addEventListener('message', onMessage)
@@ -228,20 +286,23 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       if (activeSocket) retireSocket(activeSocket)
       const socket = socketFactory(wsURL)
       activeSocket = socket
+      socketLifetime = new AbortController()
+      lastReceivedAt = now()
       lastControl = undefined
       attachControlListener(socket)
       return socket
     }
 
     const openSocket = async (mode: 'connecting' | 'reconnecting'): Promise<BrowserSocket | null> => {
-      if (stopRef.current) return null
+      if (stopped) return null
       setPhase(mode === 'reconnecting' ? 'reconnecting' : 'connecting')
       const socket = openFreshSocket()
       try {
-        await waitForSocket(socket)
+        await waitForSocket(socket, lifetime.signal, timeoutMs)
         return socket
       } catch (reason) {
-        if (stopRef.current) return null
+        retireSocket(socket)
+        if (stopped) return null
         const kind = classifyRemoteClose({
           code: (reason as SocketClose).code,
           reason: (reason as SocketClose).reason,
@@ -254,14 +315,15 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
         }
         if (shouldAutoReclaim(kind) && stored) {
           if (!(await runClaim(stored))) return null
-          if (stopRef.current) return null
+          if (stopped) return null
           setPhase(mode === 'reconnecting' ? 'reconnecting' : 'connecting')
           const retrySocket = openFreshSocket()
           try {
-            await waitForSocket(retrySocket)
+            await waitForSocket(retrySocket, lifetime.signal, timeoutMs)
             return retrySocket
           } catch (retryReason) {
-            if (stopRef.current) return null
+            retireSocket(retrySocket)
+            if (stopped) return null
             const retryKind = classifyRemoteClose({
               code: (retryReason as SocketClose).code,
               reason: (retryReason as SocketClose).reason,
@@ -278,8 +340,8 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       }
     }
 
-    const connect = async (mode: 'connecting' | 'reconnecting') => {
-      if (stopRef.current) return
+    const connectOnce = async (mode: 'connecting' | 'reconnecting') => {
+      if (stopped) return
       setPhase(mode)
       setError(null)
       const pair = parsePairLocation(location.pathname, location.hash)
@@ -298,32 +360,58 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
           if (!(await runClaim(stored))) return
         }
       }
-      if (stopRef.current) return
+      if (stopped) return
       const socket = await openSocket(mode)
       if (!socket) return
-      if (stopRef.current) {
+      if (stopped) {
         socket.close()
         return
       }
+      const nextHost = decorateHost(createWsHost(socket as WebSocketLike, { signal: socketLifetime?.signal }), opts.open)
+      try {
+        await bounded(nextHost.capabilities(), lifetime.signal, timeoutMs)
+      } catch {
+        retireSocket(socket)
+        if (!stopped) {
+          const kind = classifyRemoteClose({ controlType: lastControl })
+          if (kind === 'expired' || kind === 'replaced') failUnrecoverable(kind)
+          else scheduleReconnect()
+        }
+        return
+      }
+      if (stopped || socket !== activeSocket || socket.readyState !== 1) return
       reconnectAttempt = 0
-      const nextHost = decorateHost(createWsHost(socket as WebSocketLike), opts.open)
+      lastConnectedAt = now()
       setHost(nextHost)
       setPhase('connected')
       setCloseCopy(null)
       stopPing()
       pingTimer = window.setInterval(() => {
+        if (now() - lastReceivedAt >= heartbeatTimeoutMs) {
+          socketLifetime?.abort()
+          socket.close()
+          onStop({ code: 1006, reason: 'heartbeat timed out' })
+          return
+        }
         try { socket.send(JSON.stringify({ v: 2, type: 'ping', at: Date.now() })) } catch { /* ignore */ }
-      }, BROWSER_APP_PING_MS)
+      }, opts.pingIntervalMs ?? BROWSER_APP_PING_MS)
+      let socketStopped = false
       const onStop = (event?: SocketClose) => {
+        if (socketStopped) return
+        socketStopped = true
+        socketLifetime?.abort()
+        lastConnectedAt = now()
+        stopPing()
         socket.removeEventListener('close', onStop)
         socket.removeEventListener('error', onStop)
-        if (stopRef.current) return
+        if (stopped) return
         const kind = classifyRemoteClose({
           code: event?.code,
           reason: event?.reason,
           controlType: lastControl,
         })
         if (lastControl === 'end') {
+          terminalStop = true
           applyClose('host_offline')
           setPhase('disconnected')
           setError(remoteCloseCopy('host_offline').detail)
@@ -342,11 +430,35 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       }
       socket.addEventListener('close', onStop)
       socket.addEventListener('error', onStop)
+      detachSocketStop = () => {
+        socket.removeEventListener('close', onStop)
+        socket.removeEventListener('error', onStop)
+      }
+    }
+
+    const connect = async (mode: 'connecting' | 'reconnecting') => {
+      if (stopped || terminalStop || connectionInFlight) return
+      cancel(timer)
+      timer = 0
+      connectionInFlight = true
+      try {
+        await connectOnce(mode)
+      } catch {
+        retireSocket(activeSocket)
+        if (!stopped) scheduleReconnect()
+      } finally {
+        connectionInFlight = false
+        if (retryAfterAttempt && !stopped) {
+          retryAfterAttempt = false
+          scheduleReconnect()
+        }
+      }
     }
 
     const scheduleReconnect = (immediate = false) => {
-      if (stopRef.current) return
+      if (stopped || terminalStop) return
       setPhase('reconnecting')
+      if (connectionInFlight) { retryAfterAttempt = true; return }
       cancel(timer)
       timer = 0
       if (hidden && !immediate) {
@@ -371,9 +483,13 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
         return
       }
       hidden = false
-      if (stopRef.current) return
+      // pageshow also fires on first load, while claimPair is still awaiting
+      // HTTP and no socket exists yet. Starting another claim here revokes
+      // the first attempt's grant and leaves the UI bound to a dead socket.
+      if (stopped || terminalStop || connectionInFlight) return
       const open = activeSocket && (activeSocket.readyState === 0 || activeSocket.readyState === 1)
-      if (open) return
+      if (open && now() - lastReceivedAt < heartbeatTimeoutMs) return
+      if (open) retireSocket(activeSocket)
       scheduleReconnect(true)
     }
 
@@ -382,29 +498,30 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
     }
     if (typeof window !== 'undefined') {
       window.addEventListener('pageshow', onForeground)
+      window.addEventListener('online', onForeground)
     }
 
     void connect('connecting')
     return () => {
-      stopRef.current = true
+      stopped = true
+      lifetime.abort()
       cancel(timer)
       stopPing()
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onForeground)
       if (typeof window !== 'undefined') window.removeEventListener('pageshow', onForeground)
+        window.removeEventListener('online', onForeground)
       retireSocket(activeSocket)
     }
   }, [attempt])
 
-  if (host && displayPhase === 'connected') return <App host={host} />
-
-  if (host && (displayPhase === 'reconnecting' || displayPhase === 'disconnected')) {
+  if (host) {
     return (
       <div className="remote-browser-shell">
-        <div className="remote-browser-banner" role="status" data-testid="remote-lifecycle" data-phase={displayPhase} data-recovery="v2">
-          <strong>{displayPhase === 'reconnecting' ? phaseLabel('reconnecting') : (closeCopy?.title ?? phaseLabel(displayPhase))}</strong>
+        {displayPhase !== 'connected' && <div className="remote-browser-banner" role="status" data-testid="remote-lifecycle" data-phase={displayPhase} data-recovery="v2">
+          <strong>{displayPhase !== 'disconnected' ? phaseLabel('reconnecting') : (closeCopy?.title ?? phaseLabel(displayPhase))}</strong>
           {closeCopy && displayPhase === 'disconnected' && <span>{closeCopy.detail}</span>}
           <button type="button" onClick={retry}>{closeCopy?.action ?? '立即重试'}</button>
-        </div>
+        </div>}
         <App host={host} />
       </div>
     )

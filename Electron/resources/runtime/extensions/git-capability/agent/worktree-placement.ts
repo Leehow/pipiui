@@ -217,6 +217,8 @@ export interface WorktreePlacementOptions {
 	mainCwd?: string;
 	/** Bundled general-purpose isolation cannot be disabled by process-global legacy state. */
 	allowEnvironmentOptOut?: boolean;
+	/** Experiment preparation cannot reuse, rename around, or clean a collision. */
+	requireNew?: boolean;
 }
 
 export function resolveSubagentWorktree(opts: WorktreePlacementOptions): WorktreePlacement {
@@ -283,6 +285,16 @@ export function resolveSubagentWorktree(opts: WorktreePlacementOptions): Worktre
 
 	const preferredPath = path.resolve(worktreesRoot, id);
 	const preferredBranch = `pipiui/${id}`;
+
+	if (opts.requireNew) {
+		// mkdir is the ownership claim: Git permits an existing empty directory,
+		// but experiments may initialize only a directory created by this call.
+		try { fs.mkdirSync(preferredPath); }
+		catch { return { cwd: effectiveCwd, worktreeError: "experiment worktree directory already exists or cannot be reserved" }; }
+		const added = gitSpawnSync(["-C", toplevel, "worktree", "add", "-b", preferredBranch, preferredPath, "HEAD"], toplevel);
+		if (!added.ok) return { cwd: effectiveCwd, worktreeError: added.stderr || "experiment worktree creation failed; reserved directory retained" };
+		return { cwd: preferredPath, worktreePath: preferredPath, worktreeBranch: preferredBranch };
+	}
 
 	// 1) Reuse existing directory if it is already a valid worktree
 	if (fs.existsSync(preferredPath)) {

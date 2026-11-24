@@ -39,6 +39,7 @@ export type SpawnContributionDiagnostic = {
 /** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
 export type SpawnRegisteredExtension = {
   id: string;
+  authProviderId?: string;
   version?: string;
   enabled: boolean;
   extensionPath?: string;

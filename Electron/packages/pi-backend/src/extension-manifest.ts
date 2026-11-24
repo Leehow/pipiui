@@ -207,6 +207,7 @@ export type ExtensionUiSummary = {
   viewContainers?: ExtensionUiViewContainer[];
   views?: ExtensionUiView[];
   headerActions?: ExtensionUiHeaderAction[];
+  composerActions?: ExtensionUiHeaderAction[];
   /** Theme pack entries pass through verbatim; per-theme content validation is
    *  fail-closed in the renderer theme registry (see ThemeContribution). */
   themes?: unknown[];
@@ -260,6 +261,8 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   id: string;
   name: string;
   version: string;
+  /** Optional host product allowlist; absent makes the package visible to every product. */
+  products?: string[];
   /** Optional initial enablement; absent retains the origin's legacy default. */
   defaultEnabled?: boolean;
   /** One-line package summary shown in the extension list. */
@@ -723,6 +726,17 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   const version = asNonEmptyString(value.version);
   if (!version) errors.push("missing required field version");
 
+  let products: string[] | undefined;
+  if (value.products !== undefined) {
+    if (!Array.isArray(value.products) || value.products.length === 0 || value.products.some(
+      (item) => typeof item !== "string" || item !== item.trim() || !EXTENSION_ID_RE.test(item),
+    ) || new Set(value.products).size !== value.products.length) {
+      errors.push("products must be a non-empty array of unique product id slugs ([a-z][a-z0-9-]*)");
+    } else {
+      products = [...value.products];
+    }
+  }
+
   let description: string | undefined;
   if (value.description !== undefined && value.description !== null) {
     if (typeof value.description !== "string") {
@@ -1017,6 +1031,40 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
           if (actions.length) summary.headerActions = actions;
         }
       }
+      if (appUi.composerActions !== undefined) {
+        if (!Array.isArray(appUi.composerActions)) {
+          errors.push("app.ui.composerActions must be an array");
+        } else {
+          const actions: ExtensionUiHeaderAction[] = [];
+          const seen = new Set<string>();
+          for (const [index, item] of appUi.composerActions.entries()) {
+            const label = `app.ui.composerActions[${index}]`;
+            if (!isRecord(item)) {
+              errors.push(`${label} must be an object`);
+              continue;
+            }
+            const actionId = asNonEmptyString(item.id);
+            if (!actionId || !CONTRIBUTION_ID_RE.test(actionId)) {
+              errors.push(`${label}.id must be a semantic contribution id`);
+              continue;
+            }
+            if (seen.has(actionId)) {
+              errors.push(`duplicate composer action id '${actionId}'`);
+              continue;
+            }
+            seen.add(actionId);
+            const entry = collectRelativePath(item.entry, `${label}.entry`, errors);
+            let order: number | undefined;
+            if (item.order !== undefined) {
+              if (typeof item.order !== "number" || !Number.isFinite(item.order)) {
+                errors.push(`${label}.order must be a finite number`);
+              } else order = item.order;
+            }
+            if (entry) actions.push({ id: actionId, entry, ...(order !== undefined ? { order } : {}) });
+          }
+          if (actions.length) summary.composerActions = actions;
+        }
+      }
       if (appUi.panels !== undefined) {
         if (!Array.isArray(appUi.panels)) {
           errors.push("app.ui.panels must be an array");
@@ -1259,6 +1307,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     version: version!,
     capabilities,
   };
+  if (products) manifest.products = products;
   if (typeof value.defaultEnabled === "boolean") manifest.defaultEnabled = value.defaultEnabled;
   if (description) manifest.description = description;
   if (category) manifest.category = category;

@@ -12,9 +12,9 @@ import {
 } from "../agent/provider.js";
 
 describe("grok-build conversation request adapter", () => {
-  it("routes contributed models through HTTPS openai-responses + OAuth access", () => {
-    const provider = createAuthProvider();
-    expect(createAuthProvider).toBe(createGrokBuildProvider);
+  it("routes contributed models through HTTPS openai-responses + OAuth access", async () => {
+    const provider = await createAuthProvider({ authPath: "/nonexistent/grok-test-auth.json" });
+    expect(provider.oauth.name).toBe(createGrokBuildProvider().oauth.name);
     expect(GROK_BUILD_PROVIDER_ID).toBe("grok-build");
     expect(provider.api).toBe("openai-responses");
     expect(provider.baseUrl).toBe("https://api.x.ai/v1");

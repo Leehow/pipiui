@@ -15,9 +15,10 @@
  * a summary and never invents conclusions — where evidence is absent the checkpoint is
  * simply not written.
  *
- * Fresh routing additionally REQUIRES poisoned-broad-recon evidence: a dispatched
- * recon/review role or a read/search-dominated mutation-free trajectory, combined with a
- * NON-verify provider/context failure. An attestable verify failure outranks every other
+ * Fresh routing additionally REQUIRES poisoned-broad-recon evidence from an ephemeral
+ * worker, combined with a NON-verify provider/context failure. A writable worker keeps
+ * its stored conversation even during a read/search-only phase: lack of edits does not
+ * make its research disposable. An attestable verify failure outranks every other
  * attribution — even when the worker ALSO carries read-heavy recon evidence and a huge
  * context — because an implementation/test problem must be debugged by the conversation
  * that produced it. Size alone never sends an ordinary implementation or verify failure
@@ -142,11 +143,10 @@ export function hasBroadReconTrajectoryEvidence(
  * saturated context → unclassified. An attestable verify failure ALWAYS keeps same-agent
  * continuity: an ordinary implementation/test problem is debugged by the conversation that
  * produced it, even when that conversation also carries poisoned-recon evidence and a
- * ≥hint-token context. Provider/context failures become the FRESH route only when gated on
- * poisoned-recon evidence ({@link hasBroadReconTrajectoryEvidence}): the dispatched
- * role/task shape or the observed read/search footprint must show a broad recon/reviewer
- * trajectory. Without that evidence they fail safe to continue-slice, annotated with the
- * measured context size instead of minting a speculative fresh episode.
+ * ≥hint-token context. Provider/context failures become the FRESH route only for an
+ * ephemeral worker with poisoned-recon evidence ({@link hasBroadReconTrajectoryEvidence}).
+ * Writable roles always keep continuity, including before their first edit. Without
+ * sufficient evidence, fail safe to continue-slice rather than minting a new identity.
  */
 export function classifyWorkerRecovery(
 	input: RecoveryObservation,
@@ -158,7 +158,11 @@ export function classifyWorkerRecovery(
 	// context size, recon-shaped footprints, stall signatures, or threshold checks below.
 	if (input.verifyFailure) return { route: "continue-slice", kind: "verify-failure" };
 	const hint = options?.contextHintTokens ?? RECOVERY_CONTEXT_HINT_TOKENS_DEFAULT;
-	const poisonedRecon = hasBroadReconTrajectoryEvidence(input);
+	// Read-heavy preparation is still part of a stateful implementation slice. A provider
+	// outage or large context does not prove its saved conversation is unusable.
+	const statefulWorker = input.readOnly === false
+		|| (input.readOnly === undefined && (input.role ?? "").trim().toLowerCase() === "general-purpose");
+	const poisonedRecon = !statefulWorker && hasBroadReconTrajectoryEvidence(input);
 	if (isStallShaped(`${input.errorText}\n${input.stopReason ?? ""}`)) {
 		return poisonedRecon
 			? { route: "checkpoint-fresh-episode", kind: "provider-stall" }
@@ -466,9 +470,9 @@ export function formatRecoveryReport(input: {
 		: d.kind === "aborted"
 			? "中断不是失败：按既有规则沿用同名 agentId 续接即可。"
 			: d.kind === "context-overflow"
-				? `终态时上下文已达阈值以上，但缺乏侦查轨迹毒化的证据，不换新会话：按连续性规则重新派发同一 agentId 继续；请缩小任务范围并要求小窗口读取。`
+				? `终态时上下文较大不代表必须丢弃已有会话：重新派发同一 agentId 继续，不要传 fresh:true；请缩小任务范围、使用小窗口读取，必要时压缩上下文。`
 				: d.kind === "provider-stall"
-					? `供应商停滞但未见侦查毒化证据，fail-safe 保持连续性：重新派发同一 agentId 续接该切片。`
+					? `供应商停滞不等于会话损坏：重新派发同一 agentId 续接该切片，不要传 fresh:true；如需换模型也保留同一 agentId。`
 					: `普通实现/测试失败，与上下文无关：按连续性规则重新派发同一 agentId 继续该切片。`;
 	return `${head}\n[pipiui] ${guidance}`;
 }

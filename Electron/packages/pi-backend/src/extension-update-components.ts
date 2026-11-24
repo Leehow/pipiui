@@ -13,7 +13,7 @@ export const EXTENSION_UPDATE_COMPONENTS_MAX = 32;
 /** Semantic component slug (same shape as extension / provider ids). */
 export const EXTENSION_COMPONENT_ID_RE = /^[a-z][a-z0-9-]*$/;
 
-export const EXTENSION_UPDATE_SOURCE_TYPES = ["npm", "pypi", "githubReleases"] as const;
+export const EXTENSION_UPDATE_SOURCE_TYPES = ["npm", "pypi", "githubReleases", "githubCommits"] as const;
 export type ExtensionUpdateSourceType = (typeof EXTENSION_UPDATE_SOURCE_TYPES)[number];
 
 /**
@@ -24,7 +24,8 @@ export type ExtensionUpdateSourceType = (typeof EXTENSION_UPDATE_SOURCE_TYPES)[n
 export type ExtensionUpdateComponentSource =
   | { type: "npm"; packageName: string }
   | { type: "pypi"; packageName: string }
-  | { type: "githubReleases"; owner: string; repo: string };
+  | { type: "githubReleases"; owner: string; repo: string }
+  | { type: "githubCommits"; owner: string; repo: string; ref: string };
 
 /** Owner-neutral declared open-source component bundled by an extension. */
 export type ExtensionUpdateComponent = {
@@ -53,6 +54,7 @@ const SOURCE_KEYS: Record<ExtensionUpdateSourceType, Set<string>> = {
   npm: new Set(["type", "packageName"]),
   pypi: new Set(["type", "packageName"]),
   githubReleases: new Set(["type", "owner", "repo"]),
+  githubCommits: new Set(["type", "owner", "repo", "ref"]),
 };
 
 const COMPONENT_KEYS = new Set(["id", "name", "version", "source", "upstream", "license"]);
@@ -94,7 +96,7 @@ function parseSource(
   }
   const sourceType = type as ExtensionUpdateSourceType;
   rejectUnknownKeys(value, SOURCE_KEYS[sourceType], `${label}.source`, errors);
-  if (sourceType === "githubReleases") {
+  if (sourceType === "githubReleases" || sourceType === "githubCommits") {
     const owner = asNonEmptyString(value.owner);
     const repo = asNonEmptyString(value.repo);
     if (!owner) errors.push(`${label}.source.owner must be a non-empty GitHub owner`);
@@ -106,6 +108,14 @@ function parseSource(
       errors.push(`${label}.source.repo is not a valid GitHub repository name '${repo}'`);
     }
     if (owner && repo && GITHUB_NAME_RE.test(owner) && GITHUB_NAME_RE.test(repo)) {
+      if (sourceType === 'githubCommits') {
+        const ref = asNonEmptyString(value.ref);
+        if (!ref || ref.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref) || ref.includes('..')) {
+          errors.push(`${label}.source.ref must be a valid bounded Git ref`);
+          return undefined;
+        }
+        return { type: sourceType, owner, repo, ref };
+      }
       return { type: sourceType, owner, repo };
     }
     return undefined;
@@ -196,6 +206,9 @@ export function parseExtensionUpdateComponents(
     }
 
     const source = parseSource(raw.source, label, errors);
+    if (source?.type === 'githubCommits' && (!version || !/^[0-9a-f]{40}$/.test(version))) {
+      errors.push(`${label}.version must be a full Git commit SHA for githubCommits`);
+    }
     if (id && seen.has(id)) errors.push(`duplicate update component id '${id}'`);
     if (id) seen.add(id);
 

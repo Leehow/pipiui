@@ -96,6 +96,7 @@ import {
 	type WatchTickEvent,
 } from "./watch-registry.ts";
 import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
+import { retainWorktreeMergePolicyV1 } from "../../extensions/git-capability/host/worktree/merge-policy.ts";
 import {
 	cleanScope,
 	clearRunningDispatchScope,
@@ -476,6 +477,7 @@ import {
 	applyToolResultEvent,
 	readAssistantToolCall,
 } from "./assistant-tool-call.ts";
+import { BashDetailStore, createBashDetailConsumer, handleBashDetailCommand } from "./bash-details.ts";
 import {
 	createUsageEmitter,
 	type StreamingUsageSnapshot,
@@ -1046,6 +1048,7 @@ export function drainPipiuiTrackedChildren(
 // App-side PiProcess.terminate also SIGTERMs the process tree as a backstop.
 process.on("exit", () => pipiuiChildTracker.terminateNow("SIGTERM"));
 
+const workerBashDetails = new BashDetailStore();
 const PIPIUI_REPORT_TIMEOUT_MS = 5000;
 type PipiuiAgentReport = AgentBridgeEventPayloadV1;
 
@@ -1494,6 +1497,8 @@ interface RunSingleAgentOptions {
 	deadlineAt?: number;
 	/** Host-observed model output used by a caller-owned bounded progress deadline. */
 	onActivity?: () => void;
+	/** Sticky lifecycle policy; never retains successful prototypes without merging. */
+	mergePolicy?: "auto" | "never";
 	/** Bundled general-purpose placement override; omission remains isolated. */
 	worktree?: "isolated" | "none";
 	/** Optional Boss reason when bundled general-purpose runs in a shared cwd. */
@@ -2340,6 +2345,7 @@ interface JobRecord {
 	recovery?: RecoveryDecision;
 	/** Checkpoint artifact written at a context/provider-poisoned boundary, when evidence existed. */
 	recoveryCheckpoint?: string;
+	mergePolicy?: "auto" | "never";
 	worktreePath?: string;
 	worktreeBranch?: string;
 	integrationState?: SubagentIntegrationState;
@@ -3658,6 +3664,7 @@ async function reportResolvedCloseout(job: JobRecord): Promise<void> {
 			mainCwd: PIPIUI_MAIN_CWD,
 			worktreePath: job.worktreePath,
 			worktreeBranch: job.worktreeBranch,
+			mergePolicy: job.mergePolicy,
 			role: job.name === "secretary" ? "secretary" : "worker",
 			terminalState: terminalStateForFinalization({
 				ok: job.state === "ok",
@@ -3709,6 +3716,7 @@ async function reportResolvedCloseout(job: JobRecord): Promise<void> {
 		closeoutAt: job.closeoutAt ?? Date.now(),
 		...(worktreeFinalization ? { worktreeFinalization } : {}),
 		...(worktreeLifecycle ? { worktreeLifecycle } : {}),
+		mergePolicy: job.mergePolicy,
 		...(job.worktreePath ? { worktreePath: job.worktreePath } : {}),
 		...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
 	});
@@ -3835,6 +3843,7 @@ function jobUpsertRunning(
 		title,
 		...(blockedBy && blockedBy.length > 0 ? { blockedBy } : {}),
 		...(model ? { model } : {}),
+		mergePolicy: PIPIUI_MAIN_CWD ? retainWorktreeMergePolicyV1(PIPIUI_MAIN_CWD, agentId) : undefined,
 		...(planAdherence?.planTask ? { planTask: planAdherence.planTask } : {}),
 		...(declaredScope.length > 0 ? { scope: declaredScope } : {}),
 		state: "running",
@@ -3980,6 +3989,7 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 				? truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP)
 				: existing?.resultText,
 		verify: fields.verify ?? existing?.verify,
+		mergePolicy: existing?.mergePolicy,
 		worktreePath: fields.worktreePath ?? existing?.worktreePath,
 		worktreeBranch: fields.worktreeBranch ?? existing?.worktreeBranch,
 		integrationState: fields.integrationState ?? existing?.integrationState,
@@ -4248,6 +4258,7 @@ function markWorkerInterrupted(agentId: string, reason: string): boolean {
 		return false;
 	}
 
+	workerBashDetails.interrupt(agentId, runId);
 	if (handle) noteFinalizationDetails(handle.diagnostics, { error: "process-missing" });
 	const exitSnapshot = handle ? projectChildExitDiagnostics(agentId, handle, "vanished") : undefined;
 	const changed = jobFinalize(agentId, runId, {
@@ -4419,6 +4430,7 @@ interface AgentSliceMetadata {
 	title?: string;
 	runId?: string;
 	state?: JobState;
+	mergePolicy?: "auto" | "never";
 	/** Conversation that dispatched this worker; absent on rows written before the field existed. */
 	sessionId?: string;
 	resultSummary?: string;
@@ -4476,7 +4488,7 @@ function writeAgentSliceMetadata(slices: AgentSliceMetadata[]): void {
 function rememberAgentSlice(agentId: string, name: string, task: string, title: string | undefined, runId: string): void {
 	const all = readAgentSliceMetadata();
 	writeAgentSliceMetadata([
-		{ agentId, name, task: task.slice(0, 12_000), ...(title ? { title: title.slice(0, 500) } : {}), runId, state: "running", ...(PIPIUI_SESSION_ID ? { sessionId: PIPIUI_SESSION_ID } : {}), updatedAt: Date.now() },
+		{ agentId, name, mergePolicy: PIPIUI_MAIN_CWD ? retainWorktreeMergePolicyV1(PIPIUI_MAIN_CWD, agentId) : undefined, task: task.slice(0, 12_000), ...(title ? { title: title.slice(0, 500) } : {}), runId, state: "running", ...(PIPIUI_SESSION_ID ? { sessionId: PIPIUI_SESSION_ID } : {}), updatedAt: Date.now() },
 		...all.filter((item) => item.agentId !== agentId),
 	]);
 }
@@ -4516,6 +4528,7 @@ function rememberAgentSliceTerminal(agentId: string, runId: string, job: JobReco
 			...current,
 			runId,
 			state: job.state,
+			mergePolicy: job.mergePolicy,
 			...(resultSummary ? { resultSummary } : {}),
 			...(job.worktreePath ? { worktreePath: job.worktreePath } : {}),
 			...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
@@ -7497,8 +7510,12 @@ async function runSingleAgent(
 		);
 	}
 	const pipiuiAgentId = callerAgentId;
+	const mergePolicy = PIPIUI_MAIN_CWD
+		? retainWorktreeMergePolicyV1(PIPIUI_MAIN_CWD, pipiuiAgentId, options.mergePolicy)
+		: options.mergePolicy ?? "auto";
 	// Capture this invocation's generation before any early failure path can return a result.
 	const runId = options?.runId ?? DeliveryObligationStore.runId();
+	const consumeBashDetail = createBashDetailConsumer(workerBashDetails, pipiuiAgentId, runId, pipiuiReport);
 	const isBackground = options?.background === true;
 	localAgentReservations.add(pipiuiAgentId);
 
@@ -8169,6 +8186,7 @@ async function runSingleAgent(
 		name: agentName,
 		task,
 		depth: options?.depth ?? PIPIUI_DEPTH + 1,
+		mergePolicy,
 		model: resolvedModel ?? null,
 		...(options?.contextWindow ? { contextWindow: options.contextWindow } : {}),
 		...(options?.title ? { title: options.title } : {}),
@@ -8840,6 +8858,8 @@ async function runSingleAgent(
 						return;
 					}
 
+					consumeBashDetail(event);
+
 					// RPC responses are command-level truth, distinct from streamed agent
 					// events. A rejected initial prompt never produces a turn, so do not
 					// wait for a provider/stall timeout or attempt an auto-resume.
@@ -9232,6 +9252,7 @@ async function runSingleAgent(
 						clearChildExitTimers();
 						providerWait.dispose();
 						stdoutScanner.end();
+						workerBashDetails.interrupt(pipiuiAgentId, runId);
 					childExitCloseout.settled("ok");
 					// The process is known closed. Keep the background handle alive as finalizing
 					// while verify/end reporting runs; only an unreported dead live child is vanished.
@@ -9240,6 +9261,7 @@ async function runSingleAgent(
 				});
 
 				proc.on("error", () => {
+					workerBashDetails.interrupt(pipiuiAgentId, runId);
 					residentRpcShutdownWaker?.dispose();
 					procExited = true;
 					clearChildExitTimers();
@@ -9584,10 +9606,10 @@ async function runSingleAgent(
 			// Structured recovery classification (see recovery-classification.ts): an ordinary
 			// implementation/test failure keeps same-agent continuity — INCLUDING at huge context;
 			// size alone never mints a fresh episode. A provider-stall or saturated-context death
-			// becomes checkpoint-fresh-episode ONLY with poisoned-broad-recon evidence: dispatched
-			// recon/review role or a read/search-dominated mutation-free trajectory observed in the
-			// tool-call record (the four-episode reviewer case). Insufficient evidence fails safe
-			// to continuity and persists no checkpoint.
+			// becomes checkpoint-fresh-episode only for ephemeral recon/review with sufficient
+			// trajectory evidence. Writable workers keep their stored conversation even before
+			// their first edit; read/search-heavy preparation alone never discards that context.
+			// Insufficient evidence also keeps continuity and persists no checkpoint.
 			recoveryClassification = classifyWorkerRecovery(
 				{
 					wasAborted,
@@ -9625,7 +9647,7 @@ async function runSingleAgent(
 				const n = Math.round((currentResult.usage.contextTokens || 0) / 1000);
 				note += recoveryClassification.route === "checkpoint-fresh-episode"
 					? `\n[pipiui] 侦查轨迹毒化证据成立（~${n}k tokens）：按上方报告走新的语义 episode。`
-					: `\n[pipiui] 终态时上下文已达 ~${n}k tokens，但无侦查毒化证据：继续同一 agentId 切片，缩小任务范围并要求小窗口读取。`;
+					: `\n[pipiui] 终态时上下文已达 ~${n}k tokens，恢复策略保留原会话：继续同一 agentId 切片，缩小任务范围并要求小窗口读取。`;
 			}
 			endOutput += note;
 			endResultText += note;
@@ -9739,6 +9761,7 @@ async function runSingleAgent(
 				worktreePath: placement.worktreePath,
 				worktreeBranch: placement.worktreeBranch,
 				role: agentName === "secretary" ? "secretary" : "worker",
+				mergePolicy,
 					terminalState: terminalStateForFinalization({ ok: endOk, aborted: externallyAborted }),
 				onProgress(phase, detail) {
 					projectFinalizationPhase(pipiuiAgentId, runId, phase);
@@ -9848,6 +9871,7 @@ async function runSingleAgent(
 			turns: currentResult.usage.turns,
 			contextTokens: currentResult.usage.contextTokens,
 			stopReason: currentResult.stopReason ?? null,
+			mergePolicy,
 			...(finalization ? { worktreeFinalization: finalization } : {}),
 			...(worktreeLifecycle ? { worktreeLifecycle } : {}),
 			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
@@ -10031,7 +10055,12 @@ const UsageBudgetParam = Type.Optional(
 	}),
 );
 
+const MergePolicyParam = Type.Optional(StringEnum(["auto", "never"] as const, {
+	description: "Worktree integration policy. Default auto; never retains the worktree and branch even on success or Boss acceptance. Sticky across same-agent resume/fresh/recovery; cannot be downgraded to auto.",
+}));
+
 const TaskItem = Type.Object({
+	mergePolicy: MergePolicyParam,
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	title: Type.Optional(
@@ -10061,6 +10090,7 @@ const TaskItem = Type.Object({
 // spelling arrived 6/6). Old names {agent, task, title, worktree} live only in
 // the sanitizer and must never re-enter this property list.
 const ChainItem = Type.Object({
+	mergePolicy: MergePolicyParam,
 	prompt: Type.String({
 		minLength: 1,
 		description: "The full task prompt for this step. May reference the prior step's output with the {previous} placeholder.",
@@ -10115,6 +10145,7 @@ const SharedDispatchParams = {
 // timeoutSecs, agentScope): anything declared here survives the strict sanitizer, so a
 // field the runner supports must not be silently dropped at the provider boundary.
 const SubagentParams = Type.Object({
+	mergePolicy: MergePolicyParam,
 	// prompt/description/agentId are OPTIONAL at the schema level ONLY so the parallel
 	// `tasks[]` mode fits this one strict schema — a legal wave carries per-item agentIds and
 	// no root identity at all. Single-mode required-ness stays enforced at runtime: the
@@ -10241,6 +10272,7 @@ const SubagentWatchParams = Type.Object({
 	})),
 }, { additionalProperties: false });
 type SubagentExecuteParams = {
+	mergePolicy?: "auto" | "never";
 	action?: "abort" | "resolve" | "progress";
 	prompt?: string;
 	description?: string;
@@ -10276,6 +10308,7 @@ type SubagentExecuteParams = {
 	// isolation); adoptGrokBuildDispatch at execute entry fills the internal old names
 	// this runner reads, so agent/task stay required here.
 	chain?: Array<{
+		mergePolicy?: "auto" | "never";
 		agent: string;
 		task: string;
 		prompt?: string;
@@ -10299,6 +10332,7 @@ type SubagentExecuteParams = {
 		planTask?: string;
 	}>;
 	tasks?: Array<{
+		mergePolicy?: "auto" | "never";
 		agent: string;
 		task: string;
 		title?: string;
@@ -10489,6 +10523,7 @@ export default function (pi: ExtensionAPI) {
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
 	});
 	pi.on("session_shutdown", async () => {
+		workerBashDetails.close();
 		bossNotificationContext = undefined;
 		idleNotificationState.reset();
 		restoreNudgeThinking(pi);
@@ -11222,6 +11257,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---- RPC commands: GUI uses these same Node control paths instead of mutating Swift-only state. ----
+	pi.registerCommand("subagent_bash_detail", {
+		description: "Read a run-scoped bounded bash detail snapshot (PipiUI host)",
+		handler: async (args) => {
+			// Bypass the lifecycle queue: ended runs still support read-only requests.
+			await handleBashDetailCommand(args ?? "", workerBashDetails, postPipiuiReport);
+		},
+	});
 	pi.registerCommand("subagent_abort", {
 		description: "Abort a background subagent (running or queued): /subagent_abort <agentId> <runId> — runId must be the exact accepted run (PipiUI)",
 		handler: async (args, ctx) => {
@@ -11543,6 +11585,7 @@ export default function (pi: ExtensionAPI) {
 				model?: string,
 				modelPin?: ValidatedModelPin,
 				planTask?: string,
+				mergePolicy?: "auto" | "never",
 			): void => {
 				// A receipt is an accepted lifecycle obligation even while queue/blockedBy
 				// keeps it from spawning. The resident parent may not close over it.
@@ -11558,7 +11601,7 @@ export default function (pi: ExtensionAPI) {
 					sessionShutdownAbort.signal, // session teardown (not a turn abort) owns this descendant subtree
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, fork: params.fork, forkSourceFile, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, fork: params.fork, forkSourceFile, blockedBy, scope, planTask, mergePolicy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -12197,6 +12240,7 @@ export default function (pi: ExtensionAPI) {
 						step.model,
 						validatedPinOf(step.model),
 						step.planTask,
+						step.mergePolicy,
 					);
 					const placeholder: SingleResult = {
 						agent: agentName,
@@ -12281,6 +12325,7 @@ export default function (pi: ExtensionAPI) {
 								modelPin: validatedPinOf(step.model),
 								agentId: step.agentId!.trim(),
 								fresh: step.fresh,
+								mergePolicy: step.mergePolicy,
 								worktree: step.worktree,
 								noWorktreeReason: step.noWorktreeReason,
 								heartbeatSecs: step.heartbeatSecs,
@@ -12437,7 +12482,7 @@ export default function (pi: ExtensionAPI) {
 								sessionShutdownAbort.signal, // session teardown owns queued descendants too
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, fork: t.fork, forkSourceFile, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, fork: t.fork, forkSourceFile, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask, mergePolicy: t.mergePolicy },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -12569,6 +12614,7 @@ export default function (pi: ExtensionAPI) {
 							blockedBy: t.blockedBy,
 							scope: t.scope,
 							planTask: t.planTask,
+							mergePolicy: t.mergePolicy,
 						},
 					);
 					allResults[index] = result;
@@ -12734,7 +12780,7 @@ export default function (pi: ExtensionAPI) {
 												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
-												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, fork: params.fork, forkSourceFile, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, toolBudget: params.toolBudget, usageBudget: params.usageBudget, progressLog: params.progressLog },
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, fork: params.fork, forkSourceFile, scope: params.scope, planTask: params.planTask, mergePolicy: params.mergePolicy, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, toolBudget: params.toolBudget, usageBudget: params.usageBudget, progressLog: params.progressLog },
 											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -12770,7 +12816,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						]);
 					} else {
-						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model), params.planTask);
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model), params.planTask, params.mergePolicy);
 					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -12828,6 +12874,7 @@ export default function (pi: ExtensionAPI) {
 						blockedBy: params.blockedBy,
 						scope: params.scope,
 						planTask: params.planTask,
+						mergePolicy: params.mergePolicy,
 						worktree: params.worktree,
 						noWorktreeReason: params.noWorktreeReason,
 						heartbeatSecs: params.heartbeatSecs,

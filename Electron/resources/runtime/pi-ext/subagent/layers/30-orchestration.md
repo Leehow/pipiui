@@ -248,14 +248,19 @@ branch. It remembers writing the code — which is exactly who you want debuggin
   any worker from this goal the one that wrote the code I am about to change?
 - `resumed=true` in a done header means that worker continued; its absence on a name you meant
   to continue is a signal you typed the name wrong.
-- A failed episode carrying `[subagent-recovery]` routes its own recovery.
-  `continue-slice` (verify-failure, retry-exhausted, unclassified) is an ordinary
-  implementation/test failure: re-dispatch the SAME agentId as above. `checkpoint-fresh-episode`
-  (provider-stall, context-overflow): the conversation is the failure — in-run resume and
-  compaction are spent, replaying reproduces both cost and death. Dispatch a NEW semantic
-  agentId whose brief starts *read `.pi/checkpoints/<old-id>.md` first*: a bounded record of
-  examined file families, prior findings, preserved worktree. With `checkpoint=-` no evidence
-  existed: narrow the fresh brief yourself; never discard the old worktree either way.
+- A failed episode carrying `[subagent-recovery]` gives a recovery route, not a ban on
+  resuming. `continue-slice` includes provider stalls and large-context failures for
+  stateful workers: re-dispatch the SAME agentId without `fresh:true`. A `general-purpose`
+  or other writable worker keeps its conversation even if it had only read/searched before
+  failing; no edits yet does not make its context disposable. Changing the model also
+  keeps the same agentId. Automatic retry exhaustion alone is not proof of corrupt context.
+- `checkpoint-fresh-episode` is for ephemeral read-only recon/review, not for a writable
+  worker's preparation phase. Read its `.pi/checkpoints/<old-id>.md` in the new episode's
+  brief; with `checkpoint=-`, narrow the brief from the evidence you have. Never discard
+  a preserved worktree. If an older report recommends this route for a stateful worker,
+  inspect status and try same-agent continuation first. Use `fresh:true` only after a
+  diagnosed context problem warrants explicitly discarding that conversation, not simply
+  because the worker failed.
 
 ## Verification and supervision
 

@@ -33,11 +33,13 @@ FLAPCODE_KEY=sk-flapcode-… node e2e-flapcode.mjs
 | key | 类型 | 说明 |
 | --- | --- | --- |
 | `ext.flapcode.apiKey` | secret | Flapcode API Key（`sk-flapcode-…`），存扩展 vault |
-| `ext.flapcode.baseUrl` | string | 默认 `https://codex.takemoon.com/v1`，仅允许 HTTPS；设置后跳过自动发现 |
+| `ext.flapcode.baseUrl` | string | 默认 `https://codex.takemoon.com/v1`，仅允许 HTTPS；填写后覆盖默认网关 |
 
 ## 模型目录
 
-默认 `gpt-5.6-sol`，另收录 `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-6-astra` / `gpt-5.5`，参数对齐 pi 内置 `openai-codex` 目录（272K 上下文、thinking 档位映射），全部经真实 key 逐个验证。
+默认 `gpt-5.6-sol`，另收录 `gpt-6.1-sol` / `gpt-6.1-terra` / `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` / `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.5`。
+
+GPT-6.1 Sol/Terra 的参数和标准 API 价格来自 [Sol 模型文档](https://developers.openai.com/api/docs/models/gpt-6.1-sol)、[Terra 模型文档](https://developers.openai.com/api/docs/models/gpt-6.1-terra)及[价格表](https://developers.openai.com/api/docs/pricing)，核对于 2026-11-07：均为 1,050,000 上下文、128,000 最大输出，支持文本和图片输入；Sol 的思考不能关闭，Terra 可关闭。Flapcode 真实请求已验证 Sol 的 low/max、Terra 的 none/max 均返回 `response.completed`。目录成本为标准 API 估算，不代表 Flapcode 订阅收费。
 
 ## 构建
 

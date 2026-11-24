@@ -149,19 +149,37 @@ test("REGRESSION: an oversized ORDINARY implementation failure keeps continuity 
 	assert.doesNotMatch(report, /新的语义 agentId/);
 });
 
-test("REGRESSION: a writable episode's read-dominated mutation-free footprint supplies the recon evidence", () => {
-	assert.equal(extractReconFootprint(RECON_HISTORY).mutationCalls, 0);
-	const decision = classifyWorkerRecovery(
-		observe({
-			errorText: "fetch failed",
-			contextTokens: 150_000,
-			role: "general-purpose",
-			readOnly: false,
-			footprint: extractReconFootprint(RECON_HISTORY),
-		}),
-	);
-	assert.equal(decision.route, "checkpoint-fresh-episode");
-	assert.equal(decision.kind, "context-overflow");
+test("REGRESSION: read-heavy writable workers retain their conversation after provider/context failures", () => {
+	const footprint = extractReconFootprint(RECON_HISTORY);
+	assert.equal(footprint.mutationCalls, 0);
+	for (const worker of [
+		{ role: "general-purpose", readOnly: false },
+		{ role: "general-purpose" }, // Older observations may omit readOnly.
+		{ role: "custom-writer", readOnly: false },
+		{ role: "reviewer", readOnly: false }, // Runtime capabilities outrank the label.
+	]) {
+		for (const errorText of ["fetch failed", "provider_stall_timeout: no stream data"]) {
+			const decision = classifyWorkerRecovery(observe({
+				...worker, errorText, contextTokens: 150_000, sameModelResumeCount: 3, footprint,
+			}));
+			assert.equal(decision.route, "continue-slice", `${worker.role}: ${errorText}`);
+			assert.equal(decision.kind, errorText.startsWith("provider_stall") ? "provider-stall" : "context-overflow");
+			const report = formatRecoveryReport({ agentId: "research-then-build", decision });
+			assert.match(report, /resumeAgain=true/);
+			assert.match(report, /同一 agentId/);
+			assert.doesNotMatch(report, /新的语义 agentId|NEW semantic agentId/);
+		}
+	}
+});
+
+test("custom read-only recon still uses a checkpoint rather than pretending it has stored context", () => {
+	for (const role of ["custom-scout", "general-purpose"]) {
+		const decision = classifyWorkerRecovery(observe({
+			role, readOnly: true, // Explicit capability outranks even a familiar role name.
+			errorText: "provider_stall_timeout", footprint: extractReconFootprint(RECON_HISTORY),
+		}));
+		assert.equal(decision.route, "checkpoint-fresh-episode", role);
+	}
 });
 
 test("the context threshold is injectable and only gates recon-evidenced routing", () => {

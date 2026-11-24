@@ -12,6 +12,7 @@
  * and `refreshToken` is a pure network refresh whose result pi persists inside
  * its own `credentials.modify()` (which already holds the store lock).
  */
+import { loadGrokBuildCatalog } from "./catalog.js";
 import { resolveOAuthConfig } from "./oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
@@ -231,5 +232,9 @@ export function createGrokBuildProvider(options = {}) {
         },
     };
 }
-/** Generic host/loader export — same factory, no Grok-named import required. */
-export const createAuthProvider = createGrokBuildProvider;
+/** Generic host/session factory; await the official catalog before registering. */
+export async function createAuthProvider(options = {}) {
+    const provider = createGrokBuildProvider(options);
+    provider.models = await loadGrokBuildCatalog(options);
+    return provider;
+}

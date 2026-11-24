@@ -52,7 +52,9 @@ describe('base edition config', () => {
 
   it('keeps the embedded runtime and every other resource the full edition ships', () => {
     const config = baseEditionConfig(build)
-    expect(config.extraResources).toContainEqual(expect.objectContaining({ to: 'pipiui-embedded' }))
+    for (const platform of ['mac', 'win', 'linux']) {
+      expect(config[platform].extraResources).toEqual(build[platform].extraResources)
+    }
     expect(config.extraResources).toContainEqual(expect.objectContaining({ to: 'browser-ui' }))
     expect(config.extraResources).toContainEqual(expect.objectContaining({ to: 'cua-driver' }))
     expect(config.productName).toBe(build.productName)

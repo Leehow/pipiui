@@ -1032,9 +1032,10 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
             }
             return { content, details: { target: r.target || "both", images: r.images } };
           }
+          const { base64: _base64, ok: _ok, ...image } = r;
           return {
             content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png", ...(r.viewport ? { viewport: r.viewport } : {}) }],
-            details: r.viewport ? { viewport: r.viewport } : {},
+            details: { ...(r.viewport ? { viewport: r.viewport } : {}), image },
           };
         }
         case "back":

@@ -56,11 +56,6 @@ async function fixture(scope: "project" | "app" = "project", initialExecution?: 
   if (initialExecution !== undefined) await writeFile(join(agentDir, "pipiui-settings.json"), JSON.stringify({ computerUseEnabled: initialExecution }));
   const backend = createPiHostBackend({
     agentDir, vaultDir: agentDir, runtimeRoot, profileMode: "isolated", canonicalProjectPaths: async () => undefined,
-    // Test-only cipher; production uses Electron OS encryption, never a RAM success fallback.
-    extensionSecretCipher: {
-      encrypt: value => Buffer.from(value, 'utf8').map(byte => byte ^ 0x5a),
-      decrypt: bytes => Buffer.from(bytes.map(byte => byte ^ 0x5a)).toString('utf8'),
-    },
   });
   backends.push(backend);
   const probe = backend as unknown as Probe;

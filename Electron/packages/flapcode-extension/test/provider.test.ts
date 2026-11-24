@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import agent from "../agent/index.js";
@@ -59,6 +60,8 @@ describe("flapcode extension entry", () => {
     expect(registered.authHeader).toBe(true);
     expect(registered.models.map((model) => model.id)).toEqual([
       "gpt-5.6-sol",
+      "gpt-6.1-sol",
+      "gpt-6.1-terra",
       "gpt-5.6-luna",
       "gpt-5.6-terra",
       "gpt-6-astra",
@@ -141,10 +144,10 @@ describe("flapcode extension entry", () => {
         timeout: Type.Optional(Type.Number()),
       });
       let payload: { tools?: unknown[] } | undefined;
-      const response = streamSimple(model, {
+      const response = streamSimple(model, normalizeContext({
         messages: [{ role: "user", content: "Run pwd with bash.", timestamp: 0 }],
         tools: [{ name: "bash", description: "Run a shell command.", parameters }],
-      }, {
+      }), {
         apiKey: "sk-flapcode-test",
         fetch: async (_url, init) => {
           payload = JSON.parse(String(init?.body));

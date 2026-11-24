@@ -31,7 +31,7 @@ export function jevRuntimeStateFile(projectRoot: string): string {
 }
 
 /** Host authority only: the file contains neither a credential nor its fingerprint.
- *  `hasKey` is restored from the OS-encrypted `{projectAgentHome}/jev-optimizer/credential.enc`
+ *  `hasKey` is restored from the local `{projectAgentHome}/jev-optimizer/credential.json`
  *  via the in-memory extension vault cache — never from this JSON. */
 export class JevRuntimeStateStore {
   private readonly states = new Map<string, JevRuntimeState>();

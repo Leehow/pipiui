@@ -13,50 +13,7 @@
       "name": "Grok Build",
       "api": "openai-responses",
       "oauth": true,
-      "models": [
-        {
-          "id": "grok-4.6",
-          "name": "Grok 4.6",
-          "api": "openai-responses",
-          "input": ["text", "image"],
-          "reasoning": true,
-          "contextWindow": 500000,
-          "capabilities": {
-            "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
-            "structuredOutputs": true,
-            "inputFiles": true,
-            "nativeSearch": { "tools": ["web_search", "x_search"] }
-          }
-        },
-        {
-          "id": "grok-4-fast",
-          "name": "Grok 4 Fast",
-          "api": "openai-responses",
-          "input": ["text"],
-          "reasoning": false,
-          "contextWindow": 256000,
-          "capabilities": {
-            "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
-            "structuredOutputs": true,
-            "inputFiles": true,
-            "nativeSearch": { "tools": ["web_search", "x_search"] }
-          }
-        },
-        {
-          "id": "grok-code-fast-1",
-          "name": "Grok Code Fast",
-          "api": "openai-responses",
-          "input": ["text"],
-          "reasoning": false,
-          "contextWindow": 256000,
-          "capabilities": {
-            "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
-            "structuredOutputs": true,
-            "inputFiles": true,
-            "nativeSearch": { "tools": ["web_search", "x_search"] }
-          }
-        }
-      ]
+      "models": []
     }
   },
   "agent": {

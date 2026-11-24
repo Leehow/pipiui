@@ -6,6 +6,11 @@ import { SchemaSettingsForm } from './schema-settings-form'
 
 afterEach(cleanup)
 
+const jevKey = 'ext.jev-optimizer.apiKey'
+const jevSchema: ExtensionJsonSchema = {
+  type: 'object', properties: { [jevKey]: { type: 'string', format: 'secret', title: 'TypeSafe API Key' } },
+}
+
 const schema: ExtensionJsonSchema = {
   type: 'object',
   title: '用量监控',
@@ -20,6 +25,59 @@ const schema: ExtensionJsonSchema = {
 }
 
 describe('SchemaSettingsForm', () => {
+  it('only claims Jev persistence after an explicit save is acknowledged, and clears the input', async () => {
+    let complete!: (result: { ok: true; data: Record<string, unknown> }) => void
+    const update = vi.fn(() => new Promise<{ ok: true; data: Record<string, unknown> }>(resolve => { complete = resolve }))
+    const host = { getExtensionSettings: vi.fn(async () => ({})), updateExtensionSettings: update } as unknown as PipiHostAPI
+    render(<SchemaSettingsForm schema={jevSchema} host={host} extensionId="jev-optimizer" projectId="project-a" />)
+    const input = screen.getByLabelText('TypeSafe API Key') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'synthetic-test-key' } })
+    expect(update).not.toHaveBeenCalled()
+    expect(screen.getByRole('status').textContent).toContain('尚未保存')
+    fireEvent.click(screen.getByRole('button', { name: '保存密钥' }))
+    expect(update).toHaveBeenCalledWith('jev-optimizer', { [jevKey]: 'synthetic-test-key' }, 'project-a')
+    expect(screen.getByRole('status').textContent).toContain('保存中')
+    expect(screen.queryByText(/已保存/)).toBeNull()
+    expect(input.disabled).toBe(true)
+    complete({ ok: true, data: {} })
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('已保存，重启后自动恢复'))
+    expect(input.value).toBe('')
+    expect(screen.getByRole('button', { name: '清除' })).toBeTruthy()
+  })
+
+  it('keeps a denied Jev draft unsaved and allows retry without optimistic success', async () => {
+    const update = vi.fn().mockResolvedValueOnce({ ok: false, error: { message: '凭据文件无法写入' } })
+      .mockResolvedValueOnce({ ok: true, data: {} })
+    const host = { getExtensionSettings: vi.fn(async () => ({})), updateExtensionSettings: update } as unknown as PipiHostAPI
+    render(<SchemaSettingsForm schema={jevSchema} host={host} extensionId="jev-optimizer" />)
+    const input = screen.getByLabelText('TypeSafe API Key') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'synthetic-test-key' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存密钥' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('保存失败'))
+    expect(screen.getByRole('alert').textContent).toContain('凭据文件无法写入')
+    expect(input.value).toBe('synthetic-test-key')
+    expect(screen.queryByText(/已保存/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '关闭设置错误' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '保存密钥' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('已保存'))
+    expect(input.value).toBe('')
+  })
+
+  it('shows restored Jev presence outside the empty input, and keeps clear failures honest', async () => {
+    const update = vi.fn().mockRejectedValueOnce(new Error('写入失败')).mockResolvedValueOnce({ ok: true, data: {} })
+    const host = { getExtensionSettings: vi.fn(async () => ({ [jevKey]: true })), updateExtensionSettings: update } as unknown as PipiHostAPI
+    render(<SchemaSettingsForm schema={jevSchema} host={host} extensionId="jev-optimizer" />)
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('已保存'))
+    expect((screen.getByLabelText('TypeSafe API Key') as HTMLInputElement).value).toBe('')
+    fireEvent.click(screen.getByRole('button', { name: '清除' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('保存失败'))
+    expect(screen.getByRole('button', { name: '清除' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '清除' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('未配置密钥'))
+    expect(screen.queryByRole('button', { name: '清除' })).toBeNull()
+  })
+
   it('renders string, number, boolean, and enum from schema titles', () => {
     const onChange = vi.fn()
     render(

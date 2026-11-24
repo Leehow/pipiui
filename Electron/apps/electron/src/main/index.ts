@@ -1,8 +1,8 @@
-import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, powerMonitor, powerSaveBlocker, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
+import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, net, powerMonitor, powerSaveBlocker, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
+import { createOfficialUpdates, OFFICIAL_DOWNLOADS } from './official-updates.js'
 import { basename, join } from 'node:path'
-import { appendFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
 import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
-import { createElectronExtensionSecretCipher } from './extension-secret-cipher.js'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -301,6 +301,7 @@ if (app) {
     // from the built-in browser partitions; everything else keeps file defaults.
     const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData), readCursorAuth: readCursorAccessToken })
     const piBackend = createPiHostBackend({
+      appVersion: app.getVersion(),
       piCommand: assets.piCommand,
       env: piProcessEnv,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
@@ -314,7 +315,6 @@ if (app) {
       runtimeRoot,
       agentDir: piProfile.agentDir,
       vaultDir: piProfile.agentDir,
-      extensionSecretCipher: createElectronExtensionSecretCipher(),
       sessionsRoot: piProfile.sessionsRoot,
       canonicalModelsWrite: modelsWriteQueue,
       profileInitialization: profileInstall,
@@ -417,6 +417,54 @@ if (app) {
         return updateCatalog
       }
     }
+    const format = process.platform === 'darwin' ? 'zip' : process.platform === 'win32' ? 'exe' : process.env.APPIMAGE ? 'AppImage' : 'deb'
+    const edition = existsSync(join(process.resourcesPath, 'pipiui-runtime/extensions/office-extension/pipiui-extension.json')) ? 'coding' : 'base'
+    const official = createOfficialUpdates({
+      currentVersion: app.getVersion(),
+      fetch: (url, init) => net.fetch(url, { ...init, credentials: 'omit' }),
+      extensions: () => piBackend.listBundledUpdateExtensions(),
+      installExtension: (id, version) => piBackend.updateOfficialExtension(id, version,
+        (url, init) => net.fetch(url, { ...init, redirect: 'manual', credentials: 'omit' })),
+      desktop: app.isPackaged ? async () => {
+        const { MacUpdater, NsisUpdater, AppImageUpdater, DebUpdater } = await import('electron-updater')
+        const Updater = { zip: MacUpdater, exe: NsisUpdater, AppImage: AppImageUpdater, deb: DebUpdater }[format]
+        const feed = { provider: 'generic' as const, url: OFFICIAL_DOWNLOADS, channel: `pipiui-${edition}-${process.arch}-${format.toLowerCase()}` }
+        const updater = new Updater(feed)
+        // The --dir Mac distribution may omit builder's generated app-update.yml.
+        if (!existsSync(join(process.resourcesPath, 'app-update.yml'))) {
+          updater.updateConfigPath = join(process.resourcesPath, 'pipiui-updater.yml')
+          updater.setFeedURL(feed)
+        }
+        updater.autoDownload = false
+        updater.autoInstallOnAppQuit = false
+        updater.disableDifferentialDownload = true
+        updater.disableWebInstaller = true
+        return {
+          checkForUpdates: () => updater.checkForUpdates(),
+          downloadUpdate: () => updater.downloadUpdate(),
+          quitAndInstall: () => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+              clearTimeout(timer)
+              updater.off('error', failed)
+              app.off('will-quit', quitting)
+            }
+            const failed = (reason: Error) => { cleanup(); reject(reason) }
+            const quitting = () => { cleanup(); resolve() }
+            const timer = setTimeout(() => failed(new Error('重启安装未完成，请重试')), 180_000)
+            updater.once('error', failed)
+            app.once('will-quit', quitting)
+            try { updater.quitAndInstall(true, true) } catch (reason) {
+              failed(reason instanceof Error ? reason : new Error(String(reason)))
+            }
+          }),
+        }
+      } : undefined,
+    })
+    const checkComponents = createUpdateCenterService({ catalog: resolveUpdateCatalog })
+    const checkUpdates = async () => {
+      const [snapshot, officialItems] = await Promise.all([checkComponents(), official.check()])
+      return { ...snapshot, items: [...officialItems, ...snapshot.items] }
+    }
     const backend = withUpdateCenter(withComputerUsePermissions(withProductPackFileDialogs(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), { pickArchive: pickProductPackArchive, saveArchive: saveProductPackArchive }), createElectronComputerUsePermissionHost({
       getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),
       isTrustedAccessibilityClient: prompt => systemPreferences.isTrustedAccessibilityClient(prompt),
@@ -424,7 +472,7 @@ if (app) {
         await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
       },
       openURL: url => shell.openExternal(url),
-    })), createUpdateCenterService({ catalog: resolveUpdateCatalog }), (extensionId, componentId) => piBackend.updateExtensionComponent(extensionId, componentId))
+    })), checkUpdates, (extensionId, componentId) => piBackend.updateExtensionComponent(extensionId, componentId), official.apply)
     registerPipiHostIpc(ipcMain, backend)
     const remoteControl = createRemoteControlService({
       backend,

@@ -3,7 +3,10 @@
 .user-message-stack .user-bubble{max-width:100%}
 .user-message-collapse-toggle{display:block;margin:0 0 7px auto;padding:1px 4px;border-radius:5px;color:rgb(255 255 255 / 82%);font-size:11px;line-height:18px}
 .user-message-collapse-toggle:hover,.user-message-collapse-toggle:active{background:rgb(255 255 255 / 16%);color:#fff}
-.user-message-content{white-space:pre-wrap}
+/* A pasted secret or URL arrives as one unbreakable token; without a break
+   opportunity the text paints past the bubble and is clipped by the transcript
+   edge (mirrors the assistant side's overflow-wrap:anywhere). */
+.user-message-content{white-space:pre-wrap;overflow-wrap:anywhere}
 .user-bubble-images{display:flex;flex-direction:column;gap:6px;margin:0 0 8px}
 .user-bubble-images:last-child{margin-bottom:0}
 .user-bubble-image{max-width:100%;max-height:220px;border-radius:8px;object-fit:contain;display:block;background:rgb(0 0 0 / 18%)}

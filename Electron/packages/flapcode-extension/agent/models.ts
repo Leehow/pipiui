@@ -20,8 +20,10 @@
  * structured list `input` in the Responses payload — pi's openai-responses
  * streamer already satisfies the payload side; the header is added by
  * provider.ts. `/v1/models` is not served (404), so the catalog is maintained
- * explicitly. The original five models were relay-probed; GPT-6 Sol/Luna
- * metadata comes from OpenAI's model docs, not a relay availability probe.
+ * explicitly. Every listed model was relay-probed; GPT-6.1 Sol/Terra (2026-11-07)
+ * completed at low/max and none/max respectively. GPT-6 Sol/Luna (2026-09-23)
+ * answered at efforts none/xhigh/max, while their token/cost metadata comes
+ * from OpenAI's model docs.
  */
 
 export const FLAPCODE_PROVIDER_ID = "flapcode";
@@ -92,6 +94,33 @@ export const FLAPCODE_MODELS: readonly FlapcodeModel[] = [
     input: ["text", "image"],
     cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
     contextWindow: 1000000,
+    maxTokens: 128000,
+    thinkingLevelMap: { ...GPT_THINKING_MAP },
+    compat: { ...FLAPCODE_COMPAT },
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+  // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+  // Standard API list prices; Flapcode subscription billing is separate.
+  {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol (Flapcode)",
+    api: "openai-responses",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+    contextWindow: 1050000,
+    maxTokens: 128000,
+    thinkingLevelMap: { ...GPT_THINKING_MAP, off: null },
+    compat: { ...FLAPCODE_COMPAT },
+  },
+  {
+    id: "gpt-6.1-terra",
+    name: "GPT-6.1 Terra (Flapcode)",
+    api: "openai-responses",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
+    contextWindow: 1050000,
     maxTokens: 128000,
     thinkingLevelMap: { ...GPT_THINKING_MAP },
     compat: { ...FLAPCODE_COMPAT },

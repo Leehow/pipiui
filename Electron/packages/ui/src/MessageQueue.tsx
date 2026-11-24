@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import type { QueueFailureDetails } from '@pipi/host-api'
+import { QueueFailureDisclosure } from './QueueFailureDetails'
 import './message-queue.css'
 
 /** Lifecycle of one queued follow-up (mirrors Swift session message queue). */
@@ -20,6 +22,7 @@ export interface MessageQueueItem {
   status: MessageQueueItemStatus
   /** Shown under the row when status === 'failed'. */
   error?: string
+  failureDetails?: QueueFailureDetails
 }
 
 export interface MessageQueueProps {
@@ -219,9 +222,6 @@ export function MessageQueue({
                           <span className="message-queue__thumb-count" aria-label={`${imageCount} 张图片`}>{imageCount}</span>
                         </span>
                       )}
-                      {item.status === 'failed' && item.error && (
-                        <span className="message-queue__error" data-testid={`queue-error-${index}`} role="alert">{item.error}</span>
-                      )}
                     </>
                   )}
                 </span>
@@ -294,6 +294,9 @@ export function MessageQueue({
                       </button>
                     </span>
                   </>
+                )}
+                {!isEditing && item.status === 'failed' && (
+                  <QueueFailureDisclosure key={item.failureDetails?.occurredAt ?? item.error} index={index} error={item.error} details={item.failureDetails} />
                 )}
               </li>
             )

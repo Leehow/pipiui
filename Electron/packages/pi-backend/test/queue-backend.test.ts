@@ -77,6 +77,36 @@ async function fixture() {
 }
 
 describe("PiHostBackend message queue integration", () => {
+  it("completes handled RPC inputs without waiting for agent_settled", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => events.push(event));
+    try {
+      await backend.handle("sendPrompt", ["s1", "__handled__"]);
+      expect((backend as any).queue.isBusy("s1")).toBe(false);
+      expect((backend as any).live.get("s1").pendingDrainPrompt).toBeUndefined();
+      expect(events.some(event => event.channel === "stream" && event.event.status === "settled")).toBe(true);
+      expect(await backend.handle("sendPrompt", ["s1", "next ordinary prompt"])).toMatchObject({ outcome: "direct" });
+      expect(setup.commands.some(command => command.type === "prompt" && command.message === "next ordinary prompt")).toBe(true);
+    } finally { off(); await backend.close(); }
+  });
+
+  it("continues past handled commands already waiting in the FIFO", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    try {
+      await backend.handle("sendPrompt", ["s1", "__hold__"]);
+      await backend.handle("enqueueMessage", ["s1", "__handled__"]);
+      await backend.handle("enqueueMessage", ["s1", "__handled__"]);
+      await backend.handle("enqueueMessage", ["s1", "next ordinary prompt"]);
+      await (backend as any).command("s1", { type: "prompt", message: "__release_hold__" });
+      await eventually(() => setup.commands.some(command => command.type === "prompt" && command.message === "next ordinary prompt"));
+      await eventually(() => !(backend as any).queue.isBusy("s1"));
+      expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+    } finally { await backend.close(); }
+  });
+
   it("projects real spawn keys synchronously, isolates sessions, and cleans reclaim/close", async () => {
     const setup = await fixture();
     const backend = setup.create();
@@ -329,7 +359,7 @@ describe("PiHostBackend message queue integration", () => {
     await backend.close();
   });
 
-  it.each(["lost", "echo", "fail", "slow"])("stale idle uses steer with receipt/requeue protection: %s", async mode => {
+  it.each(["lost", "echo", "fail", "slow", "handled"])("stale idle uses steer with receipt/requeue protection: %s", async mode => {
     const setup = await fixture();
     const backend = setup.create();
     const text = `__race_steer_${mode}__`;
@@ -358,7 +388,7 @@ describe("PiHostBackend message queue integration", () => {
       }
       if (mode !== "slow") await backend.handle("stop", ["s1"]);
       await eventually(() => !(backend as any).queue.isBusy("s1"));
-      expect(await backend.handle("listQueue", ["s1"])).toEqual(mode === "echo" ? [] : [
+      expect(await backend.handle("listQueue", ["s1"])).toEqual(mode === "echo" || mode === "handled" ? [] : [
         expect.objectContaining({ text, state: mode === "fail" ? "failed" : "queued" }),
       ]);
       expect((backend as any).unconfirmedSteers.has("s1")).toBe(false);

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PROJECT_EXTENSION_ENABLED_FILE, readProjectExtensionEnabled } from "../src/extension-registry.js";
-import { readProjectProductActivation } from "../src/profile-store.js";
+import { readProjectProductActivation, writeProjectProductActivation } from "../src/profile-store.js";
 
 let root = "";
 afterEach(async () => {
@@ -32,13 +32,14 @@ describe("project Product Profile storage", () => {
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
   });
 
-  it("atomically migrates a schema 3 overlay that omits profile into the product default", async () => {
+  it("reads a schema 3 overlay that omits profile as the product default without rewriting Pipi Hydra's file", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-profile-store-v3-"));
     const path = join(root, PROJECT_EXTENSION_ENABLED_FILE);
-    await writeFile(path, JSON.stringify({
+    const original = JSON.stringify({
       schemaVersion: 3,
       overrides: { "hydra-workbench": "enabled" },
-    }), "utf8");
+    });
+    await writeFile(path, original, "utf8");
 
     const activation = await readProjectProductActivation(root, { defaultProfileId: "coding" });
 
@@ -47,18 +48,19 @@ describe("project Product Profile storage", () => {
       profile: "coding",
       overrides: { "hydra-workbench": "enabled" },
     });
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
+    expect(await readFile(path, "utf8")).toBe(original);
     expect(await readProjectExtensionEnabled(root)).toEqual({ "hydra-workbench": true });
   });
 
-  it("keeps an explicit schema 3 profile when migrating to v2", async () => {
+  it("keeps an explicit schema 3 profile when reading", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-profile-store-v3-profile-"));
     const path = join(root, PROJECT_EXTENSION_ENABLED_FILE);
-    await writeFile(path, JSON.stringify({
+    const original = JSON.stringify({
       schemaVersion: 3,
       profile: "base",
       overrides: { "skill-loader-extension": "disabled" },
-    }), "utf8");
+    });
+    await writeFile(path, original, "utf8");
 
     const activation = await readProjectProductActivation(root, { defaultProfileId: "coding" });
     expect(activation).toEqual({
@@ -66,7 +68,21 @@ describe("project Product Profile storage", () => {
       profile: "base",
       overrides: { "skill-loader-extension": "disabled" },
     });
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
+    expect(await readFile(path, "utf8")).toBe(original);
+  });
+
+  it("survives concurrent writes from one process", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-profile-store-concurrent-"));
+    const activations = Array.from({ length: 8 }, (_, i) => ({
+      schemaVersion: 2 as const,
+      profile: "coding",
+      overrides: { [`ext-${i}`]: "enabled" as const },
+    }));
+
+    await Promise.all(activations.map((activation) => writeProjectProductActivation(root, activation)));
+
+    expect(activations).toContainEqual(await readProjectProductActivation(root, { defaultProfileId: "coding" }));
+    expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
   it("atomically migrates a legacy extension overlay into the coding profile", async () => {

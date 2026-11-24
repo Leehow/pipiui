@@ -33,7 +33,7 @@ function renderWithAgents(view: JSX.Element, agents: AgentSummary[], sessionId =
 }
 
 describe('stream message reducer', () => {
-  it('preserves live thinking/tool chronology and exposes the current tool without disclosure semantics', () => {
+  it('preserves live chronology and exposes current bash with collapsed on-demand details', () => {
     let messages: ChatMessage[] = []
     messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, delta: 'inspect' })
     messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 1, toolCallId: 'read-1', name: 'read', delta: '{"path":"src/App.tsx"}' })
@@ -52,8 +52,8 @@ describe('stream message reducer', () => {
     const active = screen.getByTestId('active-tool')
     expect(active.querySelector('b')?.textContent).toBe('bash · npm test')
     expect(active.textContent).toContain('运行中')
-    expect(active.querySelector('[aria-expanded]')).toBeNull()
-    expect(active.querySelector('.activity-chevron')).toBeNull()
+    expect(active.querySelector('[aria-expanded]')?.getAttribute('aria-expanded')).toBe('false')
+    expect(active.querySelector('.activity-chevron')).toBeTruthy()
     expect(active.querySelector('.activity-details')).toBeNull()
     expect(active.querySelector('.tool-io')).toBeNull()
 
@@ -492,16 +492,15 @@ describe('session-scoped agent projection', () => {
 })
 
 describe('active tool-card semantics', () => {
-  it('shows an unfinished ordinary tool as a non-disclosure row, then folds it after completion', () => {
+  it('shows unfinished bash as a collapsed disclosure, then groups it after completion', () => {
     let messages: ChatMessage[] = []
     messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la"}' })
     const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
-    // A lone current tool has no completed-step group yet and must not pretend
-    // to be a disclosure: its real identity and running state stay visible.
+    // A lone running bash supports on-demand details without an outer step group.
     const active = screen.getByTestId('active-tool')
     expect(active.querySelector('b')?.textContent).toBe('bash · ls -la')
     expect(active.textContent).toContain('运行中')
-    expect(active.querySelector('[aria-expanded]')).toBeNull()
+    expect(active.querySelector('[aria-expanded]')?.getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByRole('button', { name: /1 个步骤/ })).toBeNull()
     // Once the tool finishes it joins the still-live completed-step group.
     messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-1', content: 'ok' })

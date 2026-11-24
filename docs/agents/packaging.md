@@ -83,3 +83,38 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
   build/PipiUI.app/Contents/MacOS/PipiUI \
   <changed-source-files>
 ```
+
+### Publishing in-app updates
+
+Use one persistent release directory containing the official payloads and indexes.
+Prepare a desktop channel from the final signed ZIP (macOS), NSIS executable
+(Windows), DEB or AppImage (Linux). Supply the version embedded in the artifact
+and the edition and architecture it was built for. For example:
+
+```sh
+node Electron/scripts/prepare-official-update.mjs desktop "$release_dir" "$windows_installer" "$app_version" coding x64
+node Electron/scripts/prepare-official-update.mjs extension "$release_dir" Electron/resources/runtime/extensions/flapcode
+```
+
+The normal website publisher can prepare and activate the update in one command:
+
+```sh
+.agents/skills/pipiui-upload/scripts/pipiui-upload --official-desktop "$windows_installer" "$app_version" coding x64
+.agents/skills/pipiui-upload/scripts/pipiui-upload --official-extension Electron/resources/runtime/extensions/flapcode
+```
+
+These modes verify the uploaded payload on the website host, merge the plugin
+entry under a lock and switch the appropriate channel atomically. When publishing
+manually, upload the printed files to the existing HTTPS
+`/downloads/` directory in order. Atomically replace the final channel file
+(`.yml` or `pipiui-extensions.json`) after verifying the immutable files.
+Keep the full extension release directory when preparing subsequent releases
+so its catalogue includes earlier plugins. Serialize publications to the same
+channel. Increase the embedded version before releasing changed contents.
+
+The plugin publisher uses the local Ed25519 private key at
+`~/.config/pipiui-release/extension-ed25519.pem` (override with
+`PIPIUI_EXTENSION_SIGNING_KEY_FILE`). Its public half is pinned in
+`official-extension-key.ts`. Protect and back up the private key separately.
+Existing customers install the first update-enabled desktop release through
+the website. Subsequent updates appear in 设置 → 更新中心.

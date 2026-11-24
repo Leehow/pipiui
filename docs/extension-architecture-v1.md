@@ -350,3 +350,12 @@ fast-app / Canonical App 的打包面也不在本合约内：扩展装在运行�
 - `.pi/findings/agent-c94dc0d28c8a8bfc.md` — deepseek-harness 对照
 
 关键存量机制（只点名、不引代码）：HostBridge 动作表、`pipi-host:v1` protocol v2、`-e` spawn-mount 通道、`extension_ui_*`（已定义、未接线）、Bundled runtime、Canonical App / fast-app 发布面、App profile `pi-agent` 与项目 `.pi/agent` 两套家。
+
+
+## Opt-in Composer actions and OpenAI Fast
+
+`app.ui.composerActions` declares `{id, entry, order?}` contributions. The controlled module exports `createComposerAction(React)` and receives only the capability-restricted extension API, `sessionId`, the selected `{provider,id,api?}` model and a `disabled` flag (streaming/compacting/read-only). The slot is directly after the thinking selector, ordered by contribution order and semantic ID. Activation follows the existing product extension projection. No full host object or new agent invocation channel is exposed.
+
+The existing data API accepts `read(path,{allowMissing:true})`: a missing declared path reads empty without creating directories. Writes may initialize missing ancestors only beneath declared write roots, with symlink confinement preserved. This lets an opt-in session/model preference be saved without waking the agent; malformed paths and undeclared roots still fail.
+
+The `openai-fast` extension requests priority for Codex and explicit Flapcode OpenAI identities; it defaults off, persists by project/session/provider/model, and separates requested and terminal effective tier. New session/fork IDs start off. Each request snapshots its choice at the provider hook; running requests do not change. The extension's README specifies response/cost and reconnection semantics. This host UI contract does not alter kernel RPC or independent lanes.

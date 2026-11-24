@@ -24,6 +24,7 @@
   "dependencies": {
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
+    "electron-updater": "6.8.9",
     "node-pty": "^1.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -49,6 +50,8 @@
     "appId": "com.leehow.pipiui-electron",
     "productName": "PipiUI",
     "forceCodeSigning": true,
+    "publish": { "provider": "generic", "url": "https://pipi.aichattrpg.com/downloads/" },
+    "beforePack": "./jev-before-pack.cjs",
     "files": [
       "out/**/*",
       "package.json",
@@ -58,6 +61,11 @@
       "node_modules/@xterm/addon-serialize/**/*"
     ],
     "extraResources": [
+      { "from": "pipiui-updater.yml", "to": "pipiui-updater.yml" },
+      {
+        "from": "../../.jev-python/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}/python",
+        "to": "pipiui-runtime/extensions/webview-browser-extension/runtime/python"
+      },
       {
         "from": "../../.cua-driver/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
         "to": "cua-driver"
@@ -70,6 +78,7 @@
           "!**/node_modules/**",
           "!**/.git/**",
           "!**/*.tsbuildinfo",
+          "!**/.jev-update-*/**",
           "!**/out/**",
           "!**/dist/**",
           "!**/release/**",
@@ -266,10 +275,6 @@
         ]
       },
       {
-        "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
-        "to": "pipiui-embedded"
-      },
-      {
         "from": "../../packages/ui/dist/browser",
         "to": "browser-ui"
       }
@@ -278,8 +283,17 @@
       "output": "../../../build"
     },
     "mac": {
+      "extraResources": [
+        {
+          "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
+          "to": "pipiui-embedded"
+        }
+      ],
       "icon": "build/icon.icns",
       "timestamp": "none",
+      "signIgnore": [
+        "pipiui-runtime/extensions/office-extension/bin/[^/]+/officecli$"
+      ],
       "extendInfo": {
         "CFBundleDisplayName": "PipiUI",
         "CFBundleName": "PipiUI"
@@ -290,6 +304,12 @@
       ]
     },
     "win": {
+      "extraResources": [
+        {
+          "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
+          "to": "pi"
+        }
+      ],
       "icon": "assets/icons/512x512.png",
       "target": [
         {
@@ -300,7 +320,16 @@
         }
       ]
     },
+    "nsis": {
+      "include": "runtime-migration.nsh"
+    },
     "linux": {
+      "extraResources": [
+        {
+          "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
+          "to": "pipiui-embedded"
+        }
+      ],
       "icon": "assets/icons",
       "category": "Development",
       "maintainer": "PipiUI <pipiui@leehow.com>",

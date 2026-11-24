@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "extensionId": "deepseek",
+  "manifestVersion": "0.1.0",
+  "hostEntry": "agent/dist/host.js",
+  "sha256": "29992ad52b5feca184c29c5195c8988d3f16df38aabfbd389b94d5cd196672f4",
+  "bytes": 499,
+  "contentHash": "bb1012c4efd8f4342a7b7f7d4534942a62b4f0c4ef52bb62c077dbadb3f9eca5",
+  "generatedAt": "2026-10-02T15:34:44.597Z"
+}

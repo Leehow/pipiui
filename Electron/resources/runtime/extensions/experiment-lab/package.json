@@ -5,6 +5,7 @@
   "type": "module",
   "engines": { "node": ">=22.19.0" },
   "description": "按需冻结实验基线、验证候选方案并保留可追溯证据",
+  "files": ["pipiui-extension.json", "agent/dist", "app/dist", "contracts.d.ts", "skills", "vendor/sandbox-runtime", "scripts/prepare-sandbox.mjs"],
   "scripts": {
     "build": "node scripts/prepare-sandbox.mjs && tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
     "postbuild": "node ../../scripts/sync-bundled-extension.mjs experiment-lab-extension",

@@ -1,0 +1,14 @@
+{
+  "id": "openai-fast",
+  "name": "OpenAI Fast",
+  "version": "0.1.0",
+  "category": "integration",
+  "description": "Session/model Fast request control for OpenAI Codex and explicit Flapcode OpenAI models. Off by default; actual server tier shown separately.",
+  "defaultEnabled": true,
+  "capabilities": ["data.read", "data.write"],
+  "agent": {"extension": "agent/index.js"},
+  "app": {
+    "data": {"read": [".pi/agent/openai-fast"], "write": [".pi/agent/openai-fast"]},
+    "ui": {"composerActions": [{"id": "openai-fast.toggle", "entry": "app/control.js", "order": 10}]}
+  }
+}

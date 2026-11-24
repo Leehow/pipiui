@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from 'react-dom'
 import { Diff, Hunk, parseDiff } from 'react-diff-view'
 import { ActivityCard } from './ActivityCard'
+import { BashDetailsProvider } from './BashToolDetails'
 import { cacheHitRate, formatCompactTokens } from './session-stats-format'
 import { toolActivitySummary, toolArgsSummary } from './tool-summary'
 import { fileChangeTokenStats, liveTokenLabel } from './file-change-tokens'
@@ -615,7 +616,7 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
     } else if (log.itemType === 'tool') {
       const result = takeResult(log, index)
       const laterTool = agent.logs.slice(index + 1).some(candidate => candidate.itemType === 'tool')
-      const tool: TranscriptTool = { id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) || laterTool }
+      const tool: TranscriptTool = { id: log.name === 'bash' && log.toolCallId ? log.toolCallId : `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) || laterTool }
       const contentIndex = activityIndex(log)
       tools.push(tool)
       activities.push({ type: 'tool', contentIndex, tool })
@@ -819,7 +820,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, on
   }, [hasRunning])
 
   useEffect(() => {
-    if (!selected) return
+    if (!selected || !paneVisible) return
     const identity = episodeIdentity(selected)
     // No exact episode identity → no subscription. A blank-keyed subscription
     // would receive every run of the slug and paint them under this row.
@@ -854,10 +855,12 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, on
     }, logSessionId, logRunId)
     return () => {
       off()
-      // Keep an already queued batch alive across a same-agent run switch. The
-      // exact-identity check in flush rejects stale old-run frames.
+      if (timer !== undefined) { window.clearTimeout(timer); logRenderTimers.current.delete(timer) }
+      // Preserve the already received exact-run batch before releasing demand;
+      // never leave a timer refreshing a hidden or newly selected pane.
+      flush()
     }
-  }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
+  }, [host, selected?.agentId, selected?.sessionId, selected?.runId, paneVisible])
 
   // Backfill the selected row's transcript from the host's log cache. The live
   // subscription only delivers events from subscribe-time on, so a row selected
@@ -871,7 +874,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, on
     const identity = selected ? episodeIdentity(selected) : undefined
     // Only an exact-episode row fetches its cached transcript: a blank-keyed
     // read would return some other run's logs under this row's header.
-    if (!identity || !host.getAgentLogs) return
+    if (!paneVisible || !identity || !host.getAgentLogs) return
     let cancelled = false
     void host.getAgentLogs(identity.agentId, identity.sessionId, identity.runId).then(entries => {
       if (cancelled || !entries.length) return
@@ -882,7 +885,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, on
       }))
     })
     return () => { cancelled = true }
-  }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
+  }, [host, selected?.agentId, selected?.sessionId, selected?.runId, paneVisible])
 
   // Explicit agent-history view (scope: 'agent' concatenates every run of this
   // agentId). Distinct from the default current-run transcript and clearly
@@ -1145,7 +1148,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, on
               )}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(agentRowKey(selected)))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />
+			<AgentDetail host={host} detailsVisible={paneVisible} agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(agentRowKey(selected)))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />
           </div>}
   </section>
 }
@@ -1533,7 +1536,9 @@ function AgentRow({ agent, testId, childCount, activeChildCount, selected, abort
   </article>
 }
 
-function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, terminalAvailable, onCheck, onWorktree, onOpenWorktreeTerminal, onAbort, historyLogs, historyError, canShowHistory, onShowHistory, onHideHistory }: {
+function AgentDetail({ host, detailsVisible, agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, terminalAvailable, onCheck, onWorktree, onOpenWorktreeTerminal, onAbort, historyLogs, historyError, canShowHistory, onShowHistory, onHideHistory }: {
+  host: PipiHostAPI
+  detailsVisible: boolean
   agent?: Agent
 	activeChildCount: number
 	aborting: boolean
@@ -1656,7 +1661,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
               ? <SecretaryCloseoutResult parsed={closeout} />
               : finalResultNeedsPlainText && message.content === output
                 ? <pre className="agent-final-result" data-testid="subagent-final-result-plain">{message.content}</pre>
-                : <AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} />}
+                : <BashDetailsProvider host={host} sessionId={identity?.sessionId ?? ''} agentId={agent.agentId} runId={identity?.runId} enabled={detailsVisible && Boolean(identity) && !historyLogs}><AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></BashDetailsProvider>}
           </article>
         })}
       </div>

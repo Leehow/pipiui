@@ -219,11 +219,11 @@ it.each([
   expect(f.invoke).not.toHaveBeenCalled();
 });
 
-it.each(["pi", "browser"] as const)("%s卡片只说明后续适配，不能显示命令运行入口", async (kind) => {
+it.each(["pi", "browser"] as const)("%s卡片引导主聊天，不能显示命令运行入口", async (kind) => {
   const f = fixture({ ...record, kind });
   render(<Panel api={f.api} />);
   const card = await screen.findByRole("article", { name: record.question });
-  expect(within(card).getByText(/适配将在后续阶段提供；当前未执行此类实验。/)).toBeTruthy();
+  expect(within(card).getByText(/请从主聊天发起；已有 Pi 批次可在上方只读查看。此卡片本身不执行实验。/)).toBeTruthy();
   expect(within(card).queryByRole("region", { name: "单次受限运行" })).toBeNull();
   expect(within(card).queryByRole("button", { name: "单次运行" })).toBeNull();
   expect(within(card).queryByRole("combobox", { name: "测例" })).toBeNull();

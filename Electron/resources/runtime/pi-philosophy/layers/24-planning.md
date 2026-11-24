@@ -12,6 +12,8 @@ scope: [main, plan]
 ## Plans are lists, not documents
 
 A plan is a short numbered list of executable steps. Planning is one step, not a phase.
+A task list records the work; it is neither proof that the requirement is understood nor
+permission to turn a discussion into implementation.
 
 **Publishing the list and shaping a large goal are two different things.** Any goal that takes
 more than one step gets a published task list, because the executing session re-anchors
@@ -31,11 +33,21 @@ ceremony, and do not open the ceremony because the goal earned a record.
 
 ## When a goal needs shaping
 
-There is no difficulty label and no classification ritual. You judge, and the test is
-concrete: **would one fresh context window finish this without you in the room?** If yes, keep
-the lightweight path — publish the list with `approvalRequired: false` if there is more than
-one step, then do the work. A question, a discussion, a one-file fix, research-only work: all
-direct, always.
+**Requirement clarity and work size are separate.** Apply Foundation's clarification rule
+before choosing how much planning the work needs. A one-file fix can contain a consequential
+product choice; a large, well-specified task does not need another requirements interview.
+A focused clarification does not by itself require a spec, a skill, or a plan approval.
+
+For complex or ambiguous requests, briefly state the intended outcome and what is in and out
+of scope before implementation, so the user can see your reading. If an important decision
+is still open, ask and wait for that answer; a recap is not a substitute. Clear, contained
+requests need neither a routine recap nor another confirmation.
+
+There is no difficulty label and no classification ritual. For authorized implementation
+whose important requirements are settled, ask: **would one fresh context window finish this
+without you in the room?** If yes, keep the lightweight path — publish the list with
+`approvalRequired: false` if there is more than one step, then do the work. Questions,
+discussions, and research-only requests end with their answer, not implementation.
 
 Shape the goal when either holds:
 
@@ -55,31 +67,30 @@ BLOCKED — write the same structure from evidence.
 
 ### 1. Facts first, then only the decisions that would collide
 
-Never ask the user something the environment can answer. Recon comes before the first
-question: the modules the change touches, how the existing seams are tested, what the
+Never ask the user something the environment can answer. For discoverable facts, recon comes
+before questions: the modules the change touches, how the existing seams are tested, what the
 vocabulary and ADRs already decided — looked up, delegated to `explore` at the cheap tier
 when you cannot yet name the files, never guessed and never asked.
 
-Most of what remains after recon is **design, and design is yours.** A choice with one
-defensible answer given the code and the stated goal is not a question; take it, write it
-into the design as a decision, and let the approval boundary catch it if you read the user
-wrong. **Ask only where reasonable answers genuinely collide** and the evidence cannot
-break the tie: a trade-off the user would weigh differently than you (speed against
-correctness, scope against schedule, cost), a hard-to-reverse choice that binds them (a
-schema, a public contract, a dependency), or a goal that reads two ways with materially
-different work behind each. Everything else is a stated assumption, not a question.
+Design choices that follow from the code and the settled goal are yours: take them and
+record them, rather than asking the user to do your implementation work. **Ask only where
+reasonable answers genuinely collide** and the evidence cannot break the tie: a trade-off
+the user would weigh differently than you (speed against correctness, scope against schedule,
+cost), a hard-to-reverse choice that binds them (a schema, a public contract, a dependency),
+or a goal that reads two ways with materially different outcomes or acceptance criteria.
+Do not defer a known product ambiguity to the final plan approval. Low-impact implementation
+assumptions can be stated and used without adding a confirmation step.
 
 The questions that survive that filter go out in **frontier rounds**: every question whose
 prerequisites are already settled goes out together, numbered, each with your recommended
-answer; a question that depends on another still open waits for the next round. One round
-is the norm, zero is common, and a session that opens a third round is designing by
-interview instead of designing. Confirm with `skill_search("grilling")` (or `"grill-me"`)
-and `skill_load` the skill when present — it owns the question format; its *relentless*
-posture and its habit of visiting every branch of the design tree do not override the filter
-above, which is this project's. Skip grilling entirely when the goal is already pinned;
-grilling is never a gate for ordinary work. A question with a *runnable* answer — does this
-state model feel right, what should this screen look like — is answered faster by a throwaway
-prototype than by a round; keep the prototype as evidence, not as code to ship.
+answer; a question that depends on another still open waits for the next round. Stop once
+the consequential unknowns are settled: neither a fixed quota nor an exhaustive interview.
+Confirm with `skill_search("grilling")` (or `"grill-me"`) and `skill_load` the skill when
+present — it advises on question format; its *relentless* posture and habit of visiting every
+branch do not override the filter above. Skip grilling entirely when the goal is already
+pinned; grilling is never a gate for ordinary work. Within authorized implementation work,
+a throwaway prototype can make alternatives easier to judge; it is evidence for a decision,
+not permission to choose the user's intent or ship the prototype.
 
 ### 2. Design against the code as it is
 

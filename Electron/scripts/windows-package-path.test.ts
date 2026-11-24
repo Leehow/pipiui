@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, win32 } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
@@ -21,6 +21,23 @@ import {
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
   const packager = readFileSync(resolve(import.meta.dirname, './package-electron-target.mjs'), 'utf8')
+
+  it('fits the customer SDK paths under both default install and uninstaller staging prefixes', () => {
+    const embedded = packageJSON.build.win.extraResources.find(entry => entry.from.includes('.embedded-runtimes/'))!
+    expect(embedded.to).toBe('pi')
+    expect(packageJSON.build.extraResources.some(entry => entry.from.includes('.embedded-runtimes/'))).toBe(false)
+    const installed = String.raw`C:\Users\13352\AppData\Local\Programs\@pipiuielectron\resources`
+    const uninstall = String.raw`C:\Users\13352\AppData\Local\Temp\nsu1234.tmp\old-install\resources`
+    const openai = 'pi/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/openai/resources/admin/organization/projects/service-accounts/service-accounts.mjs'
+    const smithy = 'pi/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@smithy/core/dist-es/submodules/config/config-resolver/endpointsConfig/NodeUseDualstackEndpointConfigOptions.js'
+    expect(win32.join(installed, 'pipiui-embedded', openai).length).toBeGreaterThanOrEqual(260)
+    expect(win32.join(uninstall, 'pipiui-embedded', smithy).length).toBeGreaterThanOrEqual(260)
+    for (const prefix of [installed, uninstall]) {
+      for (const sdkFile of [openai, smithy]) {
+        expect(win32.join(prefix, embedded.to, sdkFile).length).toBeLessThan(260)
+      }
+    }
+  })
 
   it('prepares and checks a win32-x64 embedded runtime before package:win', () => {
     expect(workspacePackage.scripts['runtime:prepare:win']).toBe('node scripts/fetch-pi-runtime.mjs --platform win32 --arch x64')

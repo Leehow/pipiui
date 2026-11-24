@@ -7,6 +7,12 @@ import type { BrowserConsoleEntry } from '@pipi/host-api/browser'
 import type { BrowserTab, BrowserTabsSnapshot, BrowserViewBounds } from '@pipi/host-api'
 
 export interface BrowserWebContentsLike {
+  debugger?: {
+    isAttached(): boolean
+    attach(version?: string): void
+    detach(): void
+    sendCommand(method: string, params?: Record<string, unknown>): Promise<unknown>
+  }
   loadURL(url: string): Promise<unknown> | unknown
   reload(): void
   stop?(): void

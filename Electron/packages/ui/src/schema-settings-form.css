@@ -14,3 +14,7 @@
 .ext-schema-secret-row .ext-schema-control{flex:1;min-width:0}
 .ext-schema-secret-clear{border:1px solid var(--border-strong);background:transparent;color:var(--muted);border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer}
 .ext-schema-secret-clear:hover{color:var(--danger);border-color:var(--danger)}
+.ext-schema-secret-save{border:1px solid var(--accent);background:var(--accent);color:var(--on-accent,#fff);border-radius:5px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.ext-schema-secret-save:disabled,.ext-schema-secret-clear:disabled{opacity:.5;cursor:default}
+.ext-schema-secret-status{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;border-radius:5px;background:color-mix(in srgb,var(--text) 5%,transparent);color:var(--text);font-size:12px;line-height:1.5}
+.ext-schema-secret-status.is-saved{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--text-strong);font-weight:600}

@@ -31,6 +31,21 @@ function UpdatesHarness({ host, onRequestUpdate = () => undefined, show = true }
 }
 
 describe('UpdateCenter', () => {
+  it('shows upstream Git revisions and sends an evaluation intent carrying the exact source', async () => {
+    const gitSource = { owner: 'browser-use', repo: 'jev-ultrafast', ref: 'main' }
+    const currentVersion = 'a'.repeat(40), latestVersion = 'b'.repeat(40)
+    const checkForUpdates = vi.fn().mockResolvedValue({ checkedAt: 1, items: [{ id: 'webview-browser-extension:browser-use-jev', name: 'Browser Use Jev', category: 'extension',
+      gitSource, currentVersion, latestVersion, status: 'updateAvailable', upstreamUrl: 'https://github.com/browser-use/jev-ultrafast',
+      compareUrl: `https://github.com/browser-use/jev-ultrafast/compare/${currentVersion}...${latestVersion}` }] })
+    const onRequestUpdate = vi.fn()
+    render(<UpdatesHarness host={{ checkForUpdates } as unknown as PipiHostAPI} onRequestUpdate={onRequestUpdate} />)
+    expect(await screen.findByText('Browser Use Jev')).toBeTruthy()
+    expect(screen.getByText('aaaaaaaaaaaa')).toBeTruthy()
+    expect(screen.getByRole('link', { name: '查看变更' }).getAttribute('href')).toContain(`${currentVersion}...${latestVersion}`)
+    expect(screen.queryByRole('button', { name: '一键更新' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '评估更新' }))
+    expect(JSON.parse(onRequestUpdate.mock.calls[0][0].slice(PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX.length))).toMatchObject({ gitSource, currentVersion, latestVersion })
+  })
   it('shows loading, update/current/error states and emits one evaluation prompt', async () => {
     let resolve!: (value: UpdateCenterSnapshot) => void
     const checkForUpdates = vi.fn(() => new Promise<UpdateCenterSnapshot>(done => { resolve = done }))
@@ -122,4 +137,25 @@ describe('UpdateCenter', () => {
     fireEvent.click(screen.getByRole('button', { name: '⟳ 刷新' }))
     await waitFor(() => expect(checkForUpdates).toHaveBeenCalledTimes(2))
   })
+})
+
+it('downloads official software, then offers restart, and installs the plugin independently', async () => {
+  let ready = false
+  let installed = false
+  const applyOfficialUpdate = vi.fn(async (action: string) => {
+    if (action === 'download') ready = true
+    if (action === 'extension') installed = true
+  })
+  const checkForUpdates = async () => ({ checkedAt: Date.now(), items: [
+    { id: 'pipiui', name: 'PipiUI', officialUpdate: 'desktop', status: 'updateAvailable', currentVersion: '1.0.0', latestVersion: '1.1.0', downloaded: ready },
+    { id: 'official:flapcode', name: 'Flapcode', officialUpdate: 'extension', ownerExtensionId: 'flapcode', status: installed ? 'upToDate' : 'updateAvailable', currentVersion: installed ? '0.1.1' : '0.1.0', latestVersion: '0.1.1' },
+  ] })
+  render(<UpdatesHarness host={{ checkForUpdates, applyOfficialUpdate } as unknown as PipiHostAPI} onRequestUpdate={vi.fn()} />)
+  fireEvent.click(await screen.findByRole('button', { name: '更新插件' }))
+  await screen.findByText('已是最新')
+  fireEvent.click(screen.getByRole('button', { name: '下载软件更新' }))
+  fireEvent.click(await screen.findByRole('button', { name: '重启并安装' }))
+  expect(applyOfficialUpdate.mock.calls).toEqual([
+    ['extension', 'flapcode', '0.1.1'], ['download', 'pipiui', '1.1.0'], ['restart', 'pipiui', '1.1.0'],
+  ])
 })

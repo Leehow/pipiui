@@ -87,8 +87,11 @@ export function streamQoder(model, context, options) {
             modelConfig.key = qoderModel;
             const isReasoning = !!modelConfig.is_reasoning;
             const maxOutputTokens = modelConfig.max_output_tokens || 32768;
-            const normalizedMessages = transformMessagesForQoder(context.messages);
-            const systemText = context.systemPrompt || "";
+            // Pi 0.86+ carries prompt/tool updates in transcript system messages.
+            // Qoder needs their replayed state in a single leading system message.
+            const transcript = PiAi.collapseSystemMessages(context);
+            const normalizedMessages = transformMessagesForQoder(transcript.messages);
+            const systemText = PiAi.getCurrentSystemPrompt(transcript.messages);
             let lastUserText = "";
             for (let i = normalizedMessages.length - 1; i >= 0; i--) {
                 if (normalizedMessages[i].role === "user") {
@@ -116,7 +119,8 @@ export function streamQoder(model, context, options) {
             if (options?.maxTokens && options.maxTokens < maxTokens) {
                 maxTokens = options.maxTokens;
             }
-            const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
+            const tools = PiAi.getCurrentTools(transcript.messages);
+            const toolsRaw = tools.length > 0 ? transformTools(tools) : undefined;
             const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
             const reqBody = {
                 request_id: crypto.randomUUID(),

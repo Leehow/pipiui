@@ -3,6 +3,7 @@ import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import { getToolRenderer, isLiveProjectedTool, registerToolRenderer, useToolRenderers } from './ui-registries'
 import { toToolRenderPayload } from './piui-envelope'
 import { ActivityCard } from './ActivityCard'
+import { BashToolDetails } from './BashToolDetails'
 import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
 import { fileChangeTokenStats, finishedFileChangeDeltaLabel, liveTokenLabel } from './file-change-tokens'
@@ -70,15 +71,18 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool }: { tool: Tr
   const meta: ReactNode = deltaNode
     ? <span>{deltaNode} · {baseMeta}</span>
     : live ? `${baseMeta} · ${live}` : baseMeta
-  return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={false}>
+  return <ActivityCard kind="tool" summary={summary} meta={meta} running={tool.name === 'bash' && !tool.finished} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={false}>
+    {tool.name === 'bash' ? <BashToolDetails toolCallId={tool.id} fallbackInput={tool.input} fallbackOutput={tool.result} /> : <>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
     {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result"><TruncatedText text={tool.result} /></div></div>}
+    </>}
   </ActivityCard>
 })
 
 const ActiveToolCard = memo(function ActiveToolCard({ tool }: { tool: TranscriptTool }) {
   const live = liveTokenLabel(fileChangeTokenStats(tool.name, tool.input ?? '')?.payloadChars ?? 0)
+  if (tool.name === 'bash') return <div data-testid="active-tool"><TranscriptToolCard tool={tool} /></div>
   return <section className="activity-card activity-card-tool activity-card-active-tool" data-activity-card="tool" data-testid="active-tool"><div className="activity-summary"><span className="activity-status" aria-hidden="true">◌</span><b>{toolDisplaySummary(tool.name, tool.input)}</b><small className="activity-meta">运行中 · {elapsed(tool.startedAt)}{live ? ` · ${live}` : ''}</small></div></section>
 })
 

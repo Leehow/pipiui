@@ -185,12 +185,12 @@ function makeScriptedHost(): ScriptedHost {
           ok: true,
           target: "both",
           images: [
-            { viewport: "desktop", base64: "ZGVza3RvcA==", mimeType: "image/png", width: 1280, height: 800 },
-            { viewport: "mobile", base64: "bW9iaWxl", mimeType: "image/png", width: 390, height: 844 },
+            { viewport: "desktop", url: "https://desktop.example/", tabId: "tab-1", base64: "ZGVza3RvcA==", mimeType: "image/png", width: 1280, height: 800 },
+            { viewport: "mobile", url: "https://mobile.example/", tabId: "tab-1", base64: "bW9iaWxl", mimeType: "image/png", width: 390, height: 844 },
           ],
         };
       }
-      return { ok: true, base64: "c2hvdA==", mimeType: "image/png", viewport: "desktop" };
+      return { ok: true, base64: "c2hvdA==", mimeType: "image/png", viewport: "desktop", url: "https://actual.example/", tabId: "tab-1", width: 1280, height: 800 };
     }
     return { ok: false, error: `unknown host action ${event.action}`, code: "unknown_action" };
   };
@@ -383,9 +383,9 @@ const INTENT_HELP = [
   '                        intent for ordinary paging. target=both stays local. Known locators',
   '                        and saved flows need no extra observation or scoring step.',
 ].join('\n');
-const GOAL_DESCRIPTION = "goal runs a bounded Jev Choice action loop using the extension's saved key; standalone only, single viewport. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. ";
+const GOAL_DESCRIPTION = "goal runs the Browser Use jev-ultrafast controller using the saved Jev key; standalone only, single viewport. When the task names a website, pass url to open it before control begins. TYPE_TEXT reuses the current model. DONE requires independent outcome verification. ";
 const GOAL_HELP = [
-  'goal {goal, max_steps?, timeoutSecs?, target?}',
+  'goal {goal, url?, max_steps?, timeoutSecs?, target?}',
   '                        Standalone bounded Jev Choice control loop (not actions[]). Requires the',
   '                        enabled Jev extension, its saved key and browser-cloud permission.',
   '                        Jev chooses operation + observed target in one request; TYPE_TEXT uses',
@@ -576,6 +576,18 @@ describe("behavioral equivalence through both transports", () => {
     expect(extension.content.filter((part) => part.type === "image")).toHaveLength(2);
     expect(resultText(extension)).toContain("desktop");
     expect(resultText(extension)).toContain("mobile");
+    expect(extension.details).toMatchObject({ images: [
+      { viewport: "desktop", url: "https://desktop.example/", tabId: "tab-1" },
+      { viewport: "mobile", url: "https://mobile.example/", tabId: "tab-1" },
+    ] });
+  });
+
+  it("single screenshot preserves host provenance without duplicating image bytes", async () => {
+    const { extension } = await runBoth({ action: "screenshot", url: "https://not-the-source.example/" });
+    expect(extension.details).toEqual({ viewport: "desktop", image: {
+      viewport: "desktop", url: "https://actual.example/", tabId: "tab-1", width: 1280, height: 800, mimeType: "image/png",
+    } });
+    expect(extension.content.filter(part => part.type === "image")).toHaveLength(1);
   });
 
   const batchCases: Array<{ name: string; params: Record<string, unknown> }> = [

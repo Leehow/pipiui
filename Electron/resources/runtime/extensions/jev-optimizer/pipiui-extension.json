@@ -25,7 +25,7 @@
             "type": "boolean",
             "default": false,
             "title": "允许 Jev 浏览器云端决策（Choice / Score）",
-            "description": "允许将任务目标和脱敏控件/选项描述发送给 TypeSafe，用于选择浏览器动作或候选评分，可能收费；不发送截图或整个页面。描述仍可能含业务数据。Choice 仅在显式调用 browser goal 时执行，不改变普通 observe。关闭后撤销浏览器决策，不影响代码检索；未挂载扩展或更换 key 需开启新会话。"
+            "description": "允许将任务目标、脱敏的可见页面文字、控件当前值与选项状态发送给 TypeSafe，用于选择浏览器动作或候选评分，可能收费；不发送截图或整页 HTML。描述仍可能含业务数据。Choice 仅在显式调用 browser goal 时执行，不改变普通 observe。关闭后撤销浏览器决策，不影响代码检索；未挂载扩展或更换 key 需开启新会话。"
           },
           "ext.jev-optimizer.computerEnabled": {
             "type": "boolean",
@@ -37,7 +37,7 @@
             "type": "string",
             "format": "secret",
             "title": "TypeSafe API Key",
-            "description": "本项目所有 Jev 功能共用此 key，包括会话上下文选择、代码检索评分、浏览器 Choice / Score 与桌面 Choice。凭据加密持久保存，重启后恢复；不需要在通用密钥库另填一份。检索启用后会发送查询及受限源码片段，浏览器、桌面和上下文外发由各自独立开关控制。更换 key 后需开启新会话。"
+            "description": "本项目所有 Jev 功能共用此 key，包括会话上下文选择、代码检索评分、浏览器 Choice / Score 与桌面 Choice。凭据保存在本项目本地，重启后恢复；旧版加密凭据需重新填写并保存一次。不需要在通用密钥库另填一份。检索启用后会发送查询及受限源码片段，浏览器、桌面和上下文外发由各自独立开关控制。更换 key 后需开启新会话。"
           }
         }
       }

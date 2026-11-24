@@ -1151,6 +1151,28 @@ describe('SubagentPanel', () => {
     expect(screen.getByText(/TLDR only/)).toBeTruthy()
   })
 
+  it('loads only the expanded worker bash and stops detail demand when the pane hides', async () => {
+    const harness = hostHarness()
+    const read = vi.fn().mockResolvedValue({ state: 'running', revision: 1, output: 'LIVE_BASH_DETAIL' })
+    harness.host.getBashDetails = read
+    const view = render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'general-purpose', task: 'verify', state: 'running', createdAt: Date.now() } })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'bash', toolCallId: 'worker-call', text: 'npm test' })
+    const active = await screen.findByTestId('active-tool')
+    expect(read).not.toHaveBeenCalled()
+    fireEvent.click(active.querySelector('button')!)
+    await screen.findByText('LIVE_BASH_DETAIL')
+    expect(read.mock.calls[0][0]).toMatchObject({ agentId: 'run', runId: 'r1', toolCallId: 'worker-call' })
+    view.rerender(<SubagentPanel host={harness.host} visible={false} />)
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(false))
+    const count = read.mock.calls.length
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 250)) })
+    expect(read).toHaveBeenCalledTimes(count)
+    expect(screen.queryByText('LIVE_BASH_DETAIL')).toBeNull()
+  })
+
   it('shows the running bash command on the live tool row and status line', async () => {
     const harness = hostHarness()
     const now = Date.now()

@@ -33,6 +33,7 @@ import {
 	runSpawnV1,
 } from "./worktree/adapter.ts";
 import { evaluateAutoMergeReadinessV1 } from "./worktree/policy.ts";
+import { retainWorktreeMergePolicyV1 } from "./worktree/merge-policy.ts";
 import type { MainRepoSerialQueueV1 } from "./worktree/queue.ts";
 import { sharedPerMainRepoSerialQueueV1 } from "./worktree/queue.ts";
 import type {
@@ -49,6 +50,7 @@ import type { WorktreeFinalizationClockV1 } from "./worktree/service.ts";
 export const SESSION_MERGE_RUN_ID = "session-merge";
 
 export type SessionMergeRequest = {
+	mergePolicy?: "auto" | "never";
 	canonicalRoot: string;
 	sessionBranch: string;
 	worktreePath: string;
@@ -92,6 +94,8 @@ export async function mergeSessionWorktree(
 	const clock = options.clock ?? systemClock;
 	const previous = options.previous;
 	const input = sessionMergeInput(canonicalRoot, sessionBranch, worktreePath);
+	input.worktree.ownership.mergePolicy = retainWorktreeMergePolicyV1(canonicalRoot, input.agentId,
+		previous?.input.worktree.ownership.mergePolicy === "never" ? "never" : request.mergePolicy);
 
 	if (!isSessionMergeBranch(sessionBranch)) {
 		return blockedState(input, previous, clock, {
@@ -136,6 +140,15 @@ async function mergeSerialized(
 	previous: WorktreeFinalizationStateV1 | undefined,
 	clock: WorktreeFinalizationClockV1,
 ): Promise<WorktreeFinalizationStateV1> {
+	input.worktree.ownership.mergePolicy = retainWorktreeMergePolicyV1(input.mainCwd, input.agentId, input.worktree.ownership.mergePolicy);
+	if (input.worktree.ownership.mergePolicy === "never") {
+		return blockedState(input, previous, clock, {
+			disposition: "retained", ownership: "verified", dirty: "unknown", conflict: "none",
+			merge: "not-attempted", cleanup: "not-attempted",
+			recovery: recovery("retained", "none", "mergePolicy=never preserves this worktree and branch", ["retain the prototype"]),
+			messages: ["session merge and cleanup skipped: mergePolicy=never"],
+		});
+	}
 	const already = await alreadyIntegratedWithoutWorktree(input);
 	if (already) return alreadyIntegratedState(adapter, input, previous, clock, already);
 

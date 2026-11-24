@@ -97,6 +97,26 @@ export function createAuthProvider() {
     expect(registered).toEqual(["acme-chat"]);
   });
 
+  it("awaits dynamic factories and rebuilds their catalog after authentication changes", async () => {
+    const dir = await writeFakeProvider();
+    await writeFile(join(dir, "agent", "dist", "provider.js"), `
+export const AUTH_PROVIDER_ID = "acme-chat";
+export async function createAuthProvider(options) {
+  await new Promise(resolve => setTimeout(resolve, 5));
+  return { models: [{ id: options.authPath }], cacheDir: options.cacheDir };
+}
+`);
+    const registrations: unknown[] = [];
+    const input = {
+      runtime: { registerProvider: (_id: string, config: unknown) => { registrations.push(config); }, getProvider: () => ({ id: "acme-chat" }) },
+      authPath: "/profile/auth.json", refreshExisting: true,
+      claims: [{ extensionId: "acme", enabled: true, contribution: { provider: { id: "acme-chat", name: "Acme", models: [] } } }],
+      directoryOf: () => dir,
+    };
+    await registerContributedAuthProviders(input);
+    expect(registrations).toEqual([{ models: [{ id: "/profile/auth.json" }], cacheDir: null }]);
+  });
+
   it("computes the provider module list the external helper cannot discover", async () => {
     const dir = await writeFakeProvider();
     const empty = join(root, "empty");

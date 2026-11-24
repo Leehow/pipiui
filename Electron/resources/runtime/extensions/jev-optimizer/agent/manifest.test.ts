@@ -29,7 +29,7 @@ test("manifest is optional with separate default-off browser cloud consent and n
   const description = String(secret?.description ?? "");
   assert.match(String(secret?.title), /TypeSafe/);
   assert.match(description, /共用此 key/);
-  assert.match(description, /加密持久保存/);
+  assert.match(description, /保存在本项目本地/);
   assert.match(String(manifest.description), /无 key.*基础检索/);
   assert.match(description, /新会话/);
   const browser = app.settings?.schema?.properties?.["ext.jev-optimizer.browserEnabled"];
@@ -38,7 +38,8 @@ test("manifest is optional with separate default-off browser cloud consent and n
   assert.match(String(browser?.title), /Choice.*Score/);
   assert.match(String(browser?.description), /TypeSafe/);
   assert.match(String(browser?.description), /收费/);
-  assert.match(String(browser?.description), /不(?:会)?发送截图或整个页面/);
+  assert.match(String(browser?.description), /不发送截图或整页 HTML/);
+  assert.match(String(browser?.description), /控件当前值与选项状态/);
   assert.match(String(browser?.description), /显式调用 browser goal/);
   assert.equal(app.ui, undefined);
 });

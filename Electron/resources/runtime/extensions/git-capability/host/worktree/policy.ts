@@ -97,6 +97,13 @@ export function evaluateAutoMergeReadinessV1(
 			["automatic merge skipped: ownership mismatch"],
 		);
 	}
+	if (ownership.mergePolicy === "never") {
+		return blocked(
+			"retained", "verified", "unknown", "none",
+			recovery("retained", "none", "mergePolicy=never preserves this worktree and branch", ["retain the prototype; adoption is not a merge"], false),
+			["automatic merge and cleanup skipped: mergePolicy=never"],
+		);
+	}
 	const bossAccepted = input.acceptance?.source === "boss";
 	if (input.terminal.state !== "ok" && !bossAccepted) {
 		const nextAction = input.terminal.state === "aborted" || input.terminal.state === "interrupted"

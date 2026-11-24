@@ -54,6 +54,15 @@ function errorsOfParse(value: unknown): string[] {
 }
 
 describe("parseExtensionUpdateComponents contract", () => {
+  it('accepts pinned Git commit tracking and rejects malformed refs or revisions', () => {
+    const component = { id: 'browser-use-jev', name: 'Browser Use Jev', version: 'a'.repeat(40),
+      source: { type: 'githubCommits', owner: 'browser-use', repo: 'jev-ultrafast', ref: 'main' } };
+    expect(parseExtensionUpdateComponents([component])?.ok).toBe(true);
+    for (const ref of ['../escape', 'main?token=x', 'https://elsewhere', '']) {
+      expect(parseExtensionUpdateComponents([{ ...component, source: { ...component.source, ref } }])?.ok).toBe(false);
+    }
+    expect(parseExtensionUpdateComponents([{ ...component, version: '0.1.0' }])?.ok).toBe(false);
+  });
   it("treats an absent field as no declared components", () => {
     expect(parseExtensionUpdateComponents(undefined)).toBeUndefined();
     expect(parseExtensionUpdateComponents(null)).toBeUndefined();

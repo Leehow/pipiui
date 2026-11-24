@@ -4,17 +4,6 @@ import { stripUnsupportedFlapcodeParams } from "./client.js";
 import { resolveFlapcodeApiKey } from "./config.js";
 import { createFlapcodeProvider, FLAPCODE_PROVIDER_ID } from "./provider.js";
 import { captureFlapcodeRateLimitHeaders } from "./quota.js";
-// TEMPORARY DIAGNOSTIC — remove before landing.
-import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-let dumpSeq = 0;
-function dumpPayload(payload: unknown): void {
-  const dir = process.env.PI_CODING_AGENT_DIR;
-  if (!dir || !existsSync(join(dir, "flapcode-debug"))) return;
-  try {
-    writeFileSync(join(dir, `flapcode-req-${String(dumpSeq++ % 6).padStart(2, "0")}.json`), JSON.stringify(payload) + "\n");
-  } catch { /* diagnostic only */ }
-}
 
 /** Minimal shape of the hook context this extension reads. */
 type FlapcodeHookContext = {
@@ -46,7 +35,6 @@ export default function (pi: ExtensionAPI): void {
       if (registry?.getApiKeyForProvider) {
         bootstrap.runWith(() => registry.getApiKeyForProvider!(FLAPCODE_PROVIDER_ID));
       }
-      dumpPayload(event.payload);
       return stripUnsupportedFlapcodeParams(event.payload);
     },
   );

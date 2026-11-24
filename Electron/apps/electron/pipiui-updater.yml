@@ -1,0 +1,3 @@
+provider: generic
+url: https://pipi.aichattrpg.com/downloads/
+updaterCacheDirName: pipiui-electron-updater

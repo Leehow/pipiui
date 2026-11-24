@@ -93,8 +93,10 @@ describe("PiHostBackend history structure",()=>{let root="";afterEach(async()=>{
       { type: "tool", contentIndex: 3, tool: { id: "call-2", name: "read", input: '{"path":"src/App.tsx"}' } },
       { type: "text", contentIndex: 4, content: "done" },
     ] }),
-    expect.objectContaining({ role: "tool", content: "total 0", toolCallId: "call-1", toolName: "bash", isError: false }),
+    expect.objectContaining({ role: "tool", content: "", toolCallId: "call-1", toolName: "bash", isError: false }),
   ]);
+  expect(await backend.handle("getBashDetails", [{ sessionId: "session-1", toolCallId: "call-1" }])).toMatchObject({ input: '{"command":"ls -la"}', output: 'total 0', state: 'completed' });
+  await backend.close();
 });
 
 it("projects typed toolResult images and structured details without leaking base64 into content", async () => {

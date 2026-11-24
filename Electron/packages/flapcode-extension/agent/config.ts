@@ -70,7 +70,7 @@ export function normalizeBaseUrl(raw: string): string {
   return trimmed.replace(/\/+$/, "");
 }
 
-/** Default `https://codex.flapcode.com/v1`; `ext.flapcode.baseUrl` overrides. */
+/** Default `FLAPCODE_BASE_URL` (`https://codex.takemoon.com/v1`); `ext.flapcode.baseUrl` overrides. */
 export function resolveBaseUrl(override?: string): string {
   if (override?.trim()) return normalizeBaseUrl(override);
   const fromSettings = settingString(SETTINGS_BASE_URL, "baseUrl");

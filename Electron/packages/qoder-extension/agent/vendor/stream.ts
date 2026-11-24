@@ -3,7 +3,7 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
-  Context,
+  TranscriptContext,
   Model,
   SimpleStreamOptions,
   TextContent,
@@ -76,7 +76,7 @@ function stableChatRecordID(
 
 export function streamQoder(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
@@ -136,8 +136,11 @@ export function streamQoder(
       const isReasoning = !!modelConfig.is_reasoning;
       const maxOutputTokens = modelConfig.max_output_tokens || 32768;
 
-      const normalizedMessages = transformMessagesForQoder(context.messages);
-      const systemText = context.systemPrompt || "";
+      // Pi 0.86+ carries prompt/tool updates in transcript system messages.
+      // Qoder needs their replayed state in a single leading system message.
+      const transcript = PiAi.collapseSystemMessages(context);
+      const normalizedMessages = transformMessagesForQoder(transcript.messages);
+      const systemText = PiAi.getCurrentSystemPrompt(transcript.messages);
 
       let lastUserText = "";
       for (let i = normalizedMessages.length - 1; i >= 0; i--) {
@@ -169,7 +172,8 @@ export function streamQoder(
         maxTokens = options.maxTokens;
       }
 
-      const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
+      const tools = PiAi.getCurrentTools(transcript.messages);
+      const toolsRaw = tools.length > 0 ? transformTools(tools) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
 
       const reqBody: Record<string, unknown> = {

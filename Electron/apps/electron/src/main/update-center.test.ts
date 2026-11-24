@@ -6,6 +6,28 @@ import type { HostBackend } from '@pipi/host-api'
 const response = (payload: unknown, ok = true, status = 200) => ({ ok, status, json: async () => payload })
 
 describe('update center version discovery', () => {
+  const currentCommit = 'a'.repeat(40), latestCommit = 'b'.repeat(40)
+  const commitItem: UpdateCatalogItem = { id: 'webview-browser-extension:browser-use-jev', name: 'Browser Use Jev', category: 'extension', currentVersion: currentCommit,
+    source: { type: 'githubCommits', owner: 'browser-use', repo: 'jev-ultrafast', ref: 'main' } }
+  it('checks commit identity and ancestry without pretending hashes are semver', async () => {
+    const fetch = vi.fn(async (url: string) => url.includes('/compare/') ? response({ status: 'ahead', ahead_by: 2 }) : response({ sha: latestCommit }))
+    const snapshot = await createUpdateCenterService({ catalog: [commitItem], fetch })()
+    expect(snapshot.items[0]).toMatchObject({ status: 'updateAvailable', currentVersion: currentCommit, latestVersion: latestCommit,
+      gitSource: { owner: 'browser-use', repo: 'jev-ultrafast', ref: 'main' }, sourceLabel: 'browser-use/jev-ultrafast' })
+    expect(snapshot.items[0].compareUrl).toContain(`${currentCommit}...${latestCommit}`)
+    expect(snapshot.items[0].transactional).toBeUndefined()
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+  it('reports unchanged commits without a comparison request, and refuses branch rewinds', async () => {
+    const fetch = vi.fn(async () => response({ sha: currentCommit }))
+    expect((await createUpdateCenterService({ catalog: [commitItem], fetch })()).items[0].status).toBe('upToDate')
+    expect(fetch).toHaveBeenCalledTimes(1)
+    for (const status of ['behind', 'diverged']) {
+      const probe = async (url: string) => url.includes('/compare/') ? response({ status, ahead_by: 0 }) : response({ sha: latestCommit })
+      expect((await createUpdateCenterService({ catalog: [commitItem], fetch: probe })()).items[0].status).toBe('notCheckable')
+    }
+    expect((await createUpdateCenterService({ catalog: [commitItem], fetch: async () => response({ sha: 'not-a-commit' }) })()).items[0].status).toBe('checkFailed')
+  })
   it('compares newer, equal, older, prerelease and malformed semvers', () => {
     expect(compareSemver('0.84.2', '0.84.0')).toBeGreaterThan(0)
     expect(compareSemver('0.84.0', '0.84.0')).toBe(0)

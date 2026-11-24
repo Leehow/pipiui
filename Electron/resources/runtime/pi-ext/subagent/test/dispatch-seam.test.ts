@@ -42,6 +42,16 @@ type RegisteredTool = {
 
 type FakeExtensionAPI = Parameters<Awaited<ReturnType<typeof loadExtension>>>[0];
 
+// Supply the live ExtensionContext contract even to older test call sites.
+function withIdleContext(fn: (...args: never[]) => unknown, index: number) {
+	return (...args: never[]) => {
+		const ctx = args[index] as Record<string, unknown> | undefined;
+		if (ctx && typeof ctx.isIdle !== "function") ctx.isIdle = () => true;
+		if (ctx && typeof ctx.hasPendingMessages !== "function") ctx.hasPendingMessages = () => false;
+		return fn(...args);
+	};
+}
+
 function createFakePi() {
 	const tools = new Map<string, RegisteredTool>();
 	const commands = new Map<string, { description: string; handler: (args: string, ctx: unknown) => unknown }>();
@@ -50,14 +60,14 @@ function createFakePi() {
 	const handlers = new Map<string, Array<(...args: never[]) => unknown>>();
 	const api = {
 		registerTool(tool: RegisteredTool) {
-			tools.set(tool.name, tool);
+			tools.set(tool.name, { ...tool, execute: withIdleContext(tool.execute, 4) as RegisteredTool["execute"] });
 		},
 		registerCommand(name: string, definition: { description: string; handler: (args: string, ctx: unknown) => unknown }) {
 			commands.set(name, definition);
 		},
 		on(event: string, handler: (...args: never[]) => unknown) {
 			const registered = handlers.get(event) ?? [];
-			registered.push(handler);
+			registered.push(withIdleContext(handler, 1));
 			handlers.set(event, registered);
 		},
 		sendMessage() {},
@@ -215,6 +225,49 @@ test("registered tool seam: provider schema + prepare rejects missing IDs; expli
 	}, undefined, undefined, { cwd: tmpdir(), model: undefined })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
 	assert.equal(unknown.isError, true);
 	assert.match(unknown.content[0]!.text, /Unknown agent/);
+});
+
+test("mergePolicy survives single, parallel, chain prepare/execute and same-agent fresh resume", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(cleanup);
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const chain = tools.get("subagent_chain")!;
+	const ctx = { cwd: suiteMainCwd, model: undefined, isIdle: () => false };
+	const single = (id: string, mergePolicy?: "auto" | "never") => ({
+		prompt: `Policy probe [dm:${id}]`, description: "policy probe", subagent_type: "explore",
+		agentId: id, mergePolicy, run_in_background: false,
+	});
+	const calls: Array<[RegisteredTool, Record<string, unknown>, string]> = [
+		[subagent, single("policy-single", "never"), "policy-single"],
+		[subagent, { ...single("policy-background", "never"), run_in_background: true }, "policy-background"],
+		[subagent, { tasks: [{ agent: "explore", task: "Policy probe [dm:policy-queued]", agentId: "policy-queued", mergePolicy: "never" }], background: true }, "policy-queued"],
+		[subagent, { tasks: [{ agent: "explore", task: "Policy probe [dm:policy-parallel]", agentId: "policy-parallel", mergePolicy: "never" }], background: false }, "policy-parallel"],
+		[chain, { chain: [single("policy-chain", "never")], background: false }, "policy-chain"],
+		[chain, { chain: [single("policy-chain-bg", "never")], background: true }, "policy-chain-bg"],
+		[subagent, { ...single("policy-single", "auto"), fresh: true }, "policy-single"],
+		[subagent, single("policy-single"), "policy-single"],
+	];
+	for (const [tool, args, id] of calls) {
+		const normalized = prepared(tool, args);
+		const item = (normalized.tasks as any[])?.[0] ?? (normalized.chain as any[])?.[0] ?? normalized;
+		const original = (args.tasks as any[])?.[0] ?? (args.chain as any[])?.[0] ?? args;
+		assert.equal(item.mergePolicy, original.mergePolicy);
+		const result = await tool.execute(`test-${id}`, normalized, undefined, undefined, ctx) as any;
+		assert.notEqual(result.isError, true, JSON.stringify(result));
+		await waitUntilTrue(async () => {
+			const saved = JSON.parse(readFileSync(join(suiteMainCwd, ".pi", "agent-slices.json"), "utf8"));
+			return saved.slices.some((entry: any) => entry.agentId === id && entry.state === "ok");
+		}, `${id} terminal`);
+		const metadata = JSON.parse(readFileSync(join(suiteMainCwd, ".pi", "agent-slices.json"), "utf8"));
+		const job = metadata.slices.find((entry: any) => entry.agentId === id);
+		assert.equal(job?.mergePolicy, "never");
+		assert.equal(job?.state, "ok");
+		const policy = JSON.parse(readFileSync(join(suiteMainCwd, ".pi", "worktree-policies", `${id}.json`), "utf8"));
+		assert.equal(policy.mergePolicy, "never");
+	}
 });
 
 test("queued dispatch allocates runId; exact abort releases the reservation so the same ID redispatches", async (t) => {
@@ -673,10 +726,7 @@ test("exact queued abort of a producer repumps its dependent into a genuine held
 		async () => /agentId=dep-b runId=[^\s]+ role=explore[^\n]*state=queued: held \(dependency prod-b was never dispatched\)/.test(await statusText(status)),
 		"dep-b must become held after its queued producer is exact-aborted",
 	);
-	await waitUntilTrue(
-		() => Promise.resolve(sentMessages.filter((line) => line.includes("agentId=dep-b") && line.includes("[subagent-blocked]")).length === 1),
-		"exactly one blocked signal for dep-b",
-	);
+	assert.equal(sentMessages.length, 0, "blocked status is queried above, never injected as a user request");
 
 	// The same id is immediately redispatchable (no stranded reservation/token).
 	const redispatch = (await subagent.execute("qb-5", prepared(subagent, {
@@ -762,10 +812,7 @@ test("pending acceptance is visible during the project-agent confirmation; denia
 		async () => /agentId=dep-c runId=[^\s]+ role=explore[^\n]*state=queued: held \(dependency gate-c was never dispatched\)/.test(await statusText(status)),
 		"dep-c must become held after the confirmation denial",
 	);
-	await waitUntilTrue(
-		() => Promise.resolve(sentMessages.filter((line) => line.includes("agentId=dep-c") && line.includes("[subagent-blocked]")).length === 1),
-		"exactly one blocked signal for dep-c",
-	);
+	assert.equal(sentMessages.length, 0, "blocked status is queried above, never injected as a user request");
 
 	// No phantom token: the id accepts a fresh dispatch right after the denial.
 	const redispatch = (await subagent.execute("pc-3", prepared(subagent, {
@@ -848,10 +895,7 @@ test("post-await identity failure releases the pending token; dependents see gen
 	const depRunId = depOut.content[0]!.text.match(/agentId=dep-d runId=([^\s]+)/)![1]!;
 	const text = await statusText(status);
 	assert.match(text, new RegExp(`agentId=dep-d runId=[^\\s]+ role=explore[^\\n]*state=queued: held \\(dependency ${legacy} was never dispatched\\)`));
-	await waitUntilTrue(
-		() => Promise.resolve(sentMessages.filter((line) => line.includes("agentId=dep-d") && line.includes("[subagent-blocked]")).length === 1),
-		"exactly one blocked signal for dep-d",
-	);
+	assert.equal(sentMessages.length, 0, "blocked status is queried above, never injected as a user request");
 
 	// Hygiene: drop the held dependent.
 	await abort.execute("pi-3", { agentId: "dep-d", runId: depRunId }, undefined, undefined, { cwd: tmpdir() });
@@ -1000,11 +1044,11 @@ test("queued-single setup failure before spawn frees the id, repumps dependents,
 	assert.equal(depOut.isError === true, false, JSON.stringify(depOut.content));
 	const depRunId = depOut.content[0]!.text.match(/agentId=predep runId=([^\s]+)/)![1]!;
 
-	// The no-spawn exit is an honest terminal delivered through the normal channel...
-	await waitUntilTrue(
-		() => Promise.resolve(sentMessages.some((line) => line.includes("[subagent-done]") && line.includes("agentId=prex "))),
-		"prex's setup failure must reach the boss channel as a done receipt",
-	);
+	// The no-spawn exit remains an honest terminal in authoritative status.
+	await waitUntilTrue(async () => {
+		const result = await status.execute("setup-failure-status", { agentId: "prex", full: true }, undefined, undefined, EXEC_CTX) as any;
+		return /(?:state|workerState): failed/.test(result.content[0].text);
+	}, "prex's setup failure must remain queryable");
 
 	// ...and its reservation release must repump the dependent into exactly one genuine
 	// held signal — never an eternal wait on a phantom running id.
@@ -1012,10 +1056,7 @@ test("queued-single setup failure before spawn frees the id, repumps dependents,
 		async () => /agentId=predep runId=[^\s]+ role=explore[^\n]*state=queued: held \(dependency prex did not succeed\)/.test(await statusText(status)),
 		"predep must become held after prex's setup failure",
 	);
-	await waitUntilTrue(
-		() => Promise.resolve(sentMessages.filter((line) => line.includes("agentId=predep") && line.includes("[subagent-blocked]")).length === 1),
-		"exactly one blocked signal for predep",
-	);
+	assert.equal(sentMessages.length, 0, "terminal and blocked status never enter the user queue");
 
 	// The freed id accepts an immediate redispatch (hook disarmed on first failure).
 	const redispatch = (await subagent.execute("qs-4", prepared(subagent, {
@@ -1370,7 +1411,7 @@ test("RPC general-purpose cooperative exit after shutdown-ready clears the timer
 	assert.equal(readChildState("capexit").sigterm, undefined);
 });
 
-test("non-RPC explore arms after agent_settled", { timeout: 40_000 }, async (t) => {
+test("explore arms after settled shutdown-ready", { timeout: 40_000 }, async (t) => {
 	const cleanup = setupSuiteEnv();
 	delete process.env.PIPIUI_FANOUT_ACTIVE;
 	const previousGrace = process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
@@ -1394,7 +1435,7 @@ test("non-RPC explore arms after agent_settled", { timeout: 40_000 }, async (t) 
 	const pid = await waitChildPid("capprint");
 	const deadline = Date.now() + 3_000;
 	while (alive(pid) && Date.now() < deadline) await delay(20);
-	assert.equal(alive(pid), false, "settled print workers retain their bounded exit fallback");
+	assert.equal(alive(pid), false, "settled shutdown-ready workers retain their bounded exit fallback");
 });
 
 test("a print worker's intermediate message does not start closeout or terminate its next turn", async (t) => {

@@ -84,6 +84,7 @@ export const EXTENSION_UPDATE_INDEX_MAX_BYTES = 1_048_576;
 export const EXTENSION_UPDATE_OWNER_FILE_RE = /^[0-9a-f]{32}\.owner$/;
 
 const ALLOWED_DOWNLOAD_HOSTS: readonly string[] = Object.freeze([
+  "pipi.aichattrpg.com",
   "github.com",
   "objects.githubusercontent.com",
   "release-assets.githubusercontent.com",
@@ -746,7 +747,7 @@ export type ExtensionSlotPointer = {
 
 export type ExtensionInstallReceipt = ExtensionSlotPointer & {
   extensionId: string;
-  source: ExtensionUpdateComponentSource | { type: "localProductPack"; packId: string };
+  source: ExtensionUpdateComponentSource | { type: "official" } | { type: "localProductPack"; packId: string };
   channel: "stable" | "local";
   signature: "ed25519" | "local";
   hostApi: string;
@@ -880,7 +881,12 @@ export async function resolveActiveExtensionObject(input: {
     const dir = objectDirFor(input.storeRoot, pointer.contentHash);
     if (!(await exists(join(dir, MANIFEST_COPY_FILENAME)))) continue;
     try {
-      await readFile(join(dir, MANIFEST_COPY_FILENAME), "utf8");
+      const raw = await readFile(join(dir, MANIFEST_COPY_FILENAME), "utf8");
+      if (input.seedRoot && (await readExtensionReceipt(input.storeRoot, id, pointer.contentHash))?.source?.type === "official") {
+        const manifest = JSON.parse(raw);
+        const seed = await readFile(join(input.seedRoot, id, MANIFEST_COPY_FILENAME), "utf8").catch(() => undefined);
+        if (seed && (compareUpdateSemver(JSON.parse(seed).version, manifest.version) ?? 0) >= 0) continue;
+      }
     } catch {
       continue;
     }
@@ -929,6 +935,10 @@ export async function checkExtensionUpdate(input: {
   const fetchImpl = input.fetchImpl ?? (globalThis.fetch as ExtensionUpdateFetch);
   const timeoutMs = input.timeoutMs ?? 8_000;
   assertExtensionId(input.extensionId);
+  if (input.source.type === 'githubCommits') {
+    return { extensionId: input.extensionId, status: 'notCheckable', currentVersion: input.currentVersion,
+      source: input.source, error: 'Git 提交组件通过更新中心评估源码更新，不是可直接安装的扩展发布包' };
+  }
   if (input.currentVersion !== undefined && !parseUpdateSemver(input.currentVersion)) {
     return { extensionId: input.extensionId, status: "notCheckable", currentVersion: input.currentVersion, source: input.source, error: "本机版本不是可识别的 SemVer" };
   }
@@ -989,7 +999,7 @@ export async function checkExtensionUpdate(input: {
 export type ExtensionUpdateRequest = {
   extensionId: string;
   /** Manifest `update.source` — the closed updateComponents union. */
-  source: ExtensionUpdateComponentSource;
+  source: ExtensionUpdateComponentSource | { type: "official" };
   /** Explicit target; omitted → run discovery first and take the latest. */
   targetVersion?: string;
   currentVersion?: string;
@@ -1096,7 +1106,7 @@ export async function applyExtensionUpdate(request: ExtensionUpdateRequest, opti
   const now = options.now || Date.now;
   const unpackArchive = options.unpackArchive ?? defaultUnpackArchive;
 
-  if (request.source.type !== "githubReleases") {
+  if (request.source.type !== "githubReleases" && request.source.type !== "official") {
     throw new ExtensionUpdateError("unsupported_source", `extension artifact updates for source type '${request.source.type}' are not supported yet; first version ships official GitHub-release packages only`);
   }
   const source = request.source;
@@ -1105,7 +1115,8 @@ export async function applyExtensionUpdate(request: ExtensionUpdateRequest, opti
     // 1. Version discovery (the 更新中心 评估更新 entry, reused for this component).
     let targetVersion = request.targetVersion;
     if (!targetVersion) {
-      const check = await checkExtensionUpdate({ extensionId, source: request.source, currentVersion: request.currentVersion, fetchImpl, timeoutMs: Math.min(timeoutMs, 8_000) });
+      if (source.type === "official") throw new ExtensionUpdateError("invalid_input", "official update requires a published version");
+      const check = await checkExtensionUpdate({ extensionId, source, currentVersion: request.currentVersion, fetchImpl, timeoutMs: Math.min(timeoutMs, 8_000) });
       if (check.status !== "updateAvailable" || !check.latestVersion) {
         return {
           extensionId,
@@ -1127,14 +1138,26 @@ export async function applyExtensionUpdate(request: ExtensionUpdateRequest, opti
     await mkdir(tmpRoot(storeRoot), { recursive: true });
     const staging = await mkdtemp(join(tmpRoot(storeRoot), `staging-${extensionId}-`));
     try {
-      const releases = await fetchReleaseDocument(source, { fetchImpl, timeoutMs, maxRedirects });
-      const release = releaseForVersion(releases, targetVersion);
-      if (!release) throw new ExtensionUpdateError("asset_index_invalid", `release ${targetVersion} not found for ${source.owner}/${source.repo}`);
-      const indexAsset = release.assets.find(asset => asset.name === `${extensionId}-assets.json`);
-      if (!indexAsset) throw new ExtensionUpdateError("asset_index_invalid", `release ${targetVersion} carries no ${extensionId}-assets.json`);
-      assertAllowedUpdateUrl(indexAsset.url);
+      let indexUrl: string;
+      let releaseAssets: { name: string; url: string }[] = [];
+      if (source.type === "official") {
+        if (!parseUpdateSemver(targetVersion)) throw new ExtensionUpdateError("invalid_input", "invalid official version");
+        const active = await readExtensionSlot(storeRoot, extensionId, "active");
+        if ([active?.version, request.currentVersion].some(version => version && (compareUpdateSemver(targetVersion!, version) ?? 0) <= 0)) {
+          throw new ExtensionUpdateError("invalid_input", "插件已更新，请刷新版本列表");
+        }
+        indexUrl = `https://pipi.aichattrpg.com/downloads/${extensionId}-${targetVersion}-assets.json`;
+      } else {
+        const releases = await fetchReleaseDocument(source, { fetchImpl, timeoutMs, maxRedirects });
+        const release = releaseForVersion(releases, targetVersion);
+        const asset = release?.assets.find(asset => asset.name === `${extensionId}-assets.json`);
+        if (!asset) throw new ExtensionUpdateError("asset_index_invalid", `release ${targetVersion} carries no ${extensionId}-assets.json`);
+        releaseAssets = release!.assets;
+        indexUrl = asset.url;
+      }
+      assertAllowedUpdateUrl(indexUrl);
       const indexFile = join(scratch, "assets-index.json");
-      await downloadToFile(indexAsset.url, indexFile, { fetchImpl, timeoutMs, maxRedirects, label: "extension asset index" });
+      await downloadToFile(indexUrl, indexFile, { fetchImpl, timeoutMs, maxRedirects, label: "extension asset index" });
       let indexJson: unknown;
       try {
         indexJson = JSON.parse(await readFile(indexFile, "utf8"));
@@ -1149,9 +1172,11 @@ export async function applyExtensionUpdate(request: ExtensionUpdateRequest, opti
       }
 
       // 3. Download the artifact to scratch (bounded redirects, byte cap).
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(entry.asset)) throw new ExtensionUpdateError("asset_index_invalid", "invalid asset filename");
+      if (source.type === "official" && index.baseUrl !== "https://pipi.aichattrpg.com/downloads") throw new ExtensionUpdateError("asset_index_invalid", "unexpected official asset origin");
       const artifactUrl = releaseAssetUrl(index.baseUrl, entry);
       assertAllowedUpdateUrl(artifactUrl);
-      const releaseAsset = release.assets.find(asset => asset.name === entry.asset);
+      const releaseAsset = releaseAssets.find(asset => asset.name === entry.asset);
       if (releaseAsset) assertAllowedUpdateUrl(releaseAsset.url);
       const artifactUrlFinal = releaseAsset?.url ?? artifactUrl;
       const partial = join(scratch, entry.asset);

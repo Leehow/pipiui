@@ -1,5 +1,14 @@
 # Jev Choice 浏览器控制
 
+> 2026-09-21 后续实现：生产 `browser goal` 已切换为固定提交
+> `1231850a0bf1a0c0341fe408ef1668dbbfdfac46` 的 Browser Use jev-ultrafast Python
+> 核心，通过 Electron WebContents 适配层运行。原版快照/提示词保持不变，保留当前字段值、
+> 选中状态、可见正文及动作后重观察。Jev 和填字请求仍由宿主使用现有凭据执行。
+> 运行时、维护补丁与测试入口见
+> [适配说明](../Electron/resources/runtime/extensions/webview-browser-extension/agent/jev-upstream/README.md)，
+> 交付与实机证据见 [实施记录](active-plans/jev-upstream-browser.md)。
+> 下文保留首版设计背景；原有 TS 简化循环不再是生产 `goal` 的执行路径。
+
 ## 目标与范围
 
 本轮按用户明确要求实现 **Choice 动作控制**，不再把观察候选 Score 当成控制提速。参考 [Browser Use / Jev Ultrafast](https://github.com/browser-use/jev-ultrafast) 的动态操作/目标选择方式，但复用 PipiUI 已有 WebView、执行器、当前模型和 Jev 扩展，不引入第二套浏览器或凭据。
@@ -28,9 +37,9 @@
 
 - 唯一设置是当前项目 Jev 扩展的 `ext.jev-optimizer.apiKey`。
 - 检索 Score、浏览器 Score、浏览器 Choice 共用 `EXT_JEV_OPTIMIZER_APIKEY`，无需通用 vault mount 或第二份 `TYPESAFE_API_KEY`。
-- Jev key 通过 Electron OS 加密，原子写入 `{project}/.pi/agent/jev-optimizer/credential.enc`，重建 backend 时恢复到同一项目的扩展内存缓存。设置页只读取 presence 布尔，不返回 key。
+- Jev key 与 OCR 凭据一样保存在本地文件，原子写入 `{project}/.pi/agent/jev-optimizer/credential.json`，重建 backend 时恢复到同一项目的扩展内存缓存。设置页只读取 presence 布尔，不返回 key。
 - 保存/替换先写密文后更新缓存；失败不伪装成功。清除同时删除密文与缓存。相关读写在同一 Jev 串行队列中，避免迟到读取使旧 key 复活。
-- 无系统加密时拒绝保存，不悄悄降级成内存成功或明文文件。Linux `basic_text`/`unknown` 不视为安全存储。通用 `secret_vault_*` 仍是 RAM-only，不受此修改影响。
+- macOS/Linux 使用目录 `0700`、文件 `0600`；Windows 继承所在目录的 ACL，不依赖钥匙串、DPAPI 或 Linux secret service。旧 `credential.enc` 保留但不自动解密，升级后在扩展设置中重新保存一次密钥；清除后不会从旧密文恢复。通用 `secret_vault_*` 仍是 RAM-only，不受此修改影响。
 - 这不会恢复在旧版退出时已经丢失的 key。若旧 key 已丢，需要在扩展设置中重新填写一次；之后才由新持久化链路保存。
 - 仍按项目隔离，不自动把一个项目的 key 复制到其他项目。浏览器云端使用由 `ext.jev-optimizer.browserEnabled` 控制，代码检索不受该开关影响。更换 key 后开启新会话，避免继续使用旧环境与代际。
 

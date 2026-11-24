@@ -68,7 +68,7 @@ interface ResidentWorker {
   tail: Promise<unknown>;
   disposed: boolean;
   ready: Promise<void>;
-  kill(): void;
+  kill(error?: Error): void;
   lines: ReturnType<typeof createInterface>;
 }
 
@@ -82,8 +82,22 @@ function spawnWorker(node: string, helperPath: string, env: NodeJS.ProcessEnv): 
     tail: Promise.resolve(),
     disposed: false,
     ready: new Promise(resolve => { readyResolve = resolve; }),
-    kill() { worker.disposed = true; try { worker.lines.close(); child.stdin.end(); child.kill(); } catch { /* already gone */ } },
+    kill(error = new Error("worker stopped")) { retire(error, true); },
     lines: undefined as any,
+  };
+  const retire = (error: Error, terminate: boolean) => {
+    const first = !worker.disposed;
+    worker.disposed = true;
+    readyResolve();
+    for (const waiter of worker.pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    worker.pending.clear();
+    if (!first) return;
+    worker.lines?.close();
+    child.stdin.destroy();
+    if (terminate) { try { child.kill(); } catch { /* already gone */ } }
   };
   worker.lines = createInterface({ input: child.stdout });
   worker.lines.on("line", line => {
@@ -97,12 +111,12 @@ function spawnWorker(node: string, helperPath: string, env: NodeJS.ProcessEnv): 
     if (msg.ok) waiter.resolve(msg.data);
     else waiter.reject(new Error(msg.error || "helper returned an invalid result"));
   });
-  child.on("exit", code => {
-    worker.disposed = true;
-    readyResolve();
-    for (const [, waiter] of worker.pending) { clearTimeout(waiter.timer); waiter.reject(new Error(`worker exited with code ${code}`)); }
-    worker.pending.clear();
-  });
+  child.on("exit", code => retire(new Error(`worker exited with code ${code}`), false));
+  child.on("error", error => retire(error, true));
+  // Pipe failures are asynchronous error events; a try/catch around write()
+  // cannot prevent an unhandled exception in the Electron main process.
+  child.stdin.on("error", error => retire(error, true));
+  child.stdin.on("close", () => retire(new Error("worker stdin closed"), true));
   // Drain stderr so a chatty runtime never backpressures the pipe, but forward
   // the lines: helper-side diagnostics (a skipped provider registration, a
   // failed module import) are otherwise invisible everywhere.
@@ -174,13 +188,21 @@ export class ExternalAuthRuntime implements AuthRuntimeLike {
         // If the worker already died (exit handler rejected this pending) or the
         // request was otherwise cleaned up while queued, don't write or arm a timer.
         if (!worker.pending.has(id)) { settleDone(); return; }
+        if (worker.disposed || worker.child.stdin.destroyed || worker.child.stdin.writableEnded || !worker.child.stdin.writable) {
+          worker.kill(new Error("worker stdin closed"));
+          return;
+        }
         waiter.timer = setTimeout(() => {
           // Clean up ONLY this pending (and its timer); the worker itself stays
           // alive so unrelated queued/new commands are not affected.
           worker.pending.delete(id);
           rejectWrapper(new Error(`worker 响应超时 (>${timeoutMs}ms)`));
         }, timeoutMs);
-        try { worker.child.stdin.write(`${JSON.stringify({ id, cmd, args })}\n`); } catch { /* stdin closed */ }
+        try {
+          worker.child.stdin.write(`${JSON.stringify({ id, cmd, args })}\n`, error => {
+            if (error) worker.kill(error);
+          });
+        } catch (error) { worker.kill(error instanceof Error ? error : new Error(String(error))); }
         // Hold the tail until this command is answered (or its timer fires), so the
         // next queued command only starts its own clock when this one completes.
         await done;
@@ -235,13 +257,20 @@ export class ExternalAuthRuntime implements AuthRuntimeLike {
     const worker = spawnWorker(node, helperPath, env);
     this.worker = worker;
     this.workerReady = false;
-    await Promise.race([
-      worker.ready,
-      new Promise<void>(resolve => setTimeout(resolve, RPC_TIMEOUT_MS * 2)).then(() => worker.kill()),
-    ]);
+    let startupTimer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        worker.ready,
+        new Promise<void>(resolve => {
+          startupTimer = setTimeout(() => {
+            worker.kill(new Error("worker startup timed out"));
+            resolve();
+          }, RPC_TIMEOUT_MS * 2);
+        }),
+      ]);
+    } finally { clearTimeout(startupTimer); }
     if (worker.disposed || worker.child.exitCode !== null) {
-      if (this.worker === worker) this.worker = undefined;
-      this.workerReady = false;
+      if (this.worker === worker) { this.worker = undefined; this.workerReady = false; }
       throw new Error("worker failed to start");
     }
     this.workerReady = true;

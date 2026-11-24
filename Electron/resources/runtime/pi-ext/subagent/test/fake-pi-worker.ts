@@ -70,6 +70,10 @@ async function runPrintWorker(text: string, rpcCommandId?: string): Promise<neve
 	if (behavior === "final-hold") {
 		line({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: assistantText(agentId) }] } });
 		line({ type: "agent_settled" });
+		if (rpcCommandId) {
+			const token = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN ?? "";
+			line({ type: "extension_ui_request", method: "setStatus", statusKey: `pipiui-resident-rpc-wake:${token}` });
+		}
 		return parkResident(agentId, false);
 	}
 	if (behavior === "interim-hold") {
@@ -95,6 +99,8 @@ let rpcExitOnGetState = false;
 
 async function runResidentPrompt(rpcCommandId: string | undefined, text: string): Promise<never> {
 	const { agentId, behavior, dispatchModel } = markerIdentity(text);
+	// Leaf roles now use RPC too; keep their scripted failure/hold behaviors.
+	if (["fail", "hang", "final-hold", "interim-hold"].includes(behavior)) return runPrintWorker(text, rpcCommandId);
 	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
 	line({ type: "session_start", cwd: process.cwd() });
 	line({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: assistantText(agentId) }] } });
@@ -104,7 +110,7 @@ async function runResidentPrompt(rpcCommandId: string | undefined, text: string)
 	if (behavior === "rpc-hold") return parkResident(agentId, false);
 	const token = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN ?? "";
 	line({ type: "extension_ui_request", method: "setStatus", statusKey: `pipiui-resident-rpc-wake:${token}` });
-	if (behavior === "rpc-exit") {
+	if (behavior === "rpc-exit" || behavior === "ok") {
 		rpcExitOnGetState = true;
 		return parkResident(agentId, false);
 	}

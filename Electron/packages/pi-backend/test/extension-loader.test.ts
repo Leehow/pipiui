@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import { createPiHostBackend } from "../src/index.js";
 import { createExtensionLoader } from "../src/extension-loader.js";
 import { validateExtensionManifest } from "../src/extension-manifest.js";
-import { createExtensionRegistry, readAppExtensionEnabled, writeAppExtensionEnabled } from "../src/extension-registry.js";
+import { createExtensionRegistry, readAppExtensionEnabled, readProjectExtensionEnabled, writeAppExtensionEnabled } from "../src/extension-registry.js";
+import { resolveProductProfile } from "../src/profile-resolver.js";
 import { projectPiAgentDir } from "../src/project-pi-home.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "extensions");
@@ -114,6 +115,198 @@ describe("extension manifest D2 validation", () => {
     expect(slotResult.ok).toBe(false);
     if (slotResult.ok) return;
     expect(slotResult.errors.join("; ")).toMatch(/unknown panel slot 'sidebar'/);
+  });
+});
+
+describe("extension product allowlist", () => {
+  const manifest = {
+    id: "product-sim",
+    name: "Product simulator",
+    version: "1.0.0",
+    capabilities: [],
+    products: ["pipi-hydra"],
+    agent: { extension: "agent.js" },
+    app: { ui: { panels: [{ id: "sim", title: "Simulation", slot: "toolPanel", entry: "panel.js" }] } },
+    host: { worker: "worker.js" },
+  };
+
+  async function simulator(directory: string, body: unknown = manifest) {
+    await writeManifest(directory, body);
+    for (const entry of ["agent.js", "panel.js", "worker.js"]) {
+      await writeFile(join(directory, entry), "export default function () {}\n");
+    }
+  }
+
+  it("retains a valid nonempty allowlist and keeps undeclared manifests compatible", () => {
+    const result = validateExtensionManifest({ ...manifest, products: ["pipiui", "pipi-hydra"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.errors.join("; "));
+    expect(result.manifest.products).toEqual(["pipiui", "pipi-hydra"]);
+    const legacy = validateExtensionManifest({ ...manifest, products: undefined });
+    expect(legacy.ok).toBe(true);
+    if (legacy.ok) expect(legacy.manifest.products).toBeUndefined();
+  });
+
+  it.each([
+    null, false, "pipi-hydra", {}, [], [1], [null], [""], ["Pipi-Hydra"],
+    ["../pipi-hydra"], ["pipi_hydra"], ["pipi-hydra "], ["pipi-hydra\n"],
+    ["pipi-hydra\u2028"], ["*"], ["pipi-hydra", "pipi-hydra"],
+  ].map(products => ({ products })))("rejects malformed products %#", ({ products }) => {
+    const result = validateExtensionManifest({ ...manifest, products });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.join("; ")).toMatch(/products/);
+  });
+
+  it("filters the same enabled project before registry, UI, worker and spawn projections", async () => {
+    await tempRoot("pipi-ext-products-");
+    const project = join(root, "project");
+    const agent = projectPiAgentDir(project);
+    await simulator(join(agent, "extensions", manifest.id));
+    await writeManifest(join(agent, "extensions", "legacy"), {
+      id: "legacy", name: "Legacy", version: "1.0.0", capabilities: [],
+    });
+    const enabledFile = join(agent, "ext-enabled.json");
+    const enabledText = `${JSON.stringify({
+      schemaVersion: 2, profile: "coding", overrides: { [manifest.id]: "enabled", legacy: "enabled" },
+    }, null, 2)}\n`;
+    await writeFile(enabledFile, enabledText);
+    const overlay = await readProjectExtensionEnabled(agent);
+    expect(overlay[manifest.id]).toBe(true);
+
+    for (const productId of ["pipiui", "pipi-hydra", undefined]) {
+      const registry = createExtensionRegistry([]);
+      const loader = createExtensionLoader({
+        registry, productId,
+        builtinRoot: join(root, "runtime", "extensions"),
+        appRoot: join(root, "app", "extensions"),
+      });
+      const records = loader.scan(project);
+      expect(loader.list(overlay).find(item => item.id === "legacy")?.state).toBe("enabled");
+      if (productId === "pipi-hydra") {
+        expect(records.find(item => item.id === manifest.id)?.state).toBe("enabled");
+        expect(loader.list(overlay).find(item => item.id === manifest.id)?.state).toBe("enabled");
+        expect(loader.spawnPackages(overlay).find(item => item.id === manifest.id)?.extensionPath).toBeTruthy();
+        expect(loader.hostWorkerEntry(manifest.id)).toBeTruthy();
+        expect(loader.readUiEntrySource(manifest.id, "panel.js")).toContain("export default");
+      } else {
+        expect(records.some(item => item.id === manifest.id)).toBe(false);
+        expect(registry.get(manifest.id)).toBeUndefined();
+        expect(loader.list(overlay).some(item => item.id === manifest.id)).toBe(false);
+        expect(loader.spawnPackages(overlay).some(item => item.id === manifest.id)).toBe(false);
+        expect(loader.profileExtensions().some(item => item.id === manifest.id)).toBe(false);
+        expect(loader.directoryOf(manifest.id)).toBeUndefined();
+        expect(loader.hostWorkerEntry(manifest.id)).toBeUndefined();
+        expect(() => loader.readUiEntrySource(manifest.id, "panel.js")).toThrow(/no declared UI entry/);
+      }
+    }
+    expect(await readFile(enabledFile, "utf8")).toBe(enabledText);
+  });
+
+  it("rejects restricted dependencies as missing, even with an enabled override", async () => {
+    await tempRoot("pipi-ext-product-dependency-");
+    const project = join(root, "project");
+    const extensions = join(projectPiAgentDir(project), "extensions");
+    await simulator(join(extensions, manifest.id));
+    await writeManifest(join(extensions, "consumer"), {
+      id: "consumer", name: "Consumer", version: "1.0.0", capabilities: [],
+      dependencies: { required: [{ id: manifest.id, version: "1.0.0" }] },
+    });
+    const loader = createExtensionLoader({
+      registry: createExtensionRegistry([]), productId: "pipiui",
+      builtinRoot: join(root, "runtime"), appRoot: join(root, "app"),
+    });
+    loader.scan(project);
+    const plan = resolveProductProfile({
+      profile: {
+        schemaVersion: 1, id: "simulation", name: "Simulation",
+        extensions: { required: [{ id: "consumer", version: "1.0.0" }], recommended: [] },
+        layout: {},
+      },
+      installed: loader.profileExtensions(),
+      overrides: { [manifest.id]: "enabled" },
+    });
+    expect(plan.missingRequired).toEqual(expect.arrayContaining([expect.objectContaining({ id: manifest.id })]));
+    expect(plan.enabled.some(item => item.id === manifest.id)).toBe(false);
+  });
+
+  it.each(["builtin", "app", "project"] as const)("filters %s instances before priority resolution", async (restrictedOrigin) => {
+    await tempRoot("pipi-ext-product-priority-");
+    const project = join(root, "project");
+    const roots = {
+      builtin: join(root, "runtime", "extensions"),
+      app: join(root, "app", "extensions"),
+      project: join(projectPiAgentDir(project), "extensions"),
+    };
+    for (const origin of ["builtin", "app", "project"] as const) {
+      await writeManifest(join(roots[origin], "same"), {
+        id: "same", name: origin, version: "1.0.0", capabilities: [],
+        ...(origin === restrictedOrigin ? { products: ["pipi-hydra"] } : {}),
+      });
+    }
+    await writeManifest(join(roots[restrictedOrigin], "restricted-only"), {
+      id: "restricted-only", name: "Restricted", version: "1.0.0", capabilities: [], products: ["pipi-hydra"],
+    });
+    const loader = createExtensionLoader({
+      registry: createExtensionRegistry([]), productId: "pipiui",
+      builtinRoot: roots.builtin, appRoot: roots.app,
+    });
+    loader.scan(project);
+    expect(loader.list().some(item => item.id === "restricted-only")).toBe(false);
+    expect(loader.list().find(item => item.id === "same")?.source)
+      .toBe(restrictedOrigin === "project" ? "app" : "project");
+  });
+
+  it("removes cached project contributions when a rescan discovers a new restriction", async () => {
+    await tempRoot("pipi-ext-product-rescan-");
+    const project = join(root, "project");
+    const directory = join(projectPiAgentDir(project), "extensions", manifest.id);
+    await simulator(directory, { ...manifest, products: undefined });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry, productId: "pipiui", builtinRoot: join(root, "runtime"), appRoot: join(root, "app"),
+    });
+    loader.scan(project);
+    expect(loader.readUiEntrySource(manifest.id, "panel.js")).toContain("export default");
+    expect(loader.hostWorkerEntry(manifest.id)).toBeTruthy();
+    await writeManifest(directory, manifest);
+    loader.scan(project);
+    expect(registry.get(manifest.id)).toBeUndefined();
+    expect(loader.list({ [manifest.id]: true })).toEqual([]);
+    expect(loader.spawnPackages({ [manifest.id]: true })).toEqual([]);
+    expect(loader.hostWorkerEntry(manifest.id)).toBeUndefined();
+    expect(loader.directoryOf(manifest.id)).toBeUndefined();
+    expect(() => loader.readUiEntrySource(manifest.id, "panel.js")).toThrow(/no declared UI entry/);
+  });
+
+  it("keeps Coding backend identity host-owned despite shared enablement and spoofed RPC parameters", async () => {
+    await tempRoot("pipi-ext-product-backend-");
+    const project = join(root, "project");
+    const agent = projectPiAgentDir(project);
+    await simulator(join(agent, "extensions", manifest.id));
+    await writeManifest(join(agent, "extensions", "coding-only"), {
+      id: "coding-only", name: "Coding only", version: "1.0.0", capabilities: [], products: ["pipiui"],
+    });
+    const enabledFile = join(agent, "ext-enabled.json");
+    const enabledText = `${JSON.stringify({
+      schemaVersion: 2, profile: "coding", overrides: { [manifest.id]: "enabled", "coding-only": "enabled" },
+    }, null, 2)}\n`;
+    await writeFile(enabledFile, enabledText);
+    const backend = await backendFor({});
+    try {
+      const added = await backend.handle("addProject", [project]) as { id: string };
+      const listed = await backend.handle("listExtensions" as never, [added.id, { productId: "pipi-hydra" }]) as Listed[];
+      expect(listed.some(item => item.id === manifest.id)).toBe(false);
+      expect(listed.find(item => item.id === "coding-only")?.state).toBe("enabled");
+      await expect(backend.handle("getExtensionUiEntrySource" as never, [manifest.id, "panel.js", added.id]))
+        .rejects.toThrow();
+      await expect(backend.handle("setExtensionEnabled" as never, [manifest.id, true, "project", added.id, "pipi-hydra"]))
+        .rejects.toThrow(/unknown extension/);
+      await expect(backend.handle("invokeExtension" as never, [manifest.id, "simulate", {}, added.id]))
+        .resolves.toMatchObject({ ok: false, error: { code: "not_found" } });
+      expect(await readFile(enabledFile, "utf8")).toBe(enabledText);
+    } finally {
+      await backend.close();
+    }
   });
 });
 
@@ -378,6 +571,43 @@ describe("extension loader via listExtensions", () => {
       name: "App Quota",
       version: "2.0.0",
       source: "app",
+    });
+    await backend.close();
+  });
+
+  it("keeps a bootstrap-registered builtin when a project repeats its id", async () => {
+    await tempRoot("pipi-ext-builtin-authority-");
+    const runtime = join(root, "runtime");
+    const project = join(root, "repo");
+    await writeManifest(join(runtime, "extensions", "grok-build-oauth"), {
+      id: "grok-build-oauth",
+      name: "Bundled Grok",
+      version: "1.0.0",
+      capabilities: [],
+    });
+    await writeManifest(join(projectPiAgentDir(project), "extensions", "grok-build-oauth"), {
+      id: "grok-build-oauth",
+      name: "Project Grok Copy",
+      version: "1.0.0",
+      capabilities: ["bridge.emit"],
+    });
+    await mkdir(project, { recursive: true });
+
+    // PiHostBackend bootstraps the bundled runtime before it learns a project.
+    const backend = await backendFor({ runtime });
+    expect(((await backend.handle("listExtensions" as never, [])) as Listed[])
+      .find((item) => item.id === "grok-build-oauth")).toMatchObject({
+      name: "Bundled Grok",
+      source: "builtin",
+    });
+
+    const added = (await backend.handle("addProject", [project])) as { id: string };
+    const projectView = (await backend.handle("listExtensions" as never, [added.id])) as Listed[];
+    expect(projectView.find((item) => item.id === "grok-build-oauth")).toMatchObject({
+      name: "Bundled Grok",
+      version: "1.0.0",
+      source: "builtin",
+      capabilities: [],
     });
     await backend.close();
   });

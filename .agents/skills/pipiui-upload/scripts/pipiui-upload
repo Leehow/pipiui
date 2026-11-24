@@ -17,6 +17,8 @@ usage: pipiui-upload [options] [file]
   file           publish this existing artifact (.zip/.dmg) under its own name
 
 options:
+  --official-desktop FILE VERSION coding|base x64|arm64   publish an in-app desktop update
+  --official-extension EXTENSION_DIR                       sign and publish a plugin update
   --app <path>   app bundle to zip (default: <repo>/build/PipiUI.app)
   --force        skip the stale-build freshness check
   -h, --help     this help
@@ -24,6 +26,29 @@ EOF
 }
 
 repo_root="${0:A:h:h:h:h:h}"
+# Each channel is exposed only after all immutable payloads have reached the host.
+if [[ "${1:-}" == "--official-desktop" || "${1:-}" == "--official-extension" ]]; then
+  kind="${1#--official-}"
+  shift
+  work=$(mktemp -d)
+  stage=""
+  cleanup_update() {
+    rm -rf "$work"
+    if [[ "$stage" =~ ^/opt/pipiui-relay/downloads/\.update-[A-Za-z0-9]+$ ]]; then
+      /usr/bin/ssh "${ssh_opts[@]}" "root@$host" "rm -rf -- '$stage'" || true
+    fi
+  }
+  trap cleanup_update EXIT
+  node "$repo_root/Electron/scripts/prepare-official-update.mjs" "$kind" "$work" "$@"
+  stage=$(/usr/bin/ssh "${ssh_opts[@]}" "root@$host" "mktemp -d '$remote_dir/.update-XXXXXXXX'")
+  [[ "$stage" =~ ^/opt/pipiui-relay/downloads/\.update-[A-Za-z0-9]+$ ]] || exit 1
+  /usr/bin/scp -q "${ssh_opts[@]}" "$work"/* "root@$host:$stage/"
+  channel=$(/usr/bin/ssh "${ssh_opts[@]}" "root@$host" "python3 - '$stage' '$remote_dir'" < "$repo_root/scripts/activate-official-release.py")
+  curl -fsS --max-time 15 "$base_url/$channel" >/dev/null
+  print "published official update: $base_url/$channel"
+  exit 0
+fi
+
 app_path="$repo_root/build/PipiUI.app"
 force=0
 target=""

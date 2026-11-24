@@ -22,6 +22,7 @@ export type WorktreeDecodeResultV1<T> =
 export type WorktreeTerminalStateV1 = "ok" | "failed" | "aborted" | "interrupted";
 export type WorktreeOwnershipModeV1 = "isolated" | "direct" | "main-session";
 export type WorktreeOwnerRoleV1 = "worker" | "secretary";
+export type WorktreeMergePolicyV1 = "auto" | "never";
 
 /**
  * `command` preserves the worker's attested command text. `argv` is optional
@@ -36,6 +37,8 @@ export type WorktreeVerifyMetadataV1 = {
 };
 
 export type WorktreeOwnershipV1 = {
+	/** Omission preserves legacy auto-merge; never survives all runs and acceptance. */
+	mergePolicy?: WorktreeMergePolicyV1;
 	mode: WorktreeOwnershipModeV1;
 	role: WorktreeOwnerRoleV1;
 	agentId: string;
@@ -348,6 +351,10 @@ export function decodeWorktreeFinalizationInputV1(raw: unknown): WorktreeDecodeR
 		return finish(undefined, diagnostics);
 	}
 	const ownership = raw.worktree.ownership;
+	const mergePolicy = ownership.mergePolicy;
+	if (mergePolicy !== undefined && mergePolicy !== "auto" && mergePolicy !== "never") {
+		diagnostics.push(diagnostic("invalid_merge_policy", "$.worktree.ownership.mergePolicy", "must be auto or never"));
+	}
 	const mode = stringField(ownership, "mode", "$.worktree.ownership", diagnostics, { required: true, min: 1, max: 32 });
 	const role = stringField(ownership, "role", "$.worktree.ownership", diagnostics, { required: true, min: 1, max: 32 });
 	const ownerAgentId = stringField(ownership, "agentId", "$.worktree.ownership", diagnostics, { required: true, min: 1, max: 256 });
@@ -423,6 +430,7 @@ export function decodeWorktreeFinalizationInputV1(raw: unknown): WorktreeDecodeR
 			path: worktreePath,
 			branch,
 			ownership: {
+				...(mergePolicy === "auto" || mergePolicy === "never" ? { mergePolicy } : {}),
 				mode: mode as WorktreeOwnershipModeV1,
 				role: role as WorktreeOwnerRoleV1,
 				agentId: ownerAgentId,

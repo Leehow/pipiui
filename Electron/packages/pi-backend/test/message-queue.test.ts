@@ -24,6 +24,72 @@ function recordingHost() {
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe("SessionMessageQueue", () => {
+  it("accepts a handled input without creating a turn and continues the FIFO", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.enqueue("s1", { text: "command" });
+    queue.enqueue("s1", { text: "next prompt" });
+
+    host.pending[0].resolve({ disposition: "handled" });
+    await flush();
+    expect(host.calls.map(call => call.payload.text)).toEqual(["command", "next prompt"]);
+    expect(queue.listQueue("s1")).toEqual([expect.objectContaining({ text: "next prompt", state: "sending" })]);
+    host.pending[1].resolve({ disposition: "started" });
+    await queue.waitForDispatch("s1");
+    expect(queue.isBusy("s1")).toBe(true);
+    expect(queue.listQueue("s1")).toEqual([]);
+  });
+
+  it("stays idle after a handled input and accepts the next direct send", async () => {
+    const queue = new SessionMessageQueue({ dispatch: async () => ({ disposition: "handled" }) });
+    queue.enqueue("s1", { text: "first command" });
+    await queue.waitForDispatch("s1");
+    expect(queue.isBusy("s1")).toBe(false);
+    expect(queue.enqueue("s1", { text: "second command" }).outcome).toBe("dispatched");
+    await queue.waitForDispatch("s1");
+    expect(queue.isBusy("s1")).toBe(false);
+  });
+
+  it("does not idle a real turn that started before a handled acknowledgement", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.enqueue("s1", { text: "command that starts another turn" });
+    queue.enqueue("s1", { text: "wait for the real turn" });
+    const epoch = queue.markBusy("s1");
+    host.pending[0].resolve({ disposition: "handled" });
+    await queue.waitForDispatch("s1");
+    expect(queue.isTurnActive("s1")).toBe(true);
+    expect(host.calls).toHaveLength(1);
+    const idle = queue.notifyIdle("s1", epoch);
+    expect(host.calls).toHaveLength(2);
+    host.pending[1].resolve({ disposition: "started" });
+    await idle;
+  });
+
+  it("keeps queued and legacy acknowledgements busy until the run settles", async () => {
+    for (const receipt of [{ disposition: "queued" }, undefined]) {
+      const queue = new SessionMessageQueue({ dispatch: async () => receipt });
+      queue.enqueue("s1", { text: "accepted prompt" });
+      await queue.waitForDispatch("s1");
+      expect(queue.isTurnActive("s1")).toBe(true);
+    }
+  });
+
+  it("continues the FIFO when a parked cut-in is handled without a new turn", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const epoch = queue.markBusy("s1");
+    const command = queue.enqueue("s1", { text: "cut-in command" });
+    queue.enqueue("s1", { text: "next prompt" });
+    await queue.cutInMessage("s1", command.message.id);
+    const idle = queue.notifyIdle("s1", epoch);
+    host.pending[0].resolve({ disposition: "handled" });
+    await flush();
+    expect(host.calls.map(call => call.payload.text)).toEqual(["cut-in command", "next prompt"]);
+    host.pending[1].resolve({ disposition: "started" });
+    await idle;
+  });
+
   it("disposes one session idempotently without resurrecting it from a late dispatch", async () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch });

@@ -1,15 +1,15 @@
+import { compareUpdateSemver } from "./extension-update-engine.js";
+import { replaceConfinedDataFile } from "./extension-data-write.js";
 import {
   closeSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
   realpathSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
@@ -139,8 +139,33 @@ function declaredUiEntryPaths(ui: ExtensionUiSummary | undefined): Set<string> {
     ...(ui.settingsSections ?? []).map(item => item.entry),
     ...(ui.views ?? []).map(item => item.entry),
     ...(ui.headerActions ?? []).map(item => item.entry),
+    ...(ui.composerActions ?? []).map(item => item.entry),
   ].filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim()));
   return new Set(entries.map(entry => entry.trim()));
+}
+
+/** Resolve missing data ancestors without following symlinks. Only write callers create dirs. */
+function dataPathWithMissing(projectRoot: string, relativePath: string, createParents = false): string | undefined {
+  const candidate = confinedJoin(projectRoot, relativePath);
+  if (!candidate) return undefined;
+  let current = realpathSync(projectRoot);
+  const parts = relativePath.split("/");
+  for (let i = 0; i < parts.length; i++) {
+    current = join(current, parts[i]);
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || (i < parts.length - 1 && !stat.isDirectory())) return undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      if (createParents && i < parts.length - 1) {
+        try { mkdirSync(current, {mode: 0o700}); }
+        catch (created) { if ((created as NodeJS.ErrnoException).code !== "EEXIST") throw created; }
+        const stat = lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return undefined;
+      }
+    }
+  }
+  return current;
 }
 
 /** Matches runtime prompt-file cap so oversized prompts never enter the snapshot. */
@@ -430,6 +455,16 @@ export function scanActiveSharedExtensionStore(storeRoot: string): DiscoveredExt
   return out.sort((a, b) => a.directoryName.localeCompare(b.directoryName));
 }
 
+function isOfficialSlot(storeRoot: string, pkg: DiscoveredExtensionPackage): boolean {
+  const hash = basename(pkg.directory);
+  const path = join(storeRoot, "extensions", pkg.directoryName, "receipts", hash + ".json");
+  try {
+    const receipt = JSON.parse(readFileSync(path, "utf8"));
+    return receipt.extensionId === pkg.directoryName && receipt.contentHash === hash
+      && receipt.source?.type === "official" && receipt.signature === "ed25519";
+  } catch { return false; }
+}
+
 export function builtinExtensionsRoot(runtimeRoot: string): string {
   return join(runtimeRoot, EXTENSIONS_DIRNAME);
 }
@@ -456,7 +491,20 @@ export function scanExtensionLocations(input: {
   const found: DiscoveredExtensionPackage[] = [];
   if (input.builtinRoot) found.push(...scanExtensionDirectory(input.builtinRoot, "builtin"));
   if (input.appRoot) found.push(...scanExtensionDirectory(input.appRoot, "app"));
-  if (input.sharedStoreRoot) found.push(...scanActiveSharedExtensionStore(input.sharedStoreRoot));
+  if (input.sharedStoreRoot) {
+    for (const pkg of scanActiveSharedExtensionStore(input.sharedStoreRoot)) {
+      const bundled = found.find(item => item.origin === "builtin" && item.directoryName === pkg.directoryName);
+      if (bundled && isOfficialSlot(input.sharedStoreRoot, pkg)) {
+        const seed = readPackage(bundled).validation;
+        const update = readPackage(pkg).validation;
+        if (update.ok && seed.ok && (compareUpdateSemver(update.manifest.version, seed.manifest.version) ?? 0) > 0) {
+          Object.assign(bundled, { directory: pkg.directory, manifestPath: pkg.manifestPath });
+        }
+      } else {
+        found.push(pkg);
+      }
+    }
+  }
   if (input.projectRoot) {
     const jail = projectPiAgentDir(input.projectRoot);
     found.push(...scanExtensionDirectory(projectExtensionsRoot(input.projectRoot), "project", jail));
@@ -465,8 +513,9 @@ export function scanExtensionLocations(input: {
 }
 
 /**
- * Same id: project > app > builtin for instance selection.
- * Builtin files are never replaced on disk; a builtin instance already in the registry wins.
+ * Same unreserved id: project > app > builtin for instance selection.
+ * Bootstrap-registered builtin instances are reserved by the loader: their files are
+ * immutable runtime authority, not project-local override targets.
  */
 export function resolveExtensionInstances(
   packages: readonly DiscoveredExtensionPackage[],
@@ -583,6 +632,8 @@ function invalidateConflictingAgentExtensions(
 
 export type ExtensionLoaderOptions = {
   registry: ExtensionRegistry;
+  /** Trusted host identity, never a project setting or RPC parameter. Unknown hosts fail closed for restricted packages. */
+  productId?: string;
   builtinRoot: string;
   appRoot: string;
   /** App-profile content-addressed store; active slots overlay the app extension root. */
@@ -591,6 +642,7 @@ export type ExtensionLoaderOptions = {
 
 export class ExtensionLoader {
   private readonly registry: ExtensionRegistry;
+  private readonly productId?: string;
   private readonly builtinRoot: string;
   private readonly appRoot: string;
   private readonly sharedStoreRoot?: string;
@@ -608,6 +660,7 @@ export class ExtensionLoader {
 
   constructor(options: ExtensionLoaderOptions) {
     this.registry = options.registry;
+    this.productId = options.productId;
     this.builtinRoot = options.builtinRoot;
     this.appRoot = options.appRoot;
     this.sharedStoreRoot = options.sharedStoreRoot;
@@ -627,7 +680,24 @@ export class ExtensionLoader {
       sharedStoreRoot: this.sharedStoreRoot,
       projectRoot,
     });
-    const resolved = resolveExtensionInstances(discovered, this.reservedBuiltinIds);
+    // `reservedBuiltinIds` contains host-core descriptors known at construction.
+    // Manifest packages enter the registry during the initial project-less bootstrap
+    // scan, so add those runtime-owned ids before a project scan can select a
+    // same-id local copy. Otherwise `loadOne` would retain the enabled builtin
+    // (correctly non-unloadable) and then try to ingest that id a second time.
+    const reservedBuiltinIds = new Set(this.reservedBuiltinIds);
+    for (const record of this.registry.list()) {
+      if (record.origin === "builtin") reservedBuiltinIds.add(record.id);
+    }
+    // Filter before precedence and registry ingestion: a restricted project copy
+    // must neither shadow an eligible app package nor appear in dependency/spawn/UI projections.
+    const eligible = discovered.filter((pkg) => {
+      const { validation } = readPackage(pkg);
+      // Invalid manifests retain their normal error record, never trusted product metadata.
+      if (!validation.ok || !validation.manifest.products) return true;
+      return this.productId !== undefined && validation.manifest.products.includes(this.productId);
+    });
+    const resolved = resolveExtensionInstances(eligible, reservedBuiltinIds);
     const desired = new Set(resolved.map((pkg) => packageId(pkg)));
 
     for (const rec of this.registry.list()) {
@@ -736,6 +806,8 @@ export class ExtensionLoader {
     for (const record of this.registry.list(overlay)) {
       const info = this.agent.get(record.id);
       const item: SpawnRegisteredExtension = { id: record.id, version: record.version, enabled: record.state === "enabled" };
+      const auth = this.auth.get(record.id);
+      if (auth) item.authProviderId = auth.provider.id;
       if (info?.extensionPath) item.extensionPath = info.extensionPath;
       if (info?.skillRoots.length) item.skillRoots = info.skillRoots;
       if (item.enabled && info && !this.contributionRefused(record)) {
@@ -797,7 +869,9 @@ export class ExtensionLoader {
       return existing;
     }
     if (existing) this.drop(descriptor.id);
-    const record = this.registry.ingest(descriptor);
+    const record = this.registry.get(descriptor.id)?.origin === "builtin" && pkg.origin === "builtin"
+      ? this.registry.replaceBuiltinPackage(descriptor)
+      : this.registry.ingest(descriptor);
     this.directories.set(descriptor.id, pkg.directory);
     if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
     else this.ui.delete(descriptor.id);
@@ -882,7 +956,7 @@ export class ExtensionLoader {
    * must stay inside the project. A symlink that points out of the project resolves to
    * undefined rather than to its target.
    */
-  private confinedDataPath(id: string, projectRoot: string, requested: string): string | undefined {
+  private confinedDataPath(id: string, projectRoot: string, requested: string, allowMissing = false): string | undefined {
     const rel = (requested || "").trim();
     if (!rel || rel.includes("..")) return undefined;
     const roots = this.dataRoots(id);
@@ -891,7 +965,7 @@ export class ExtensionLoader {
     const declared = roots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
     if (!declared) return undefined;
     const candidate = confinedJoin(projectRoot, normalized);
-    return candidate ? confinedRealpath(candidate, projectRoot) : undefined;
+    return allowMissing ? dataPathWithMissing(projectRoot, normalized) : candidate ? confinedRealpath(candidate, projectRoot) : undefined;
   }
 
   /**
@@ -915,7 +989,9 @@ export class ExtensionLoader {
     const name = normalized.slice(slash + 1);
     if (!name || name.startsWith(".")) return undefined;
     const parent = confinedJoin(projectRoot, normalized.slice(0, slash));
-    const realParent = parent ? confinedRealpath(parent, projectRoot) : undefined;
+    let realParent = parent ? confinedRealpath(parent, projectRoot) : undefined;
+    if (!realParent && dataPathWithMissing(projectRoot, normalized, true))
+      realParent = parent ? confinedRealpath(parent, projectRoot) : undefined;
     if (!realParent) return undefined;
     return join(realParent, name);
   }
@@ -935,23 +1011,8 @@ export class ExtensionLoader {
       throw new Error(`write is ${bytes} bytes, over the ${EXTENSION_DATA_WRITE_MAX_BYTES} cap`);
     }
     try {
-      const existing = lstatSync(real);
-      if (!existing.isFile()) throw new Error("not a regular file");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw new Error(`extension ${id} data path is not writable`);
-      }
-    }
-    const temp = `${real}.${process.pid}.tmp`;
-    try {
-      writeFileSync(temp, content, { encoding: "utf8", mode: 0o600 });
-      renameSync(temp, real);
+      replaceConfinedDataFile(projectRoot, real, content);
     } catch {
-      try {
-        unlinkSync(temp);
-      } catch {
-        /* nothing to clean up */
-      }
       throw new Error(`extension ${id} data path is not writable`);
     }
     return { bytes };
@@ -987,8 +1048,8 @@ export class ExtensionLoader {
    * Read the tail of one declared file. Tail, not head: these are append-only logs and the
    * panel wants what just happened. Truncation is reported, never silent.
    */
-  readDataFile(id: string, projectRoot: string, path: string, tailBytes?: number): { content: string; bytes: number; truncated: boolean } {
-    const real = this.confinedDataPath(id, projectRoot, path);
+  readDataFile(id: string, projectRoot: string, path: string, tailBytes?: number, allowMissing = false): { content: string; bytes: number; truncated: boolean } {
+    const real = this.confinedDataPath(id, projectRoot, path, allowMissing);
     if (!real) throw new Error(`extension ${id} has no declared data path '${path}'`);
     const cap = Math.min(Math.max(1024, Math.floor(tailBytes ?? EXTENSION_DATA_DEFAULT_TAIL)), EXTENSION_DATA_MAX_BYTES);
     try {
@@ -1008,7 +1069,8 @@ export class ExtensionLoader {
       } finally {
         closeSync(handle);
       }
-    } catch {
+    } catch (error) {
+      if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return {content: "", bytes: 0, truncated: false};
       throw new Error(`extension ${id} data file is unavailable`);
     }
   }

@@ -22,8 +22,8 @@
  *   instead of throwing. `enqueue` while idle dispatches immediately.
  * - `notifyIdle` drains the queue: the head item is delivered with the drain
  *   behavior (default `prompt`, matching Swift's idle-after-settle follow-ups).
- *   A successful delivery marks the session busy again until the next
- *   `notifyIdle`, so the next item is never sent while a turn is streaming.
+ *   A delivery that starts or queues a run stays busy until `notifyIdle`.
+ *   Inputs handled by a command or hook without a run leave the FIFO idle.
  *   A failed delivery keeps the item with its error and continues the FIFO —
  *   the failed item never reached pi, so retrying cannot double-send.
  *   A compaction-in-progress rejection is not a user-facing failure: the item
@@ -43,7 +43,8 @@
  * Attachment objects keep every field (no field loss, mirroring
  * `PromptAttachment` plus any extras).
  */
-import type { TurnTelemetryRendererSample } from "@pipi/host-api";
+import { QueueDispatchError } from "./queue-failure.js";
+import { safeQueueError, type QueueFailureDetails, type TurnTelemetryRendererSample } from "@pipi/host-api";
 
 export type QueuedMessageState = "queued" | "sending" | "failed";
 /** The pi streaming behavior used for a delivery. */
@@ -67,6 +68,7 @@ export type QueuedMessage = {
   turnTelemetry?: TurnTelemetryRendererSample;
   /** Failure detail when `state === "failed"`; cleared again by retry/edit. */
   error?: string;
+  failureDetails?: QueueFailureDetails;
 };
 export type EnqueueInput = { text: string; attachments?: QueuedAttachment[]; turnTelemetry?: TurnTelemetryRendererSample };
 export type EnqueueResult = { outcome: "queued" | "dispatched"; message: QueuedMessage };
@@ -132,6 +134,9 @@ type DeliveryWaiter = {
 const snapshot = <T>(value: T): T => structuredClone(value);
 const freeze = <T extends object>(value: T): T => Object.freeze(value);
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+function queueFailure(error: unknown) {
+  return { error: safeQueueError(errorMessage(error)), failureDetails: error instanceof QueueDispatchError ? error.details : undefined };
+}
 const isCompactionInProgressError = (error: unknown): boolean =>
   /compaction is in progress/i.test(errorMessage(error));
 
@@ -425,7 +430,7 @@ export class SessionMessageQueue {
     const session = this.state(sessionId, lifecycleToken);
     session.suppressDrainEpoch = session.turnEpoch;
     session.deliveryEpoch += 1;
-    const restore = (item: QueuedMessage) => freeze({ ...item, state: "queued" as const, error: undefined });
+    const restore = (item: QueuedMessage) => freeze({ ...item, state: "queued" as const, error: undefined, failureDetails: undefined });
     if (session.pendingCutIn) {
       const item = session.pendingCutIn;
       session.pendingCutIn = undefined;
@@ -453,6 +458,7 @@ export class SessionMessageQueue {
       attachments: snapshot(item.attachments ?? []),
       state: item.state === "failed" ? ("failed" as const) : ("queued" as const),
       error: item.state === "failed" ? item.error : undefined,
+      failureDetails: item.state === "failed" ? item.failureDetails : undefined,
     }));
     session.acceptedMessages = [];
     session.turnActive = false;
@@ -541,7 +547,7 @@ export class SessionMessageQueue {
     if (current.state === "sending") throw new Error(`message ${id} is already sending`);
     if (session.dispatching) throw new Error(`session ${sessionId} is already delivering a message`);
     if (!session.turnActive) {
-      const promoted = freeze({ ...current, state: "queued" as const, error: undefined });
+      const promoted = freeze({ ...current, state: "queued" as const, error: undefined, failureDetails: undefined });
       session.items.splice(index, 1);
       session.items.unshift(promoted);
       if (!session.compactionActive) void this.drain(sessionId, session.lifecycleToken);
@@ -549,7 +555,7 @@ export class SessionMessageQueue {
     }
     session.dispatching = true;
     const deliveryEpoch = session.deliveryEpoch;
-    const sending = freeze({ ...current, state: "sending" as const, error: undefined });
+    const sending = freeze({ ...current, state: "sending" as const, error: undefined, failureDetails: undefined });
     session.items[index] = sending;
     this.changed(sessionId, session);
     const delivery = this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments, turnTelemetry: sending.turnTelemetry }, "steer", session.lifecycleToken);
@@ -563,8 +569,8 @@ export class SessionMessageQueue {
     } catch (error) {
       if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return snapshot(sending);
       const kept = isCompactionInProgressError(error)
-        ? freeze({ ...sending, state: "queued" as const, error: undefined })
-        : freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
+        ? freeze({ ...sending, state: "queued" as const, error: undefined, failureDetails: undefined })
+        : freeze({ ...sending, state: "failed" as const, ...queueFailure(error) });
       if (session.items[index]?.id === id) session.items[index] = kept;
       this.changed(sessionId, session);
       return snapshot(kept);
@@ -597,7 +603,7 @@ export class SessionMessageQueue {
     if (current.state === "sending") throw new Error(`message ${id} is already sending`);
     if (session.dispatching) throw new Error(`session ${sessionId} is already delivering a message`);
     if (!session.turnActive) {
-      const promoted = freeze({ ...current, state: "queued" as const, error: undefined });
+      const promoted = freeze({ ...current, state: "queued" as const, error: undefined, failureDetails: undefined });
       session.items.splice(index, 1);
       session.items.unshift(promoted);
       if (session.compactionActive) {
@@ -606,12 +612,13 @@ export class SessionMessageQueue {
       }
       const delivery = this.send(sessionId, promoted, this.drainBehavior, session.lifecycleToken);
       session.dispatchPromise = this.trackDispatch(session, delivery);
-      await delivery;
+      const outcome = await delivery;
       if (this.isCurrentSession(sessionId, session) && session.dispatchPromise) session.dispatchPromise = undefined;
+      if (outcome === "handled") await this.drain(sessionId, session.lifecycleToken);
       const stored = session.items.find((item) => item.id === id);
       return snapshot(stored ?? { ...promoted, state: "sending" as const });
     }
-    const sending = freeze({ ...current, state: "sending" as const, error: undefined });
+    const sending = freeze({ ...current, state: "sending" as const, error: undefined, failureDetails: undefined });
     session.items.splice(index, 1);
     session.pendingCutIn = sending;
     this.changed(sessionId, session);
@@ -625,7 +632,7 @@ export class SessionMessageQueue {
     if (index < 0) throw new Error(`unknown queued message ${id}`);
     const current = session.items[index];
     if (current.state !== "failed") throw new Error(`message ${id} is ${current.state}; only failed messages can be retried`);
-    const retried = freeze({ ...current, state: "queued" as const, error: undefined });
+    const retried = freeze({ ...current, state: "queued" as const, error: undefined, failureDetails: undefined });
     session.items.splice(index, 1);
     session.items.unshift(retried);
     this.changed(sessionId, session);
@@ -738,12 +745,13 @@ export class SessionMessageQueue {
     const item = session.pendingCutIn;
     if (!item || session.dispatching || session.turnActive || session.compactionActive) return;
     session.pendingCutIn = undefined;
-    session.items.unshift(freeze({ ...item, state: "queued" as const, error: undefined }));
+    session.items.unshift(freeze({ ...item, state: "queued" as const, error: undefined, failureDetails: undefined }));
     const delivery = this.send(sessionId, session.items[0], this.drainBehavior, session.lifecycleToken);
     const acknowledgement = this.trackDispatch(session, delivery);
     session.dispatchPromise = acknowledgement;
-    await delivery;
+    const outcome = await delivery;
     if (this.isCurrentSession(sessionId, session) && session.dispatchPromise === acknowledgement) session.dispatchPromise = undefined;
+    if (outcome === "handled") await this.drain(sessionId, session.lifecycleToken);
   }
 
   /**
@@ -766,34 +774,41 @@ export class SessionMessageQueue {
     const delivery = this.send(sessionId, session.items[index], this.drainBehavior, session.lifecycleToken);
     const acknowledgement = this.trackDispatch(session, delivery);
     session.dispatchPromise = acknowledgement;
-    const delivered = await delivery;
+    const outcome = await delivery;
     if (this.isCurrentSession(sessionId, session) && session.dispatchPromise === acknowledgement) session.dispatchPromise = undefined;
     if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return;
-    if (!delivered && !session.turnActive && !session.dispatching) await this.drain(sessionId, session.lifecycleToken);
+    if (outcome !== "active" && !session.turnActive && !session.dispatching) await this.drain(sessionId, session.lifecycleToken);
   }
 
   /**
    * Single-flight delivery of one item. On success the item leaves the queue
-   * (delivered) and the session is marked busy — the turn is streaming until
-   * the host reports idle. On failure the item is kept with its error.
+   * (delivered). A handled input leaves the session idle; an accepted model
+   * run stays busy until the host reports idle. Failed inputs keep their row.
    */
-  private async send(sessionId: string, item: QueuedMessage, behavior: DispatchBehavior, lifecycleToken?: unknown): Promise<boolean> {
+  private async send(sessionId: string, item: QueuedMessage, behavior: DispatchBehavior, lifecycleToken?: unknown): Promise<"active" | "handled" | "failed"> {
     const session = this.currentState(sessionId, lifecycleToken);
-    if (!session) return false;
+    if (!session) return "failed";
     session.dispatching = true;
     const deliveryEpoch = session.deliveryEpoch;
-    const sending = freeze({ ...item, state: "sending" as const, error: undefined });
+    const sending = freeze({ ...item, state: "sending" as const, error: undefined, failureDetails: undefined });
     const index = session.items.findIndex((candidate) => candidate.id === item.id);
     if (index >= 0) session.items[index] = sending;
     this.changed(sessionId, session);
     try {
-      await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments, turnTelemetry: sending.turnTelemetry }, behavior, session.lifecycleToken);
-      if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return false;
+      const receipt = await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments, turnTelemetry: sending.turnTelemetry }, behavior, session.lifecycleToken);
+      if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return "failed";
       session.acceptedMessages = [
         ...session.acceptedMessages.filter(accepted => accepted.id !== sending.id),
         sending,
       ].slice(-64);
       if (index >= 0 && session.items[index]?.id === item.id) session.items.splice(index, 1);
+      // Pi may handle a command/input hook without starting an agent run. Accept
+      // that input, but do not create a busy epoch or wait for a nonexistent settle.
+      // A real agent_start that raced the receipt still owns its existing epoch.
+      if (receipt && typeof receipt === "object" && (receipt as { disposition?: unknown }).disposition === "handled") {
+        this.changed(sessionId, session);
+        return session.turnActive ? "active" : "handled";
+      }
       // Mint an epoch only when this delivery is the thing that starts the turn.
       // A cut-in send needs one, so the aborted turn's late idle cannot clear the
       // turn it just started. But when the host already marked the session busy —
@@ -805,18 +820,18 @@ export class SessionMessageQueue {
       session.turnActive = true;
       session.suppressDrainEpoch = undefined;
       this.changed(sessionId, session);
-      return true;
+      return "active";
     } catch (error) {
-      if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return false;
+      if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return "failed";
       if (index >= 0 && session.items[index]?.id === item.id) {
         // Pi rejects prompts mid-compaction. Keep the item queued and let
         // `clearCompacting` / a later idle drain retry — never a send failure.
         session.items[index] = isCompactionInProgressError(error)
-          ? freeze({ ...sending, state: "queued" as const, error: undefined })
-          : freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
+          ? freeze({ ...sending, state: "queued" as const, error: undefined, failureDetails: undefined })
+          : freeze({ ...sending, state: "failed" as const, ...queueFailure(error) });
       }
       this.changed(sessionId, session);
-      return false;
+      return "failed";
     } finally {
       if (this.isCurrentSession(sessionId, session) && session.deliveryEpoch === deliveryEpoch) session.dispatching = false;
     }

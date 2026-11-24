@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxProvider, fauxAssistantMessage, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { registerContextSelector } from "../../../resources/runtime/extensions/jev-optimizer/agent/context-selector.ts";
 import { buildContextDecision, executeContextDecision, parseContextDecision } from "../../../resources/runtime/extensions/jev-optimizer/agent/context-decision.ts";
 import { contextCatalog, expandSelection, materializeLayer, SNAPSHOT_ENTRY } from "../../../resources/runtime/extensions/jev-optimizer/agent/context-catalog.ts";
@@ -63,7 +63,10 @@ async function fixture(options: { selected?: string[]; fail?: boolean; manager?:
   sessions.push(session);
   await session.bindExtensions({ onError: (error: unknown) => errors.push(error) });
   const respond = (content: any = "done") => faux.appendResponses([(context: any) => {
-    providerContexts.push(JSON.parse(JSON.stringify(context))); return fauxAssistantMessage(content);
+    const transcript = JSON.parse(JSON.stringify(context));
+    providerContexts.push({ ...transcript, systemPrompt: getCurrentSystemPrompt(transcript.messages),
+      tools: getCurrentTools(transcript.messages) });
+    return fauxAssistantMessage(content);
   }]);
   const ask = async (text: string) => { respond(); await session.prompt(text); expect(errors).toEqual([]);
     expect(session.messages.filter((m: any) => m.role === "assistant" && m.stopReason === "error").map((m: any) => m.errorMessage)).toEqual([]); };

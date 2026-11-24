@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { PiCommand, RuntimeAssets } from '@pipi/pi-backend'
+import backendPackage from '../../../../packages/pi-backend/package.json'
 
 export interface AssetLookup {
   /** `app.isPackaged`. Decides whether the shipped copies or the repository are authoritative. */
@@ -62,7 +63,7 @@ export function materializeDetachedDarwinHost(source: string, destDir: string | 
 
 export const EMBEDDED_NODE_VERSION = '24.19.0'
 export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
-  '@earendil-works/pi-coding-agent': '0.84.2',
+  '@earendil-works/pi-coding-agent': backendPackage.dependencies['@earendil-works/pi-coding-agent'],
   'pi-web-access': '0.28.0',
   'pi-mcp-extension': '1.5.0',
   'pi-hermes-memory': '0.9.8',
@@ -199,7 +200,9 @@ export function resolveRuntimeAssets(lookup: AssetLookup): ResolvedAssets {
     return {
       sourceRoot,
       cuaDriver: resolveCua(env.PIPIUI_CUA_DRIVER_PATH ?? join(root, 'cua-driver', driverName)),
-      ...resolveEmbeddedPi(join(root, 'pipiui-embedded'), env, platform, arch, lookup.userData)
+      // NSIS install/uninstall still uses MAX_PATH-limited shell operations.
+      // Keep the complete SDK hierarchy under a short Windows resource root.
+      ...resolveEmbeddedPi(join(root, platform === 'win32' ? 'pi' : 'pipiui-embedded'), env, platform, arch, lookup.userData)
     }
   }
   // apps/electron/out/main -> out -> electron -> apps -> Electron.

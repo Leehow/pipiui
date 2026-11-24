@@ -70,7 +70,10 @@ export const createAuthProvider = () => ({ name: 'Fake Ext', api: 'openai-comple
       await mkdir(outside, { recursive: true })
       await writeFile(join(outside, 'provider.js'), `
 export const AUTH_PROVIDER_ID = 'fake-outside'
-export const createAuthProvider = () => ({ name: 'Fake Outside', api: 'openai-completions', baseUrl: 'https://example.invalid', models: [] })
+export const createAuthProvider = async () => {
+  await new Promise(resolve => setTimeout(resolve, 5));
+  return { name: 'Fake Outside', api: 'openai-completions', baseUrl: 'https://example.invalid', models: [] };
+}
 `)
       const { stdout } = await execFileAsync(process.execPath, [helperPath, 'list-providers'], {
         env: {
