@@ -61,7 +61,10 @@ jobs:
           version="${RELEASE_TAG#release-win-}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must be release-win-<x.y.z>, got $RELEASE_TAG" >&2; exit 1; }
           node scripts/fetch-cua-driver.mjs
-          node scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64 --config.extraMetadata.version="$version"
+          # node-pty was already rebuilt for Electron by install-app-deps (and ships
+          # N-API win32 prebuilds); electron-builder's second rebuild links winpty
+          # against a mismatched MSVC STL on the hosted image, so skip it.
+          node scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64 --config.extraMetadata.version="$version" --config.npmRebuild=false
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
