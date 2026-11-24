@@ -2,7 +2,7 @@ import type { ExtensionComponentUpdateResult, HostBackend, UpdateCenterItem, Upd
 
 /** Build-time tools are not shipped as runtime dependencies, so keep their resolved versions explicit and test them against the lockfile. */
 export const UPDATE_CENTER_FRAMEWORK_VERSIONS = {
-  electron: '44.0.0',
+  electron: '45.4.1',
   vite: '7.3.6',
   'electron-vite': '5.0.0'
 } as const

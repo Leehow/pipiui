@@ -152,8 +152,18 @@ function nativeArchitectures(bytes, platform) {
   return []
 }
 
+// better-sqlite3 >=13 is a Node-API addon that ships one prebuilt binary per
+// target under `prebuilds/` (ABI-independent, so the same file loads in
+// standalone Node and in Electron). A node-gyp build in `build/Release` still
+// wins at load time when present, so inspect exactly what the loader picks.
+function sqlitePrebuildsToKeep(platform, arch) {
+  return platform === 'linux' ? [`linux-${arch}.node`, `linuxmusl-${arch}.node`] : [`${platform}-${arch}.node`]
+}
+
 async function inspectHermesNative(nodeModules, { platform, arch }) {
-  const addon = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+  const sqliteRoot = join(nodeModules, 'better-sqlite3')
+  const compiled = join(sqliteRoot, 'build', 'Release', 'better_sqlite3.node')
+  const addon = (await isFile(compiled)) ? compiled : join(sqliteRoot, 'prebuilds', `${platform}-${arch}.node`)
   let bytes
   try { bytes = await readFile(addon) } catch { return { ok: false, reason: `better-sqlite3 native addon is missing: ${addon}` } }
   const architectures = nativeArchitectures(bytes, platform)
@@ -194,6 +204,7 @@ function unusedRuntimeDirectory(name, parent, target) {
 
 async function pruneRuntimeTree(root, { platform, arch }) {
   const keptPrebuilds = new Set(koffiPrebuildsToKeep(platform, arch))
+  const keptSqlitePrebuilds = new Set(sqlitePrebuildsToKeep(platform, arch))
   let removed = 0
   // koffi lays its prebuilt binaries out as `koffi/build/koffi/<platform>_<arch>`.
   const walk = async (dir, insideDocs, holdsPrebuilds) => {
@@ -223,6 +234,12 @@ async function pruneRuntimeTree(root, { platform, arch }) {
         continue
       }
       if (!entry.isFile()) continue
+      if (entry.name.endsWith('.node') && basename(dir) === 'prebuilds' && basename(dirname(dir)) === 'better-sqlite3'
+        && !keptSqlitePrebuilds.has(entry.name)) {
+        await rm(path, { force: true })
+        removed += 1
+        continue
+      }
       if (insideDocs && entry.name.endsWith('.md')) continue
       if (!PRUNABLE_FILE.test(entry.name)) continue
       await rm(path, { force: true })

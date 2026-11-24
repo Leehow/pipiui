@@ -20,7 +20,7 @@ describe('persistent embedded Pi runtime CLI', () => {
     const nodeModules = join(target, 'pi', 'lib', 'node_modules')
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
     const hermes = join(nodeModules, 'pi-hermes-memory', 'package.json')
-    const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+    const sqliteNative = join(nodeModules, 'better-sqlite3', 'prebuilds', `${platform}-${arch}.node`)
     const launcher = join(target, 'pi', 'bin', 'pi')
     await Promise.all([
       mkdir(join(node, '..'), { recursive: true }),
@@ -62,7 +62,7 @@ describe('persistent embedded Pi runtime CLI', () => {
       schemaVersion: 1,
       platform,
       arch,
-      nodeVersion: '24.19.0',
+      nodeVersion: '26.13.1',
       nodeExecutable: 'node/bin/node',
       piCli: 'pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
       piLauncher: 'pi/bin/pi',
@@ -221,7 +221,7 @@ describe('persistent embedded Pi runtime CLI', () => {
 
     await mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true })
     await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.11.0' }))
-    const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+    const sqliteNative = join(nodeModules, 'better-sqlite3', 'prebuilds', 'darwin-arm64.node')
     const wrongHeader = Buffer.alloc(32)
     wrongHeader.writeUInt32LE(0xfeedfacf, 0)
     wrongHeader.writeUInt32LE(0x01000007, 4)
@@ -240,7 +240,7 @@ describe('persistent embedded Pi runtime CLI', () => {
 
     const armCheck = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
     expect(armCheck.status).toBe(1)
-    expect(armCheck.stderr).toContain('Node is 22.18.0, expected 24.19.0')
+    expect(armCheck.stderr).toContain('Node is 22.18.0, expected 26.13.1')
     const x64Check = run(['--platform', 'darwin', '--arch', 'x64', '--check'], '')
     expect(x64Check.status).toBe(0)
   })

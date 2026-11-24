@@ -61,7 +61,7 @@ export function materializeDetachedDarwinHost(source: string, destDir: string | 
   }
 }
 
-export const EMBEDDED_NODE_VERSION = '24.19.0'
+export const EMBEDDED_NODE_VERSION = '26.13.1'
 export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   '@earendil-works/pi-coding-agent': backendPackage.dependencies['@earendil-works/pi-coding-agent'],
   'pi-web-access': '0.48.0',
