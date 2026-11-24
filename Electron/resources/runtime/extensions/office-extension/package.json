@@ -24,7 +24,7 @@
     "@pipiui/extension-api": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
     "@file-viewer/vite-plugin": "^2.2.8",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^18.3.12",

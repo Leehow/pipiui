@@ -10316,6 +10316,8 @@ export class PiHostBackend implements HostBackend {
       "google-gemini-cli",
       "github-copilot",
       "amazon-bedrock",
+      "azure",
+      // Pre-1.0.3 id of the same provider; keep it reserved for old configs.
       "azure-openai-responses",
       "openai-codex",
       "xai",

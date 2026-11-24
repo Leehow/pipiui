@@ -408,6 +408,9 @@ export function registerPlanDrive(pi: ExtensionAPI, deps: DriveDeps): PlanDriver
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    // Pi ≥1.2 also fires this for extension-triggered custom-message runs, which carry
+    // no prompt. Leave the drive's ownership state alone for them, as before 1.2.
+    if ((event as { messageType?: string }).messageType === "custom") return;
     driver.noteAgentStart(event.prompt);
     const plan = deps.readActivePlan(ctx as DriveContext);
     if (!planIsDrivable(plan)) return;

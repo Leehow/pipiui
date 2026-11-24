@@ -352,6 +352,10 @@ export function registerGoalLifecycle(
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		// Pi ≥1.2 also fires this for runs started by `sendMessage(..., { triggerTurn: true })`
+		// (subagent notifications and the like). Those carry no prompt; ownership of such
+		// custom runs is settled at agent_start / the context boundary, as before 1.2.
+		if ((event as { messageType?: string }).messageType === "custom") return;
 		runtime.clearAgentRun();
 		// Pi-owned retries emit agent_start directly. Reaching a normal prompt
 		// boundary means cleanup no longer owns the next run, so the hard-cap guard

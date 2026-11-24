@@ -4,7 +4,7 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
 {
   "properties": {
     "answerModel": {
-      "description": "Optional provider/model-id override for mode answer. Defaults to fetch.answerProvider + fetch.answerModel when configured, otherwise the current Pi model.",
+      "description": "provider/model-id for answer mode",
       "type": "string",
     },
     "auth": {
@@ -16,20 +16,20 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
           "type": "boolean",
         },
       ],
-      "description": "Opt into an authFetch profile for local browser-cookie fetching. Use a profile name, or true only when exactly one profile exists.",
+      "description": "authFetch profile name, or true for the only one",
     },
     "forceClone": {
-      "description": "Force cloning large GitHub repositories that exceed the size threshold",
+      "description": "Clone GitHub repos over the size limit",
       "type": "boolean",
     },
     "frames": {
-      "description": "Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video.",
+      "description": "Frames over a range, 5s apart from one time, or over the video",
       "maximum": 12,
       "minimum": 1,
       "type": "integer",
     },
     "mode": {
-      "description": "Fetch mode: readable (default extraction), raw (exact textual HTTP body), or answer (answer prompt using only fetched content).",
+      "description": "readable (default): extract readable content as markdown; raw: return the exact textual body using direct HTTP only; answer: answer a prompt using only fetched content.",
       "enum": [
         "readable",
         "raw",
@@ -38,27 +38,32 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
       "type": "string",
     },
     "model": {
-      "description": "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-3.6-flash'). Defaults to config or gemini-3.6-flash.",
+      "description": "Gemini model for video analysis",
       "type": "string",
     },
     "prompt": {
-      "description": "Question or instruction for video analysis, or the page-local question required by mode answer.",
+      "description": "Question for video analysis or answer mode",
       "type": "string",
     },
     "proxy": {
-      "description": "http(s) proxy URL (e.g. http://host:port) used for this fetch. Needed when the target is unreachable directly; localhost and NO_PROXY hosts always bypass the proxy. Empty string forces direct access.",
+      "description": "Proxy URL; omit by default; "" forces direct",
+      "type": "string",
+    },
+    "redirects": {
+      "description": "Refuse cross-origin redirects",
+      "enum": [
+        "same-origin",
+      ],
       "type": "string",
     },
     "timestamp": {
-      "description": "Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame.",
+      "description": "Video frame time ('1:23:45') or range ('23:41-25:00'); needs ffmpeg",
       "type": "string",
     },
     "url": {
-      "description": "Single URL to fetch",
       "type": "string",
     },
     "urls": {
-      "description": "Multiple URLs (parallel)",
       "items": {
         "type": "string",
       },
@@ -73,7 +78,6 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
 {
   "properties": {
     "findMode": {
-      "description": "Matching mode for findText (default: case-insensitive). Requires findText.",
       "enum": [
         "exact",
         "case-insensitive",
@@ -99,38 +103,32 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
           "type": "array",
         },
       ],
-      "description": "Text or texts to find in the selected stored content. When supplied, offset and limit are ignored.",
+      "description": "Find passages instead of paging",
     },
     "limit": {
-      "description": "Maximum characters to return for fetched URL content slices (default and max are set by maxInlineContentChars). Ignored when findText is supplied.",
+      "description": "Characters, default the maximum",
       "maximum": 30000,
       "minimum": 1,
       "type": "integer",
     },
     "offset": {
-      "description": "Character offset for fetched URL content slices (default 0). Ignored when findText is supplied.",
       "minimum": 0,
       "type": "integer",
     },
     "query": {
-      "description": "Get content for this query (web_search)",
       "type": "string",
     },
     "queryIndex": {
-      "description": "Get content for query at index",
       "minimum": 0,
       "type": "integer",
     },
     "responseId": {
-      "description": "The responseId from web_search, source_check, or fetch_content",
       "type": "string",
     },
     "url": {
-      "description": "Get content for this URL",
       "type": "string",
     },
     "urlIndex": {
-      "description": "Get content for URL at index",
       "minimum": 0,
       "type": "integer",
     },
@@ -146,118 +144,42 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
 {
   "properties": {
     "claim": {
-      "description": "The assertion to check against web sources.",
+      "description": "Assertion to check",
       "type": "string",
     },
     "domainFilter": {
-      "description": "Limit to domains; prefix with - to exclude.",
+      "description": "Prefix - to exclude",
       "items": {
         "type": "string",
       },
       "type": "array",
     },
     "fetchContent": {
-      "description": "Fetch up to 5 result pages for exact passage extraction.",
+      "description": "Fetch top 5 pages for exact passages",
       "type": "boolean",
     },
     "numResults": {
-      "description": "Results per query (default: 5, max: 20).",
+      "description": "Default 5",
       "maximum": 20,
       "minimum": 1,
       "type": "integer",
     },
     "provider": {
-      "anyOf": [
-        {
-          "enum": [
-            "auto",
-            "all",
-            "openai",
-            "brave",
-            "parallel",
-            "parallel-mcp",
-            "tinyfish",
-            "search1api",
-            "searchinfinity",
-            "querit",
-            "tavily",
-            "firecrawl",
-            "jina",
-            "searxng",
-            "duckduckgo",
-            "perplexity",
-            "gemini",
-            "kimi",
-            "exa",
-            "serpdive",
-            "kagi",
-            "ollama",
-            "anysearch",
-            "xai",
-            "mistral",
-            "brightdata",
-            "serpbase",
-            "serper",
-            "valyu",
-            "bocha",
-            "xcrawl",
-          ],
-          "type": "string",
-        },
-        {
-          "items": {
-            "enum": [
-              "openai",
-              "brave",
-              "parallel",
-              "parallel-mcp",
-              "tinyfish",
-              "search1api",
-              "searchinfinity",
-              "querit",
-              "tavily",
-              "firecrawl",
-              "jina",
-              "searxng",
-              "duckduckgo",
-              "perplexity",
-              "gemini",
-              "kimi",
-              "exa",
-              "serpdive",
-              "kagi",
-              "ollama",
-              "anysearch",
-              "xai",
-              "mistral",
-              "brightdata",
-              "serpbase",
-              "serper",
-              "valyu",
-              "bocha",
-              "xcrawl",
-            ],
-            "type": "string",
-          },
-          "minItems": 1,
-          "type": "array",
-        },
-      ],
-      "description": "Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, Valyu, xAI, Mistral, Bright Data, SerpBase, and Serper",
+      "description": "auto, all, a name, or comma-separated names; omit for the configured default.",
+      "type": "string",
     },
     "proxy": {
-      "description": "http(s) proxy URL (e.g. http://host:port) used for every outbound request in this call (search APIs and result-page fetches). Empty string forces direct access.",
+      "description": "Proxy URL; omit by default; "" forces direct",
       "type": "string",
     },
     "queries": {
-      "description": "Search queries (default: the claim).",
+      "description": "Default: the claim",
       "items": {
         "type": "string",
       },
       "type": "array",
     },
     "recencyFilter": {
-      "description": "Filter by recency.",
       "enum": [
         "day",
         "week",
@@ -277,119 +199,50 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
 exports[`web-access-extension schema snapshot > extension-mounted schemas are identical to the pinned package and snapshotted > web_search schema 1`] = `
 {
   "properties": {
+    "category": {
+      "description": "Exa only, e.g. news",
+      "type": "string",
+    },
     "domainFilter": {
-      "description": "Limit to domains (prefix with - to exclude)",
+      "description": "Prefix - to exclude",
       "items": {
         "type": "string",
       },
       "type": "array",
     },
     "includeContent": {
-      "description": "Fetch full page content (async)",
+      "description": "Also fetch full page content",
       "type": "boolean",
     },
+    "model": {
+      "description": "Model ID; needs provider openai, gemini, xai, mistral",
+      "type": "string",
+    },
     "numResults": {
-      "description": "Results per query (default: 5, max: 20)",
+      "description": "Default 5",
       "maximum": 20,
       "minimum": 1,
       "type": "integer",
     },
     "provider": {
-      "anyOf": [
-        {
-          "enum": [
-            "auto",
-            "all",
-            "openai",
-            "brave",
-            "parallel",
-            "parallel-mcp",
-            "tinyfish",
-            "search1api",
-            "searchinfinity",
-            "querit",
-            "tavily",
-            "firecrawl",
-            "jina",
-            "searxng",
-            "duckduckgo",
-            "perplexity",
-            "gemini",
-            "kimi",
-            "exa",
-            "serpdive",
-            "kagi",
-            "ollama",
-            "anysearch",
-            "xai",
-            "mistral",
-            "brightdata",
-            "serpbase",
-            "serper",
-            "valyu",
-            "bocha",
-            "xcrawl",
-          ],
-          "type": "string",
-        },
-        {
-          "items": {
-            "enum": [
-              "openai",
-              "brave",
-              "parallel",
-              "parallel-mcp",
-              "tinyfish",
-              "search1api",
-              "searchinfinity",
-              "querit",
-              "tavily",
-              "firecrawl",
-              "jina",
-              "searxng",
-              "duckduckgo",
-              "perplexity",
-              "gemini",
-              "kimi",
-              "exa",
-              "serpdive",
-              "kagi",
-              "ollama",
-              "anysearch",
-              "xai",
-              "mistral",
-              "brightdata",
-              "serpbase",
-              "serper",
-              "valyu",
-              "bocha",
-              "xcrawl",
-            ],
-            "type": "string",
-          },
-          "minItems": 1,
-          "type": "array",
-        },
-      ],
-      "description": "Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, Valyu, xAI, Mistral, Bright Data, SerpBase, and Serper, omit this field to use the configured provider, or use auto when none is configured",
+      "description": "auto, all, a name, or comma-separated names; omit for the configured default.",
+      "type": "string",
     },
     "proxy": {
-      "description": "http(s) proxy URL (e.g. http://host:port) used for every outbound request in this call (search APIs and content fetches). Node fetch ignores HTTP(S)_PROXY env vars, so set this (or \`proxy\` in web-search.json) when direct access is blocked; empty string forces direct access.",
+      "description": "Proxy URL; omit by default (env proxy vars ignored); "" forces direct",
       "type": "string",
     },
     "queries": {
-      "description": "Multiple queries searched concurrently (up to three at a time), each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results).",
+      "description": "Run concurrently (up to three at a time); vary the angle",
       "items": {
         "type": "string",
       },
       "type": "array",
     },
     "query": {
-      "description": "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead.",
       "type": "string",
     },
     "recencyFilter": {
-      "description": "Filter by recency",
       "enum": [
         "day",
         "week",
@@ -399,7 +252,7 @@ exports[`web-access-extension schema snapshot > extension-mounted schemas are id
       "type": "string",
     },
     "workflow": {
-      "description": "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator",
+      "description": "Default none; summary-review opens the curator; auto-summary summarizes",
       "enum": [
         "none",
         "summary-review",

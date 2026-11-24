@@ -63,7 +63,9 @@ export function registerContextSelector(pi: ExtensionAPI, deps: JevDeps, gate: R
       && Array.isArray(data.toolInfo) && Array.isArray(data.supplements)) {
       snapshot = structuredClone(data);
       // Restored sessions may have different enabled tools. Never resurrect disabled tools.
-      const available = new Set(pi.getActiveTools());
+      // Check registration, not activation: Pi ≥1.4 restores the branch's recorded active
+      // set on resume (the narrowed loadout), while excluded/disabled tools are never registered.
+      const available = new Set(pi.getAllTools().map(tool => tool.name));
       if (snapshot.authority.some(name => !available.has(name)) || snapshot.model !== modelKey(ctx)
         || snapshot.toolSignature !== toolSignature(pi, snapshot.authority)) {
         snapshot = undefined;
