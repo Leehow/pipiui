@@ -27,7 +27,7 @@ import {
   type ComputerImagePipeline,
 } from "./computer-image-pipeline.js";
 
-export const CUA_DRIVER_VERSION = "0.28.0";
+export const CUA_DRIVER_VERSION = "0.61.2";
 /** Model-delivered screenshots never exceed this long edge (Anthropic tool_result image budget). */
 export const MAX_SCREENSHOT_LONG_EDGE = 1568;
 /** The complete set of batch action types this host can execute — the model-facing schema must match. */
@@ -1826,6 +1826,9 @@ export class CuaDriverHost {
         window_id: target.window_id,
         max_elements: 2000,
         max_depth: 25,
+        // Driver ≥0.48 defaults to markdown-only and drops structuredContent.elements,
+        // which actionable context and focus confirmation read.
+        tree_format: "both",
       }),
     );
   }
