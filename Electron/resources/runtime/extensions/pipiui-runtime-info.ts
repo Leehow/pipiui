@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { closeSync, constants as fsConstants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, openSync, writeSync } from "node:fs";
 import { Type } from "typebox";
@@ -216,7 +216,29 @@ function writeRuntimeDebugSnapshot(
   }
 }
 
+// The RPC host creates the SettingsManager before extensions load. Scope the
+// chat retry budget to that manager, including after project settings reload.
+const retryBinding = Symbol.for("pipiui.rpcRetryBudget");
+function installRpcRetryBudget() {
+  const proto = AgentSession.prototype;
+  if (retryBinding in proto.bindExtensions) return;
+  const bind = proto.bindExtensions;
+  proto.bindExtensions = function (bindings) {
+    const manager = this.settingsManager;
+    if (bindings.mode === "rpc" && !(retryBinding in manager)) {
+      const settings = manager.getRetrySettings.bind(manager);
+      const provider = manager.getProviderRetrySettings.bind(manager);
+      manager.getRetrySettings = () => ({ ...settings(), enabled: true, maxRetries: 2 });
+      manager.getProviderRetrySettings = () => ({ ...provider(), maxRetries: 0 });
+      Object.defineProperty(manager, retryBinding, { value: true });
+    }
+    return bind.call(this, bindings);
+  };
+  Object.defineProperty(proto.bindExtensions, retryBinding, { value: true });
+}
+
 export default function (pi: ExtensionAPI) {
+  if (process.env.PIPIUI_SESSION_CAPABILITY) installRpcRetryBudget();
   let lastRequest: RequestEvidence | undefined;
   let lastSystemPrompt: PromptProvenance | undefined;
   let debugState: RuntimeDebugState = { signature: "" };

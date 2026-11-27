@@ -114,6 +114,10 @@ export class HostBridge {
   private sessions = new Map<string, string>();
   private computers = new Map<string, string>();
 
+  // Preserve even a null take result if its response is lost. The same deadline
+  // fences late requests after their receipt has expired.
+  private readonly structuredReads = new Map<string, Map<string, { until: number; result: Promise<unknown> }>>();
+
   constructor(private handlers: BridgeHandlers) {}
 
   /** Idempotent: repeated calls return the port of the already-listening server. */
@@ -136,6 +140,7 @@ export class HostBridge {
 
   /** Mint this session's capability. Re-registering a session rotates it. */
   register(sessionId: string): string {
+    this.structuredReads.delete(sessionId);
     for (const [capability, owner] of this.sessions) if (owner === sessionId) this.sessions.delete(capability);
     const capability = randomBytes(32).toString("base64url");
     this.sessions.set(capability, sessionId);
@@ -163,11 +168,13 @@ export class HostBridge {
   }
 
   unregister(sessionId: string): void {
+    this.structuredReads.delete(sessionId);
     for (const [capability, owner] of this.sessions) if (owner === sessionId) this.sessions.delete(capability);
     for (const [capability, owner] of this.computers) if (owner === sessionId) this.computers.delete(capability);
   }
 
   async close(): Promise<void> {
+    this.structuredReads.clear();
     this.sessions.clear();
     this.computers.clear();
     const server = this.server;
@@ -278,11 +285,25 @@ export class HostBridge {
       else if (body.action === "terminal_action") return this.reply(response, 200, await (this.handlers.onTerminalAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "terminal host unavailable" })));
       else if (body.action === "structured_output") {
         try {
-          return this.reply(response, 200, {
-            ok: true,
-            result: await (this.handlers.onStructuredOutput?.(event as Record<string, unknown>, sessionId)
-              ?? Promise.resolve(null)),
-          });
+          const take = () => this.handlers.onStructuredOutput?.({ ...event, op: "take" }, sessionId) ?? null;
+          if (event.op === "claim") {
+            const { requestId, until } = event;
+            const now = Date.now();
+            if (typeof requestId !== "string" || requestId.length !== 36 || !Number.isSafeInteger(until)
+              || until <= now || until > now + 30_000) throw new Error("invalid structured read");
+            let reads = this.structuredReads.get(sessionId);
+            if (!reads) this.structuredReads.set(sessionId, reads = new Map());
+            for (const [key, receipt] of reads) if (receipt.until <= now) reads.delete(key);
+            let receipt = reads.get(requestId);
+            if (!receipt) {
+              receipt = { until, result: Promise.resolve(take()) };
+              reads.set(requestId, receipt);
+            }
+            if (receipt.until !== until) throw new Error("invalid structured read deadline");
+            return this.reply(response, 200, { ok: true, result: await receipt.result });
+          }
+          if (event.op !== "take") throw new Error("unsupported structured_output op");
+          return this.reply(response, 200, { ok: true, result: await take() });
         } catch (error) {
           return this.reply(response, 200, {
             ok: false,

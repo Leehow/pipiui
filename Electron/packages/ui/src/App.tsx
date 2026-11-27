@@ -2910,23 +2910,6 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         } else {
           setWaitingPhase('tool')
         }
-      } else if (event.type === 'auto_retry') {
-        // pi is backing off and retrying a failed provider call inside the open
-        // turn. The turn is NOT over (queued messages correctly keep waiting for
-        // its settle); surface the retry so the silence never reads as a wedged
-        // send. End reverts to thinking: the model restarts, or the turn's error
-        // message lands right after retries are exhausted.
-        if (event.phase === 'start') {
-          setWaitingVisible(true)
-          const span = event.attempt !== undefined && event.maxAttempts !== undefined
-            ? `第 ${event.attempt}/${event.maxAttempts} 次重试`
-            : undefined
-          setWaitingDetail([span, event.error].filter(Boolean).join(' · ') || undefined)
-          setWaitingPhase('retrying')
-        } else {
-          setWaitingPhase('thinking')
-          setWaitingDetail(undefined)
-        }
       }
     } })
     // Background (non-selected) sessions still owe the sidebar their main-agent

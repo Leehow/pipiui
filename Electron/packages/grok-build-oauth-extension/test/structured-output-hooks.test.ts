@@ -134,6 +134,19 @@ describe("production structured-output hooks", () => {
     expect(second).toBeUndefined();
   });
 
+  it("preserves the applied format for provider recovery and consumes it after success", async () => {
+    const controller = new StructuredOutputController();
+    controller.set("sess-a", request);
+    const hooks = createStructuredOutputHooks({ controller });
+    const run = () => hooks.beforeProviderRequest({ payload: responsesPayload() }, grokCtx("sess-a"));
+    const original = await run();
+    expect(original?.text).toBeDefined();
+    hooks.providerAttemptEnded("sess-a", true);
+    expect(await run()).toEqual(original);
+    hooks.providerAttemptEnded("sess-a", false);
+    expect(await run()).toBeUndefined();
+  });
+
   it("isolates sessions and clear() drops the next turn", async () => {
     const controller = new StructuredOutputController();
     controller.set("sess-a", request);
@@ -279,7 +292,7 @@ describe("production structured-output hooks", () => {
     process.env.PIPIUI_SESSION_CAPABILITY = "cap-sess-a";
     const fetchImpl: typeof fetch = async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as { event?: { op?: string }; sessionCapability?: string };
-      expect(body.event).toEqual({ op: "take" });
+      expect(body.event).toMatchObject({ op: "claim", requestId: expect.any(String) });
       expect(body.sessionCapability).toBe("cap-sess-a");
       expect(JSON.stringify(body)).not.toContain("sess-forged");
       return new Response(JSON.stringify({

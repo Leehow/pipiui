@@ -403,15 +403,29 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
-    if (command.message === "__auto_retry__") {
+    if (["__auto_retry__", "__retry_exhausted__"].includes(command.message)) {
       // Provider hiccup inside the turn: pi auto-retries with backoff, then
       // recovers. The host must forward auto_retry_start/end so the UI can
       // show the retrying wait instead of a silent gap.
       ok();
       send({ type: "agent_start" });
-      send({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 50, errorMessage: "Codex error: transient 500" });
+      const failure = { role: "assistant", content: [], stopReason: "error", errorMessage: "Codex error: transient 500" };
+      send({ type: "tool_execution_start", toolCallId: "completed", toolName: "read", args: {} });
+      send({ type: "tool_execution_end", toolCallId: "completed", result: { content: [{ type: "text", text: "read once" }] }, isError: false });
+      send({ type: "message_end", message: failure });
+      send({ type: "auto_retry_start", attempt: 1, maxAttempts: 2, delayMs: 50, errorMessage: "Codex error: transient 500" });
       setTimeout(() => {
-        send({ type: "auto_retry_end", success: true, attempt: 1 });
+        send({ type: "agent_start" });
+        send({ type: "message_end", message: failure });
+        send({ type: "auto_retry_start", attempt: 2, maxAttempts: 2, delayMs: 100, errorMessage: failure.errorMessage });
+        send({ type: "agent_start" });
+        if (command.message === "__retry_exhausted__") {
+          send({ type: "message_end", message: failure });
+          send({ type: "auto_retry_end", success: false, finalError: failure.errorMessage });
+          send({ type: "agent_settled" });
+          return;
+        }
+        send({ type: "auto_retry_end", success: true, attempt: 2 });
         send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "recovered" } });
         send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop" } });
         send({ type: "agent_settled" });

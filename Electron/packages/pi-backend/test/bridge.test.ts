@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { takeStructuredOutputViaBridge } from "../../grok-build-oauth-extension/agent/structured-output-hooks.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 // Import the units directly: the package barrel drags in the whole backend.
 import { HostBridge } from "../src/bridge.js";
 import { assemblePiSpawn, sanitizeEnvironment } from "../src/spawn-assembly.js";
@@ -73,6 +74,28 @@ describe("HostBridge", () => {
     const response = await post(port, { schemaVersion: 1, sessionCapability: capability, action: "browser_action", event: { action: "observe" } });
     expect(await response.json()).toEqual({ ok: true, text: "page text" });
     expect(received).toContainEqual({ channel: "browser", sessionId: "session-1", payload: { action: "observe" } });
+  });
+
+  it("replays a consumed format after a lost response without taking a second request", async () => {
+    const { port, received, bridge } = await started();
+    vi.stubEnv("PIPIUI_BRIDGE_PORT", String(port));
+    vi.stubEnv("PIPIUI_SESSION_CAPABILITY", bridge.register("session-1"));
+    let attempts = 0;
+    try {
+      const format = await takeStructuredOutputViaBridge(async (url, init) => {
+        const response = await fetch(url, init);
+        if (++attempts === 1) {
+          await response.text();
+          throw new TypeError("lost response");
+        }
+        return response;
+      });
+      expect(format?.name).toBe("flag");
+      expect(attempts).toBe(2);
+      expect(received).toHaveLength(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("takes structured output only for the capability-mapped session", async () => {

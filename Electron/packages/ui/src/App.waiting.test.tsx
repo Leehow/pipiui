@@ -52,7 +52,7 @@ describe('active-turn waiting placeholder', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('false'))
   })
 
-  it('surfaces pi auto-retry as the retrying wait and reverts when the retry finishes', async () => {
+  it('keeps both retry attempts silent, including successful recovery', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
@@ -70,19 +70,13 @@ describe('active-turn waiting placeholder', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '第一步答复' }) })
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
 
-    // …then the provider call fails and pi backs off: the retrying wait appears
-    // with the attempt span and redacted provider error, instead of a silent gap.
-    act(() => { listener?.({ type: 'auto_retry', sessionId: 'layout', phase: 'start', attempt: 2, maxAttempts: 5, delayMs: 4000, error: 'Codex error: transient 500' }) })
-    const retrying = await screen.findByTestId('waiting-placeholder')
-    expect(retrying.getAttribute('data-phase')).toBe('retrying')
-    expect(retrying.textContent).toContain('连接中断，正在重试')
-    expect(retrying.textContent).toContain('第 2/5 次重试')
-    expect(retrying.textContent).toContain('Codex error: transient 500')
-
-    // The retry succeeds: the model restarts, so the wait reverts to thinking.
+    for (const attempt of [1, 2]) {
+      act(() => { listener?.({ type: 'auto_retry', sessionId: 'layout', phase: 'start', attempt, maxAttempts: 2, error: 'Codex error: transient 500' }) })
+      expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+      expect(screen.queryByText(/transient 500|正在重试/)).toBeNull()
+    }
     act(() => { listener?.({ type: 'auto_retry', sessionId: 'layout', phase: 'end', success: true, attempt: 2 }) })
-    await waitFor(() => expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking'))
-    expect(screen.getByTestId('waiting-placeholder').textContent).not.toContain('正在重试')
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
 
     // The recovered completion streams and settles cleanly.
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '重试后的答复' }) })

@@ -11,10 +11,9 @@ import './waiting-placeholder.css'
  * - `followup` — a `[subagent-*]` follow-up is being digested (not a silent leftover busy)
  * - `thinking` — model reasoning in progress (Swift "AI 正在思考…")
  * - `tool`     — a tool run is in flight (Swift media / compacting equivalents)
- * - `retrying` — a failed call is being retried
  * - `stopping` — user requested stop (Swift "正在停止…", which takes precedence)
  */
-export type WaitingPhase = 'awaiting' | 'continuing' | 'followup' | 'thinking' | 'tool' | 'retrying' | 'stopping'
+export type WaitingPhase = 'awaiting' | 'continuing' | 'followup' | 'thinking' | 'tool' | 'stopping'
 
 export const WAITING_COPY = {
   connecting: '正在连接模型',
@@ -25,7 +24,6 @@ export const WAITING_COPY = {
   followup: '正在处理子任务结果',
   thinking: '模型正在思考…',
   tool: '正在执行工具操作…',
-  retrying: '连接中断，正在重试…',
   stopping: '正在停止…'
 } as const
 

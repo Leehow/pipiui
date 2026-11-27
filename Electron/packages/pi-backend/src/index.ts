@@ -1,3 +1,4 @@
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { BashDetailsStore, bashInputSummary, boundedText, maskBashWindowEdges, transformBashPage } from "./bash-details.js";
 import { BashHistoryReader } from "./bash-history.js";
@@ -867,6 +868,8 @@ type Live = {
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
   /** Exact final assistant awaiting the last real subagent terminal event. */
+  pendingProviderError?: string;
+  providerRetryActive?: boolean;
   pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
   /** SIGKILL/close in flight: do not write another RPC to this child. */
   exiting?: boolean;
@@ -1471,6 +1474,8 @@ type ContextEntrySummary = {
   parentId: string | null;
   type: string;
   visible: boolean;
+  failedAssistant?: boolean;
+  omittedId?: string;
 };
 
 function isMetadataReroot(type: string): boolean {
@@ -1503,7 +1508,9 @@ function leafBranchFromFileOrder(ordered: ContextEntrySummary[]): ContextEntrySu
 }
 
 function visibleIdsFromFileOrder(ordered: ContextEntrySummary[]): string[] {
-  return leafBranchFromFileOrder(ordered).filter(entry => entry.visible).map(entry => entry.id);
+  const branch = leafBranchFromFileOrder(ordered);
+  const omitted = new Set(branch.map(entry => entry.omittedId).filter(Boolean));
+  return branch.filter(entry => entry.visible && !(entry.failedAssistant && omitted.has(entry.id))).map(entry => entry.id);
 }
 
 function jsonlSnapshotStream(path: string, byteEnd?: number) {
@@ -1530,6 +1537,8 @@ async function activeVisibleIds(path: string, byteEnd?: number): Promise<string[
       id: entry.id,
       parentId: typeof entry.parentId === "string" ? entry.parentId : null,
       type: String(entry.type ?? ""),
+      failedAssistant: entry.message?.role === "assistant" && entry.message.stopReason === "error",
+      omittedId: entry.type === "context_edit" && entry.replacement === null ? entry.targetId : undefined,
       visible: entry.type === "message"
         || isVisibleCustomMessage(entry)
         || entry.type === "compaction",
@@ -6130,6 +6139,10 @@ export class PiHostBackend implements HostBackend {
     }
     const id = live.session.id;
     if (e.type === "agent_start") {
+      if (live.providerRetryActive) {
+        this.touchTurnActivity(live);
+        return;
+      }
       live.hostAbortedTurn = false;
       live.compaction.cancel();
       // Must be synchronous: fake-pi/real Pi emit agent_start and agent_settled
@@ -6161,6 +6174,8 @@ export class PiHostBackend implements HostBackend {
         pendingFollowUps,
         turnEpoch: live.turnEpoch,
       });
+    } else if (e.type === "agent_end" && e.willRetry === false && live.pendingProviderError && !live.providerRetryActive) {
+      this.projectTurnTerminal(live, "stopped");
     } else if (e.type === "agent_settled") {
       this.requestSessionRedact(id, live.runtimeToken);
       this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled", true);
@@ -6174,6 +6189,8 @@ export class PiHostBackend implements HostBackend {
       // settle — otherwise reads to the user as a wedged queue. Redact the
       // provider error text, matching the message_end error path.
       const start = e.type === "auto_retry_start";
+      live.providerRetryActive = start;
+      if (!start && (e.success || e.finalError === "Retry cancelled")) live.pendingProviderError = undefined;
       const retryError = redactText(
         String(start ? (e.errorMessage ?? "") : (e.finalError ?? "")).slice(0, 200),
         this.sessionSecrets(id),
@@ -6188,6 +6205,10 @@ export class PiHostBackend implements HostBackend {
         ...(start ? {} : { success: e.success === true }),
         ...(retryError ? { error: retryError } : {}),
       });
+      if (!start && !e.success && e.finalError !== "Retry cancelled") {
+        live.pendingProviderError ||= retryError;
+        this.projectTurnTerminal(live, "stopped");
+      }
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
       // Must be synchronous: `loadQueue().then(markBusy)` raced enqueue/drain
@@ -6537,6 +6558,12 @@ export class PiHostBackend implements HostBackend {
           typeof message.errorMessage === "string" && message.errorMessage
             ? message.errorMessage
             : undefined;
+        // Pi emits message_end before deciding whether this attempt will retry.
+        // Keep the queue and completed tools in their original turn until settle.
+        if (content && (live.providerRetryActive || isRetryableAssistantError(message))) {
+          live.pendingProviderError = redactText(content, secrets);
+          return;
+        }
         if (content) this.stream({ type: "error", sessionId: id, content: redactText(content, secrets) });
         // message_end is the durable terminal boundary even when Pi omits the
         // subsequent agent_settled event after a provider transport failure.
@@ -6660,6 +6687,12 @@ export class PiHostBackend implements HostBackend {
   private projectTurnTerminal(live: Live, status: "settled" | "stopped", pushStats = false): boolean {
     const epoch = live.turnEpoch;
     if (epoch === undefined || live.terminalEpoch === epoch) return false;
+    if (live.pendingProviderError && !live.hostAbortedTurn) {
+      this.stream({ type: "error", sessionId: live.session.id, content: live.pendingProviderError });
+      status = "stopped";
+    }
+    live.pendingProviderError = undefined;
+    live.providerRetryActive = false;
     live.terminalEpoch = epoch;
     this.bashDetails.interrupt(live.session.id);
     live.pendingFinalReconciliation = undefined;

@@ -110,12 +110,17 @@ describe("structured output runner fail-closed", () => {
     expect(String((result.error as Error).message)).not.toMatch(LEAK);
   });
 
-  it("invalid bridge response does not call the provider", async () => {
+  it("stops after three consecutive transient bridge failures before calling the provider", async () => {
+    let attempts = 0;
     const hooks = createStructuredOutputHooks({
-      takeRequest: () => takeStructuredOutputViaBridge(async () => new Response("not-json", { status: 500 })),
+      takeRequest: () => takeStructuredOutputViaBridge(async () => {
+        attempts++;
+        return new Response("not-json", { status: 500 });
+      }),
     });
     const runner = createRunner([{ path: "grok-structured", handler: hooks.beforeProviderRequest }]);
     const result = await sendTurn(runner, incoming());
+    expect(attempts).toBe(3);
     expect(result.providerCalls).toBe(0);
     expect(isPipiUIFatalHookError(result.error)).toBe(true);
     expect(String((result.error as Error).message)).toMatch(/无法读取 Structured Output/);
